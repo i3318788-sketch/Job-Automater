@@ -47,11 +47,16 @@ Copy the example env file and adjust values:
 cp .env.example .env
 ```
 
-At minimum set a `SECRET_KEY`. You can generate one with:
+At minimum set a `SECRET_KEY`. Generate a URL-safe one with:
 
 ```bash
-python -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
+python -c "import secrets; print(secrets.token_urlsafe(64))"
 ```
+
+> **Note:** Avoid `$` in any `.env` value (e.g. Django's
+> `get_random_secret_key()` can emit `$`). Docker Compose interprets `$` as a
+> variable reference, which corrupts the value and prints
+> `The "..." variable is not set` warnings. The generator above is safe.
 
 Available variables (see `.env.example`):
 
