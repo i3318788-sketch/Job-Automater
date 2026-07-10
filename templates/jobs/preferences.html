@@ -1,0 +1,14 @@
+{% extends 'base.html' %}
+{% block title %}Preferences · Job Automation{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h1>Job search preferences</h1>
+    <form method="post">
+        {% csrf_token %}
+        {{ form.as_p }}
+        <button type="submit">Save preferences</button>
+        <a class="btn" style="background:#6b7280;" href="{% url 'dashboard' %}">Cancel</a>
+    </form>
+</div>
+{% endblock %}

@@ -1,0 +1,77 @@
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-job_automation}
+      POSTGRES_USER: ${POSTGRES_USER:-jobuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jobpass}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-jobuser}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  web:
+    build: .
+    command: gunicorn job_automation.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 120
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-jobuser}:${POSTGRES_PASSWORD:-jobpass}@db:5432/${POSTGRES_DB:-job_automation}
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - media:/app/media
+      - ./credentials:/app/credentials:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  celery-worker:
+    build: .
+    command: celery -A job_automation worker --loglevel=info
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-jobuser}:${POSTGRES_PASSWORD:-jobpass}@db:5432/${POSTGRES_DB:-job_automation}
+      REDIS_URL: redis://redis:6379/0
+      RUN_MIGRATIONS: "0"
+    volumes:
+      - media:/app/media
+      - ./credentials:/app/credentials:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started
+
+  celery-beat:
+    build: .
+    command: celery -A job_automation beat --loglevel=info
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-jobuser}:${POSTGRES_PASSWORD:-jobpass}@db:5432/${POSTGRES_DB:-job_automation}
+      REDIS_URL: redis://redis:6379/0
+      RUN_MIGRATIONS: "0"
+    depends_on:
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started
+
+volumes:
+  pgdata:
+  media:

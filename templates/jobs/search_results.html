@@ -1,0 +1,66 @@
+{% extends 'base.html' %}
+{% block title %}Search #{{ search_run.id }} results · Job Automation{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h1>Search #{{ search_run.id }} results</h1>
+    <p>
+        <strong>Status:</strong> {{ search_run.get_status_display }} &middot;
+        <strong>Run on:</strong> {{ search_run.created_at|date:"d M Y, H:i" }} &middot;
+        <strong>Countries:</strong> {{ search_run.countries|join:", "|default:"—" }} &middot;
+        <strong>Min salary:</strong> {{ search_run.min_salary|default:"—" }}
+    </p>
+    <p>
+        <a class="btn" href="{% url 'dashboard' %}">Back to dashboard</a>
+        {% if search_run.status == 'COMPLETED' %}
+            <a class="btn" href="{% url 'export_excel' search_run.id %}">Download Excel</a>
+        {% endif %}
+    </p>
+</div>
+
+<div class="card">
+    <h2>Jobs ({{ jobs|length }})</h2>
+    {% if jobs %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Score</th>
+                    <th>Title</th>
+                    <th>Company</th>
+                    <th>Location</th>
+                    <th>Salary</th>
+                    <th>Sponsorship</th>
+                    <th>Reason</th>
+                    <th>Tailored CV</th>
+                    <th>Apply</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for job in jobs %}
+                    <tr>
+                        <td>{{ job.match_score|default:"—" }}</td>
+                        <td>{{ job.title }}</td>
+                        <td>{{ job.company|default:"—" }}</td>
+                        <td>{{ job.location|default:"—" }}</td>
+                        <td>{{ job.salary|default:"—" }}</td>
+                        <td>{{ job.get_sponsorship_flag_display }}</td>
+                        <td>{{ job.match_reason|default:"—" }}</td>
+                        <td>
+                            {% if job.tailored_pdf %}
+                                <a href="{{ job.tailored_pdf.url }}" target="_blank" rel="noopener">PDF</a>
+                            {% else %}—{% endif %}
+                        </td>
+                        <td>
+                            {% if job.application_link %}
+                                <a href="{{ job.application_link }}" target="_blank" rel="noopener">Link</a>
+                            {% else %}—{% endif %}
+                        </td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% else %}
+        <p>No jobs were found for this search.</p>
+    {% endif %}
+</div>
+{% endblock %}

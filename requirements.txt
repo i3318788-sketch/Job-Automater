@@ -1,0 +1,24 @@
+Django>=5.0,<6.0
+django-environ
+PyPDF2
+python-docx
+openpyxl
+requests
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+openai>=1.0
+apify-client
+reportlab
+django-crispy-forms
+crispy-bootstrap5
+
+# Async processing & deployment
+celery>=5.3
+redis>=5.0
+gunicorn
+whitenoise
+psycopg2-binary
+
+# Optional: error tracking in production
+sentry-sdk

@@ -1,0 +1,14 @@
+{% extends 'base.html' %}
+{% block title %}Register · Job Automation{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h1>Create an account</h1>
+    <form method="post">
+        {% csrf_token %}
+        {{ form.as_p }}
+        <button type="submit">Register</button>
+    </form>
+    <p style="margin-top:1rem;">Already have an account? <a href="{% url 'login' %}">Log in</a></p>
+</div>
+{% endblock %}

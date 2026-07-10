@@ -1,0 +1,10 @@
+from django.apps import AppConfig
+
+
+class AccountsConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'accounts'
+
+    def ready(self):
+        # Import signal handlers so UserProfile is auto-created with each User.
+        from . import signals  # noqa: F401

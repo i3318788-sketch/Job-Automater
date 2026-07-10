@@ -1,0 +1,15 @@
+{% extends 'base.html' %}
+{% block title %}Upload CV · Job Automation{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h1>Upload your CV</h1>
+    <p class="helptext">Accepted formats: PDF or DOCX.</p>
+    <form method="post" enctype="multipart/form-data">
+        {% csrf_token %}
+        {{ form.as_p }}
+        <button type="submit">Upload</button>
+        <a class="btn" style="background:#6b7280;" href="{% url 'dashboard' %}">Cancel</a>
+    </form>
+</div>
+{% endblock %}
