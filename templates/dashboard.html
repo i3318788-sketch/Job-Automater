@@ -14,6 +14,29 @@
         <p class="muted">Signed in as {{ user.username }} · {{ profile.get_role_display }}</p>
     </div>
 
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-icon">📊</div>
+            <div class="stat-value">{{ stats.total_jobs }}</div>
+            <div class="stat-label">Total jobs searched</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon">✅</div>
+            <div class="stat-value">{{ stats.matched }}</div>
+            <div class="stat-label">Matched (≥ {{ MATCH_THRESHOLD|default:75 }})</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon">📄</div>
+            <div class="stat-value">{{ stats.tailored }}</div>
+            <div class="stat-label">Tailored CVs</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon">🕑</div>
+            <div class="stat-value stat-value-sm">{% if stats.last_search %}{{ stats.last_search|date:"d M, H:i" }}{% else %}—{% endif %}</div>
+            <div class="stat-label">Last search</div>
+        </div>
+    </div>
+
     <div class="card">
         <h2>CV file</h2>
         {% if active_cv.has_file %}
@@ -37,9 +60,10 @@
         <h2>Preferences</h2>
         <p><strong>Target countries:</strong>
             {% if preferences and preferences.target_countries %}{{ preferences.target_countries|join:", " }}{% else %}none set{% endif %}</p>
-        <p><strong>Minimum salary:</strong>
+        <p><strong>Salary range:</strong>
             {{ preferences.currency_symbol|default:"£" }}{{ effective_min_salary }}
-            {% if not preferences.min_salary %}<span class="helptext">(system default)</span>{% endif %}</p>
+            {% if effective_max_salary %}– {{ preferences.currency_symbol|default:"£" }}{{ effective_max_salary }}{% else %}<span class="helptext">and up (no upper limit)</span>{% endif %}
+            {% if not preferences.salary_min %}<span class="helptext">(minimum is system default)</span>{% endif %}</p>
         <p><a class="btn btn-ghost" href="{% url 'edit_preferences' %}">Edit preferences</a></p>
     </div>
 
@@ -58,9 +82,14 @@
     </div>
 
     <div class="card">
-        <h2>Search runs</h2>
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:1rem; flex-wrap:wrap;">
+            <h2 style="margin:0;">Search runs</h2>
+            {% if search_runs %}
+                <button type="button" class="btn btn-danger icon-btn" id="clear-history-btn" title="Delete all search history">🗑 Clear All History</button>
+            {% endif %}
+        </div>
         {% if search_runs %}
-            <div class="table-wrap">
+            <div class="table-wrap" style="margin-top:1rem;">
                 <table>
                     <thead>
                         <tr><th>#</th><th>Date</th><th>Status</th><th>Progress</th><th>Results</th><th>Excel</th></tr>
@@ -70,18 +99,24 @@
                             <tr data-run-id="{{ run.id }}" data-status-url="{% url 'search_status' run.id %}">
                                 <td>{{ run.id }}</td>
                                 <td>{{ run.created_at|date:"d M, H:i" }}</td>
-                                <td class="run-status">{{ run.get_status_display }}</td>
-                                <td class="run-progress">
+                                <td>
+                                    <span class="run-status badge
+                                        {% if run.status == 'COMPLETED' %}badge-green
+                                        {% elif run.status == 'RUNNING' %}badge-blue badge-pulse
+                                        {% elif run.status == 'PENDING' %}badge-yellow badge-pulse
+                                        {% else %}badge-red{% endif %}" data-status="{{ run.status }}">{{ run.get_status_display }}</span>
+                                </td>
+                                <td class="run-progress" style="min-width:150px;">
                                     {% if run.status == 'RUNNING' or run.status == 'PENDING' %}
                                         <div class="progress"><span class="progress-bar" style="width:{{ run.progress }}%;"></span></div>
                                         <span class="progress-text helptext">{{ run.progress }}%</span>
                                     {% elif run.status == 'FAILED' %}
-                                        <span class="badge badge-red" title="{{ run.error_message }}">error</span>
-                                    {% else %}—{% endif %}
+                                        <span class="helptext" title="{{ run.error_message }}">{{ run.error_message|truncatechars:40 }}</span>
+                                    {% else %}<span class="helptext">{{ run.total_jobs }} jobs</span>{% endif %}
                                 </td>
                                 <td><a href="{% url 'search_results' run.id %}">View</a></td>
                                 <td class="run-excel">
-                                    {% if run.status == 'COMPLETED' %}<a href="{% url 'export_excel' run.id %}">Download</a>{% else %}—{% endif %}
+                                    {% if run.status == 'COMPLETED' %}<a href="{% url 'export_excel' run.id %}" data-loading="Preparing download…">Download</a>{% else %}—{% endif %}
                                 </td>
                             </tr>
                         {% endfor %}
@@ -91,6 +126,20 @@
         {% else %}
             <p class="muted">No search runs for this profile yet.</p>
         {% endif %}
+    </div>
+
+    <div class="modal-overlay" id="clear-history-modal">
+        <div class="modal">
+            <h2>Clear all history?</h2>
+            <p class="muted">Are you sure you want to delete <strong>ALL</strong> search history? This also removes their jobs and tailored CVs. This action cannot be undone.</p>
+            <form method="post" action="{% url 'clear_search_history' %}" data-loading="Clearing history…">
+                {% csrf_token %}
+                <div class="actions">
+                    <button type="button" class="btn btn-secondary" id="clear-cancel">Cancel</button>
+                    <button type="submit" class="btn btn-danger">🗑 Clear All</button>
+                </div>
+            </form>
+        </div>
     </div>
 
     <div class="card">
@@ -124,6 +173,7 @@
 {% block scripts %}
 <script>
 (function () {
+    // Disable the search button on submit.
     var form = document.getElementById('search-form');
     if (form) {
         form.addEventListener('submit', function () {
@@ -131,12 +181,25 @@
             if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
         });
     }
+
+    // Clear-history confirmation modal.
+    var modal = document.getElementById('clear-history-modal');
+    var openBtn = document.getElementById('clear-history-btn');
+    var cancelBtn = document.getElementById('clear-cancel');
+    if (openBtn && modal) { openBtn.addEventListener('click', function () { modal.classList.add('open'); }); }
+    if (cancelBtn && modal) { cancelBtn.addEventListener('click', function () { modal.classList.remove('open'); }); }
+    if (modal) {
+        modal.addEventListener('click', function (e) { if (e.target === modal) modal.classList.remove('open'); });
+        document.addEventListener('keydown', function (e) { if (e.key === 'Escape') modal.classList.remove('open'); });
+    }
+
+    // Live status/progress polling.
     var ACTIVE = {'PENDING': true, 'RUNNING': true};
     var rows = Array.prototype.slice.call(document.querySelectorAll('tr[data-run-id]'));
     function activeRows() {
         return rows.filter(function (row) {
             var s = row.querySelector('.run-status');
-            return s && ACTIVE[s.textContent.trim().toUpperCase()];
+            return s && ACTIVE[(s.getAttribute('data-status') || '').toUpperCase()];
         });
     }
     function poll() {
@@ -150,7 +213,15 @@
                     var bar = row.querySelector('.progress-bar');
                     var text = row.querySelector('.progress-text');
                     if (bar) bar.style.width = data.progress + '%';
-                    if (text) text.textContent = data.progress + '%';
+                    if (text) {
+                        if (data.total > 0 && data.status === 'RUNNING') {
+                            text.textContent = 'Processing job ' + data.processed + ' of ' + data.total + ' (' + data.progress + '%)';
+                        } else {
+                            text.textContent = data.progress + '%';
+                        }
+                    }
+                    var badge = row.querySelector('.run-status');
+                    if (badge) { badge.setAttribute('data-status', data.status); badge.textContent = data.status_display; }
                     if (!ACTIVE[data.status]) reloadNeeded = true;
                 })
                 .catch(function () {})

@@ -36,14 +36,14 @@
                     {% for job in jobs %}
                         <tr>
                             <td>
-                                {% if job.match_score >= 75 %}<span class="badge badge-green">{{ job.match_score }}</span>
-                                {% elif job.match_score >= 50 %}<span class="badge badge-yellow">{{ job.match_score }}</span>
-                                {% else %}<span class="badge badge-red">{{ job.match_score|default:"0" }}</span>{% endif %}
+                                {% if job.match_score >= 75 %}<span class="badge badge-lg badge-green">{{ job.match_score }}</span>
+                                {% elif job.match_score >= 50 %}<span class="badge badge-lg badge-yellow">{{ job.match_score }}</span>
+                                {% else %}<span class="badge badge-lg badge-red">{{ job.match_score|default:"0" }}</span>{% endif %}
                             </td>
                             <td>{{ job.title }}</td>
                             <td>{{ job.company|default:"—" }}</td>
                             <td>{{ job.location|default:"—" }}</td>
-                            <td>{{ job.salary|default:"—" }}</td>
+                            <td>{% if job.salary %}{{ job.salary }}{% else %}<span class="muted">Salary not listed</span>{% endif %}</td>
                             <td>
                                 {% if job.sponsorship_flag == 'SPONSORED' %}<span class="badge badge-green">Sponsored</span>
                                 {% else %}<span class="muted">{{ job.get_sponsorship_flag_display }}</span>{% endif %}

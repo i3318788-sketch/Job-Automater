@@ -21,12 +21,19 @@ logger = logging.getLogger(__name__)
 def get_effective_min_salary(user):
     """Resolve a user's minimum salary: pref -> profile default -> system default."""
     preferences = UserPreferences.objects.filter(user=user).first()
-    if preferences and preferences.min_salary is not None:
-        return preferences.min_salary
+    if preferences and preferences.salary_min is not None:
+        return preferences.salary_min
     profile = getattr(user, 'profile', None)
     if profile and profile.default_min_salary is not None:
         return profile.default_min_salary
     return settings.DEFAULT_MIN_SALARY
+
+
+def get_effective_salary_range(user):
+    """Return (min, max) salary for a user. Max is None when no upper limit."""
+    preferences = UserPreferences.objects.filter(user=user).first()
+    salary_max = preferences.salary_max if preferences else None
+    return get_effective_min_salary(user), salary_max
 
 
 @login_required
@@ -37,14 +44,12 @@ def dashboard(request):
     preferences = UserPreferences.objects.filter(user=request.user).first()
 
     # Search runs for the active profile (plus any legacy runs with no CV link).
+    runs_qs = SearchRun.objects.filter(user=request.user)
     if active_cv:
-        search_runs = SearchRun.objects.filter(
-            user=request.user
-        ).filter(Q(cv=active_cv) | Q(cv__isnull=True))[:20]
-    else:
-        search_runs = SearchRun.objects.filter(user=request.user)[:20]
+        runs_qs = runs_qs.filter(Q(cv=active_cv) | Q(cv__isnull=True))
+    search_runs = list(runs_qs[:20])
 
-    effective_min_salary = get_effective_min_salary(request.user)
+    effective_min_salary, effective_max_salary = get_effective_salary_range(request.user)
 
     # Tailored CVs generated for the active profile (most recent first).
     tailored_qs = Job.objects.filter(search_run__user=request.user).exclude(tailored_pdf='')
@@ -54,13 +59,26 @@ def dashboard(request):
         )
     tailored_jobs = tailored_qs.order_by('-search_run__created_at', '-match_score')[:50]
 
+    # Dashboard stat cards (scoped to the active profile's runs).
+    jobs_qs = Job.objects.filter(search_run__in=runs_qs)
+    last_run = runs_qs.order_by('-created_at').first()
+    stats = {
+        'total_jobs': jobs_qs.count(),
+        'matched': jobs_qs.filter(match_score__gte=settings.MATCH_THRESHOLD).count(),
+        'tailored': jobs_qs.exclude(tailored_pdf='').count(),
+        'last_search': last_run.created_at if last_run else None,
+    }
+
     context = {
         'profile': profile,
         'active_cv': active_cv,
         'preferences': preferences,
         'search_runs': search_runs,
         'effective_min_salary': effective_min_salary,
+        'effective_max_salary': effective_max_salary,
         'tailored_jobs': tailored_jobs,
+        'stats': stats,
+        'MATCH_THRESHOLD': settings.MATCH_THRESHOLD,
     }
     return render(request, 'dashboard.html', context)
 
@@ -179,13 +197,14 @@ def start_search(request):
 
     preferences = UserPreferences.objects.filter(user=request.user).first()
     countries = (preferences.target_countries if preferences else None) or ['United Kingdom']
-    min_salary = get_effective_min_salary(request.user)
+    min_salary, max_salary = get_effective_salary_range(request.user)
 
     search_run = SearchRun.objects.create(
         user=request.user,
         cv=active_cv,
         countries=countries,
         min_salary=min_salary,
+        max_salary=max_salary,
         status=SearchRun.STATUS_PENDING,
         progress=0,
     )
@@ -206,14 +225,27 @@ def start_search(request):
 def search_status(request, run_id):
     """Return the SearchRun status + progress as JSON (used by dashboard polling)."""
     search_run = get_object_or_404(SearchRun, pk=run_id, user=request.user)
+    processed = search_run.jobs.count()
     return JsonResponse({
         'id': search_run.pk,
         'status': search_run.status,
         'status_display': search_run.get_status_display(),
         'progress': search_run.progress,
         'error_message': search_run.error_message,
-        'job_count': search_run.jobs.count(),
+        'job_count': processed,
+        'processed': processed,
+        'total': search_run.total_jobs,
     })
+
+
+@login_required
+@require_POST
+def clear_search_history(request):
+    """Delete all of the current user's search runs (and their jobs, by cascade)."""
+    deleted, _ = SearchRun.objects.filter(user=request.user).delete()
+    messages.success(request, 'Search history cleared.')
+    logger.info('User %s cleared search history (%s rows)', request.user.username, deleted)
+    return redirect('dashboard')
 
 
 @login_required

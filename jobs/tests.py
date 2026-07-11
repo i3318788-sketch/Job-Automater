@@ -45,13 +45,14 @@ class PreferencesViewTests(TestCase):
         self.client.login(username='carol', password='pw12345!')
         response = self.client.post(
             reverse('edit_preferences'),
-            {'target_countries': ['United Kingdom', 'Remote'], 'min_salary': '45000',
-             'currency': 'GBP'},
+            {'target_countries': ['United Kingdom', 'Remote'], 'salary_min': '45000',
+             'salary_max': '80000', 'currency': 'GBP'},
         )
         self.assertEqual(response.status_code, 302)
         prefs = UserPreferences.objects.get(user=self.user)
         self.assertEqual(prefs.target_countries, ['United Kingdom', 'Remote'])
-        self.assertEqual(str(prefs.min_salary), '45000.00')
+        self.assertEqual(str(prefs.salary_min), '45000.00')
+        self.assertEqual(str(prefs.salary_max), '80000.00')
 
 
 class CVUploadTests(TestCase):
@@ -133,6 +134,28 @@ class MatchingHelperTests(TestCase):
         # Unknown salary -> included
         meets, parsed = salary_meets_threshold('Competitive', 30000)
         self.assertTrue(meets)
+        self.assertIsNone(parsed)
+
+    def test_salary_within_range(self):
+        from jobs.services.matching import salary_within_range
+        # Below minimum
+        within, _p, reason = salary_within_range('£25,000', 30000, 60000)
+        self.assertFalse(within)
+        self.assertEqual(reason, 'Salary below minimum')
+        # Above maximum
+        within, _p, reason = salary_within_range('£90,000', 30000, 60000)
+        self.assertFalse(within)
+        self.assertEqual(reason, 'Salary above maximum')
+        # Within range
+        within, _p, reason = salary_within_range('£45,000', 30000, 60000)
+        self.assertTrue(within)
+        self.assertEqual(reason, '')
+        # No upper limit
+        within, _p, _r = salary_within_range('£200,000', 30000, None)
+        self.assertTrue(within)
+        # Unknown salary -> included
+        within, parsed, _r = salary_within_range('Competitive', 30000, 60000)
+        self.assertTrue(within)
         self.assertIsNone(parsed)
 
     def test_parse_match_response_clamps_and_defaults(self):
@@ -314,12 +337,52 @@ class PreferencesCurrencyTests(TestCase):
     def test_currency_saved_and_default_gbp(self):
         response = self.client.post(
             reverse('edit_preferences'),
-            {'target_countries': ['United Kingdom'], 'min_salary': '50000', 'currency': 'USD'},
+            {'target_countries': ['United Kingdom'], 'salary_min': '50000', 'currency': 'USD'},
         )
         self.assertRedirects(response, reverse('dashboard'))
         prefs = UserPreferences.objects.get(user=self.user)
         self.assertEqual(prefs.currency, 'USD')
         self.assertEqual(prefs.currency_symbol, '$')
+
+    def test_salary_max_must_exceed_min(self):
+        response = self.client.post(
+            reverse('edit_preferences'),
+            {'target_countries': [], 'salary_min': '60000', 'salary_max': '40000', 'currency': 'GBP'},
+        )
+        self.assertEqual(response.status_code, 200)  # re-rendered with error
+        self.assertFalse(UserPreferences.objects.filter(user=self.user, salary_min=60000).exists())
+
+
+class ClearHistoryAndStatusTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='hank', password='pw12345!')
+        self.client.login(username='hank', password='pw12345!')
+
+    def test_clear_search_history(self):
+        SearchRun.objects.create(user=self.user, status=SearchRun.STATUS_COMPLETED)
+        SearchRun.objects.create(user=self.user, status=SearchRun.STATUS_FAILED)
+        other = User.objects.create_user(username='someoneelse', password='pw12345!')
+        keep = SearchRun.objects.create(user=other)
+
+        response = self.client.post(reverse('clear_search_history'))
+        self.assertRedirects(response, reverse('dashboard'))
+        self.assertEqual(SearchRun.objects.filter(user=self.user).count(), 0)
+        self.assertTrue(SearchRun.objects.filter(pk=keep.pk).exists())  # other user's kept
+
+    def test_clear_history_rejects_get(self):
+        response = self.client.get(reverse('clear_search_history'))
+        self.assertEqual(response.status_code, 405)
+
+    def test_status_returns_total_and_processed(self):
+        run = SearchRun.objects.create(
+            user=self.user, status=SearchRun.STATUS_RUNNING, progress=50, total_jobs=10,
+        )
+        Job.objects.create(search_run=run, title='A', company='X', location='L',
+                           application_link='https://x/1')
+        data = self.client.get(reverse('search_status', args=[run.pk])).json()
+        self.assertEqual(data['total'], 10)
+        self.assertEqual(data['processed'], 1)
+        self.assertEqual(data['progress'], 50)
 
 
 @override_settings(MEDIA_ROOT=_TEST_MEDIA)

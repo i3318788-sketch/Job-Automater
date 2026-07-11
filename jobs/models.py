@@ -53,12 +53,19 @@ class UserPreferences(models.Model):
     target_countries = models.JSONField(
         default=list, blank=True, help_text='List of target country names.'
     )
-    min_salary = models.DecimalField(
+    salary_min = models.DecimalField(
         max_digits=12,
         decimal_places=2,
         null=True,
         blank=True,
-        help_text='Overrides the system default minimum salary when set.',
+        help_text='Minimum acceptable salary. Overrides the system default when set.',
+    )
+    salary_max = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text='Maximum acceptable salary (optional; blank = no upper limit).',
     )
     currency = models.CharField(
         max_length=3, choices=CURRENCY_CHOICES, default=CURRENCY_GBP
@@ -102,6 +109,11 @@ class SearchRun(models.Model):
     min_salary = models.DecimalField(
         max_digits=12, decimal_places=2, null=True, blank=True
     )
+    max_salary = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    # Number of jobs fetched for this run (used for "processing X of Y").
+    total_jobs = models.PositiveIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     status = models.CharField(
         max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING

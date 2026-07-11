@@ -19,7 +19,7 @@ from .services.google_sheets import log_job_to_sheet
 from .services.matching import (
     compute_match_score,
     detect_sponsorship,
-    salary_meets_threshold,
+    salary_within_range,
 )
 from .services.pdf_generator import build_pdf_filename, generate_tailored_pdf
 from .services.tailoring import tailor_cv_for_job
@@ -106,6 +106,7 @@ def run_job_search(search_run_id):
 
     countries = search_run.countries or ['United Kingdom']
     min_salary = search_run.min_salary
+    max_salary = search_run.max_salary
 
     try:
         raw_jobs = search_jobs(countries, min_salary=min_salary, limit=max_jobs)
@@ -123,6 +124,10 @@ def run_job_search(search_run_id):
     )
 
     total = len(raw_jobs) or 1
+    # Record the fetched total so the UI can show "processing X of Y".
+    search_run.total_jobs = len(raw_jobs)
+    search_run.save(update_fields=['total_jobs'])
+
     created = 0
     tailored = 0
     scored = 0
@@ -130,10 +135,12 @@ def run_job_search(search_run_id):
         for index, raw in enumerate(raw_jobs, start=1):
             description = raw.get('description', '')
             sponsorship = detect_sponsorship(f"{description} {raw.get('title', '')}")
-            meets, _parsed = salary_meets_threshold(raw.get('salary', ''), min_salary)
+            within, _parsed, range_reason = salary_within_range(
+                raw.get('salary', ''), min_salary, max_salary,
+            )
 
-            if not meets:
-                score, reason = 0, 'Salary below minimum'
+            if not within:
+                score, reason = 0, range_reason  # below min or above max
             elif scored >= max_scored:
                 # Cost cap reached: store the job but skip OpenAI scoring.
                 score, reason = 0, 'Not scored (scoring limit reached)'

@@ -85,12 +85,26 @@ def salary_meets_threshold(salary_text, min_salary):
     Returns (meets: bool, parsed: float|None). When salary can't be parsed,
     ``meets`` is True (we don't exclude jobs with unknown salary).
     """
-    if min_salary is None:
-        return True, parse_salary(salary_text)
+    within, parsed, _ = salary_within_range(salary_text, min_salary, None)
+    return within, parsed
+
+
+def salary_within_range(salary_text, min_salary, max_salary):
+    """Decide whether a job's salary falls within [min_salary, max_salary].
+
+    ``max_salary`` may be None (no upper limit). Returns
+    ``(within: bool, parsed: float|None, reason: str)`` where ``reason`` explains
+    an out-of-range result ('Salary below minimum' / 'Salary above maximum').
+    Unknown salary is treated as within-range (we don't drop jobs without data).
+    """
     parsed = parse_salary(salary_text)
     if parsed is None:
-        return True, None  # unknown salary -> include
-    return parsed >= float(min_salary), parsed
+        return True, None, ''  # unknown salary -> include (flagged elsewhere)
+    if min_salary is not None and parsed < float(min_salary):
+        return False, parsed, 'Salary below minimum'
+    if max_salary is not None and parsed > float(max_salary):
+        return False, parsed, 'Salary above maximum'
+    return True, parsed, ''
 
 
 # ---------------------------------------------------------------------------

@@ -55,11 +55,18 @@ class UserPreferencesForm(forms.ModelForm):
 
     class Meta:
         model = UserPreferences
-        fields = ('target_countries', 'min_salary', 'currency')
+        fields = ('target_countries', 'salary_min', 'salary_max', 'currency')
 
     def clean_target_countries(self):
         # MultipleChoiceField returns a list; store it directly in the JSONField.
         return list(self.cleaned_data.get('target_countries', []))
+
+    def clean(self):
+        cleaned = super().clean()
+        lo, hi = cleaned.get('salary_min'), cleaned.get('salary_max')
+        if lo is not None and hi is not None and hi < lo:
+            self.add_error('salary_max', 'Maximum salary must be greater than the minimum.')
+        return cleaned
 
 
 class ProfileForm(forms.ModelForm):

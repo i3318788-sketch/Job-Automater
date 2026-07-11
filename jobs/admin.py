@@ -13,7 +13,7 @@ class CVAdmin(admin.ModelAdmin):
 
 @admin.register(UserPreferences)
 class UserPreferencesAdmin(admin.ModelAdmin):
-    list_display = ('user', 'target_countries', 'min_salary')
+    list_display = ('user', 'target_countries', 'salary_min', 'salary_max', 'currency')
     search_fields = ('user__username',)
 
 
