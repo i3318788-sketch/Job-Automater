@@ -3,13 +3,33 @@
 
 {% block content %}
 <div class="card">
-    <h1>Upload your CV</h1>
+    <h1>Upload CV</h1>
+    {% if active_cv %}
+        <p class="muted">Uploading to profile: <strong>{{ active_cv.display_name }}</strong></p>
+        {% if active_cv.has_file %}
+            <p style="display:flex; align-items:center; gap:0.75rem; flex-wrap:wrap;">
+                <span>📎 Current file: {{ active_cv.original_file.name|cut:"cvs/" }}</span>
+                <a class="btn btn-ghost icon-btn" href="{{ active_cv.original_file.url }}" target="_blank" rel="noopener" title="View file">👁 View</a>
+                <form method="post" action="{% url 'delete_cv' active_cv.id %}" style="margin:0;"
+                      onsubmit="return confirm('Are you sure you want to delete this CV?');" data-loading="Deleting CV…">
+                    {% csrf_token %}
+                    <button type="submit" class="btn btn-danger icon-btn" title="Delete CV">🗑 Delete</button>
+                </form>
+            </p>
+            <p class="helptext">Uploading a new file will replace the current one.</p>
+        {% endif %}
+    {% else %}
+        <p class="muted">No active profile — a new one will be created from your uploaded CV.</p>
+    {% endif %}
+
     <p class="helptext">Accepted formats: PDF or DOCX.</p>
-    <form method="post" enctype="multipart/form-data">
+    <form method="post" enctype="multipart/form-data" data-loading="Uploading &amp; parsing CV…">
         {% csrf_token %}
         {{ form.as_p }}
-        <button type="submit">Upload</button>
-        <a class="btn" style="background:#6b7280;" href="{% url 'dashboard' %}">Cancel</a>
+        <div style="display:flex; gap:0.6rem; margin-top:0.5rem;">
+            <button type="submit">⬆ Upload</button>
+            <a class="btn btn-secondary" href="{% url 'dashboard' %}">Cancel</a>
+        </div>
     </form>
 </div>
 {% endblock %}

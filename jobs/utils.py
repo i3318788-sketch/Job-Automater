@@ -1,9 +1,46 @@
-"""Helpers for extracting text from uploaded CV files."""
+"""Helpers for extracting text from uploaded CV files and resolving the active CV."""
 import os
 
 from django.core.exceptions import ValidationError
 
 ALLOWED_EXTENSIONS = {'.pdf', '.docx'}
+
+SESSION_ACTIVE_CV = 'active_cv_id'
+
+
+def resolve_active_cv(request, profiles=None):
+    """Return the user's active CV profile, honouring ?cv_id= then the session.
+
+    Selecting via ?cv_id= persists the choice in the session. Falls back to the
+    first profile, or None if the user has no CVs. ``profiles`` may be passed to
+    avoid a duplicate query.
+    """
+    from .models import CV  # local import to avoid circulars
+
+    if not request.user.is_authenticated:
+        return None
+    if profiles is None:
+        profiles = list(CV.objects.filter(user=request.user).order_by('id'))
+    if not profiles:
+        request.session.pop(SESSION_ACTIVE_CV, None)
+        return None
+
+    by_id = {c.pk: c for c in profiles}
+
+    # 1) Explicit selection via query param.
+    raw = request.GET.get('cv_id')
+    if raw and raw.isdigit() and int(raw) in by_id:
+        request.session[SESSION_ACTIVE_CV] = int(raw)
+        return by_id[int(raw)]
+
+    # 2) Previously selected (and still valid).
+    session_id = request.session.get(SESSION_ACTIVE_CV)
+    if session_id in by_id:
+        return by_id[session_id]
+
+    # 3) Default to the first profile.
+    request.session[SESSION_ACTIVE_CV] = profiles[0].pk
+    return profiles[0]
 
 
 def validate_cv_extension(filename):

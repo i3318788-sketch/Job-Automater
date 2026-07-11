@@ -55,8 +55,25 @@ class UserPreferencesForm(forms.ModelForm):
 
     class Meta:
         model = UserPreferences
-        fields = ('target_countries', 'min_salary')
+        fields = ('target_countries', 'min_salary', 'currency')
 
     def clean_target_countries(self):
         # MultipleChoiceField returns a list; store it directly in the JSONField.
         return list(self.cleaned_data.get('target_countries', []))
+
+
+class ProfileForm(forms.ModelForm):
+    """Create a new (initially empty) CV profile / tab."""
+
+    class Meta:
+        model = CV
+        fields = ('name',)
+        widgets = {
+            'name': forms.TextInput(attrs={'placeholder': 'e.g. John Doe'}),
+        }
+
+    def clean_name(self):
+        name = (self.cleaned_data.get('name') or '').strip()
+        if not name:
+            raise forms.ValidationError('Please enter a profile name.')
+        return name

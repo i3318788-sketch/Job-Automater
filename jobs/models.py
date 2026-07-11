@@ -3,10 +3,15 @@ from django.db import models
 
 
 class CV(models.Model):
-    """An uploaded CV plus its extracted text and structured data."""
+    """A candidate profile: a named CV plus its extracted text and data.
+
+    A single user may own several CVs ("profiles"), each shown as a tab in the UI.
+    """
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='cvs')
-    original_file = models.FileField(upload_to='cvs/')
+    # Profile / tab name (e.g. "John Doe"). Optional file so empty profiles exist.
+    name = models.CharField(max_length=120, blank=True)
+    original_file = models.FileField(upload_to='cvs/', blank=True)
     parsed_text = models.TextField(blank=True)
     parsed_data = models.JSONField(default=dict, blank=True)
     upload_date = models.DateTimeField(auto_now_add=True)
@@ -14,14 +19,33 @@ class CV(models.Model):
     class Meta:
         verbose_name = 'CV'
         verbose_name_plural = 'CVs'
-        ordering = ['-upload_date']
+        # Stable order for tabs (oldest first).
+        ordering = ['id']
 
     def __str__(self):
-        return f'CV of {self.user.username} ({self.upload_date:%Y-%m-%d})'
+        return f'{self.display_name} ({self.user.username})'
+
+    @property
+    def display_name(self):
+        return self.name or f'Profile {self.pk}'
+
+    @property
+    def has_file(self):
+        return bool(self.original_file)
 
 
 class UserPreferences(models.Model):
     """Per-user job search preferences."""
+
+    CURRENCY_GBP = 'GBP'
+    CURRENCY_USD = 'USD'
+    CURRENCY_EUR = 'EUR'
+    CURRENCY_CHOICES = [
+        (CURRENCY_GBP, '£ (GBP)'),
+        (CURRENCY_USD, '$ (USD)'),
+        (CURRENCY_EUR, '€ (EUR)'),
+    ]
+    CURRENCY_SYMBOLS = {CURRENCY_GBP: '£', CURRENCY_USD: '$', CURRENCY_EUR: '€'}
 
     user = models.OneToOneField(
         User, on_delete=models.CASCADE, related_name='preferences'
@@ -36,6 +60,9 @@ class UserPreferences(models.Model):
         blank=True,
         help_text='Overrides the system default minimum salary when set.',
     )
+    currency = models.CharField(
+        max_length=3, choices=CURRENCY_CHOICES, default=CURRENCY_GBP
+    )
 
     class Meta:
         verbose_name = 'User preferences'
@@ -43,6 +70,10 @@ class UserPreferences(models.Model):
 
     def __str__(self):
         return f'Preferences of {self.user.username}'
+
+    @property
+    def currency_symbol(self):
+        return self.CURRENCY_SYMBOLS.get(self.currency, '£')
 
 
 class SearchRun(models.Model):
@@ -61,6 +92,11 @@ class SearchRun(models.Model):
 
     user = models.ForeignKey(
         User, on_delete=models.CASCADE, related_name='search_runs'
+    )
+    # The candidate profile this search was run for (kept if the CV is deleted).
+    cv = models.ForeignKey(
+        'CV', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='search_runs',
     )
     countries = models.JSONField(default=list, blank=True)
     min_salary = models.DecimalField(

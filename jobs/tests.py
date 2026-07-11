@@ -45,7 +45,8 @@ class PreferencesViewTests(TestCase):
         self.client.login(username='carol', password='pw12345!')
         response = self.client.post(
             reverse('edit_preferences'),
-            {'target_countries': ['United Kingdom', 'Remote'], 'min_salary': '45000'},
+            {'target_countries': ['United Kingdom', 'Remote'], 'min_salary': '45000',
+             'currency': 'GBP'},
         )
         self.assertEqual(response.status_code, 302)
         prefs = UserPreferences.objects.get(user=self.user)
@@ -117,9 +118,10 @@ class MatchingHelperTests(TestCase):
         )
 
 
-def _make_cv_for(user):
+def _make_cv_for(user, name='Test Profile'):
     return CV.objects.create(
         user=user,
+        name=name,
         original_file=SimpleUploadedFile('cv.docx', build_docx_bytes()),
         parsed_text='Python Django engineer',
     )
@@ -141,6 +143,7 @@ TWO_RAW_JOBS = [
 ]
 
 
+@override_settings(MEDIA_ROOT=_TEST_MEDIA)
 class StartSearchViewTests(TestCase):
     """The view only enqueues a task; the workflow itself is tested separately."""
 
@@ -157,12 +160,13 @@ class StartSearchViewTests(TestCase):
 
     @mock.patch('jobs.views.process_job_search.delay')
     def test_search_enqueues_task_and_creates_pending_run(self, delay):
-        _make_cv_for(self.user)
+        cv = _make_cv_for(self.user)
         response = self.client.post(reverse('start_search'))
         # Redirects to dashboard, not results (async).
         self.assertRedirects(response, reverse('dashboard'))
         run = SearchRun.objects.get(user=self.user)
         self.assertEqual(run.status, SearchRun.STATUS_PENDING)
+        self.assertEqual(run.cv, cv)  # search is tied to the active profile
         delay.assert_called_once_with(run.pk)
 
     def test_start_search_rejects_get(self):
@@ -203,6 +207,91 @@ class SearchStatusViewTests(TestCase):
         run = SearchRun.objects.create(user=other)
         response = self.client.get(reverse('search_status', args=[run.pk]))
         self.assertEqual(response.status_code, 404)
+
+
+@override_settings(MEDIA_ROOT=_TEST_MEDIA)
+class ProfileManagementTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='pat', password='pw12345!')
+        self.client.login(username='pat', password='pw12345!')
+
+    def test_empty_state_when_no_profiles(self):
+        response = self.client.get(reverse('dashboard'))
+        self.assertContains(response, 'No CVs found')
+
+    def test_create_profile(self):
+        response = self.client.post(reverse('create_profile'), {'name': 'John Doe'})
+        self.assertRedirects(response, reverse('dashboard'))
+        cv = CV.objects.get(user=self.user)
+        self.assertEqual(cv.name, 'John Doe')
+        self.assertFalse(cv.has_file)
+        # New profile becomes the active tab.
+        self.assertEqual(self.client.session['active_cv_id'], cv.pk)
+
+    def test_create_profile_rejects_blank_name(self):
+        response = self.client.post(reverse('create_profile'), {'name': '   '})
+        self.assertRedirects(response, reverse('dashboard'))
+        self.assertEqual(CV.objects.filter(user=self.user).count(), 0)
+
+    def test_tabs_rendered_and_active_switches_via_query(self):
+        a = _make_cv_for(self.user, name='Profile A')
+        b = _make_cv_for(self.user, name='Profile B')
+        response = self.client.get(reverse('dashboard'))
+        self.assertContains(response, 'Profile A')
+        self.assertContains(response, 'Profile B')
+        # Switching via ?cv_id= sets the active profile in the session.
+        self.client.get(reverse('dashboard') + f'?cv_id={b.pk}')
+        self.assertEqual(self.client.session['active_cv_id'], b.pk)
+
+    def test_delete_cv_switches_active_and_removes_record(self):
+        a = _make_cv_for(self.user, name='Profile A')
+        b = _make_cv_for(self.user, name='Profile B')
+        # Make B active, then delete it -> falls back to remaining profile.
+        self.client.get(reverse('dashboard') + f'?cv_id={b.pk}')
+        response = self.client.post(reverse('delete_cv', args=[b.pk]))
+        self.assertRedirects(response, reverse('dashboard'))
+        self.assertFalse(CV.objects.filter(pk=b.pk).exists())
+        self.assertEqual(self.client.session['active_cv_id'], a.pk)
+
+    def test_delete_other_users_cv_forbidden(self):
+        other = User.objects.create_user(username='intruder', password='pw12345!')
+        cv = _make_cv_for(other, name='Secret')
+        response = self.client.post(reverse('delete_cv', args=[cv.pk]))
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(CV.objects.filter(pk=cv.pk).exists())
+
+    def test_upload_targets_active_profile(self):
+        cv = _make_cv_for(self.user, name='Profile A')
+        cv.original_file.delete(save=False)  # empty the profile
+        cv.original_file = ''
+        cv.parsed_text = ''
+        cv.save()
+        self.client.get(reverse('dashboard') + f'?cv_id={cv.pk}')  # make active
+
+        upload = SimpleUploadedFile('resume.docx', build_docx_bytes())
+        response = self.client.post(reverse('upload_cv'), {'original_file': upload})
+        self.assertRedirects(response, reverse('dashboard'))
+        # Same profile updated, not a new CV created.
+        self.assertEqual(CV.objects.filter(user=self.user).count(), 1)
+        cv.refresh_from_db()
+        self.assertTrue(cv.has_file)
+        self.assertIn('Jane Doe', cv.parsed_text)
+
+
+class PreferencesCurrencyTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='cara', password='pw12345!')
+        self.client.login(username='cara', password='pw12345!')
+
+    def test_currency_saved_and_default_gbp(self):
+        response = self.client.post(
+            reverse('edit_preferences'),
+            {'target_countries': ['United Kingdom'], 'min_salary': '50000', 'currency': 'USD'},
+        )
+        self.assertRedirects(response, reverse('dashboard'))
+        prefs = UserPreferences.objects.get(user=self.user)
+        self.assertEqual(prefs.currency, 'USD')
+        self.assertEqual(prefs.currency_symbol, '$')
 
 
 @override_settings(MEDIA_ROOT=_TEST_MEDIA)

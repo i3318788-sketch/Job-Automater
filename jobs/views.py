@@ -4,15 +4,16 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ValidationError
+from django.db.models import Q
 from django.http import FileResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
 
-from .forms import CVUploadForm, UserPreferencesForm
+from .forms import CVUploadForm, ProfileForm, UserPreferencesForm
 from .models import CV, Job, SearchRun, UserPreferences
 from .services.excel_export import build_workbook
 from .tasks import process_job_search
-from .utils import extract_cv_text
+from .utils import SESSION_ACTIVE_CV, extract_cv_text, resolve_active_cv
 
 logger = logging.getLogger(__name__)
 
@@ -30,24 +31,32 @@ def get_effective_min_salary(user):
 
 @login_required
 def dashboard(request):
-    """Landing page after login: profile, CV status, preferences, search runs."""
+    """Landing page after login: active profile, CV status, prefs, search runs."""
     profile = request.user.profile
-    latest_cv = CV.objects.filter(user=request.user).first()
+    active_cv = resolve_active_cv(request)
     preferences = UserPreferences.objects.filter(user=request.user).first()
-    search_runs = SearchRun.objects.filter(user=request.user)[:20]
+
+    # Search runs for the active profile (plus any legacy runs with no CV link).
+    if active_cv:
+        search_runs = SearchRun.objects.filter(
+            user=request.user
+        ).filter(Q(cv=active_cv) | Q(cv__isnull=True))[:20]
+    else:
+        search_runs = SearchRun.objects.filter(user=request.user)[:20]
 
     effective_min_salary = get_effective_min_salary(request.user)
 
-    # Tailored CVs generated across the user's searches (most recent first).
-    tailored_jobs = (
-        Job.objects.filter(search_run__user=request.user)
-        .exclude(tailored_pdf='')
-        .order_by('-search_run__created_at', '-match_score')[:50]
-    )
+    # Tailored CVs generated for the active profile (most recent first).
+    tailored_qs = Job.objects.filter(search_run__user=request.user).exclude(tailored_pdf='')
+    if active_cv:
+        tailored_qs = tailored_qs.filter(
+            Q(search_run__cv=active_cv) | Q(search_run__cv__isnull=True)
+        )
+    tailored_jobs = tailored_qs.order_by('-search_run__created_at', '-match_score')[:50]
 
     context = {
         'profile': profile,
-        'latest_cv': latest_cv,
+        'active_cv': active_cv,
         'preferences': preferences,
         'search_runs': search_runs,
         'effective_min_salary': effective_min_salary,
@@ -57,13 +66,57 @@ def dashboard(request):
 
 
 @login_required
+@require_POST
+def create_profile(request):
+    """Create a new (empty) CV profile / tab and switch to it."""
+    form = ProfileForm(request.POST)
+    if form.is_valid():
+        cv = form.save(commit=False)
+        cv.user = request.user
+        cv.parsed_data = {}
+        cv.save()
+        request.session[SESSION_ACTIVE_CV] = cv.pk
+        messages.success(
+            request,
+            f'Profile "{cv.display_name}" created. Upload a CV file for it.',
+        )
+    else:
+        errors = form.errors.get('name') or ['Invalid profile name.']
+        messages.error(request, errors[0])
+    return redirect('dashboard')
+
+
+@login_required
+@require_POST
+def delete_cv(request, cv_id):
+    """Delete a CV profile (file + record) and switch to another profile."""
+    cv = get_object_or_404(CV, pk=cv_id, user=request.user)
+    name = cv.display_name
+    if cv.original_file:
+        cv.original_file.delete(save=False)
+    cv.delete()
+
+    remaining = CV.objects.filter(user=request.user).order_by('id').first()
+    if remaining:
+        request.session[SESSION_ACTIVE_CV] = remaining.pk
+    else:
+        request.session.pop(SESSION_ACTIVE_CV, None)
+    messages.success(request, f'Profile "{name}" deleted.')
+    return redirect('dashboard')
+
+
+@login_required
 def upload_cv(request):
-    """Upload a PDF/DOCX CV, extract its text and store structured data."""
+    """Upload a PDF/DOCX file into the active profile (or a new one)."""
+    active_cv = resolve_active_cv(request)
     if request.method == 'POST':
-        form = CVUploadForm(request.POST, request.FILES)
+        # Update the active profile in place, or create a fresh CV if none.
+        form = CVUploadForm(request.POST, request.FILES, instance=active_cv)
         if form.is_valid():
             cv = form.save(commit=False)
             cv.user = request.user
+            if not cv.name:
+                cv.name = request.user.profile.candidate_name or 'Profile'
             try:
                 parsed_text = extract_cv_text(cv.original_file)
             except ValidationError as exc:
@@ -83,12 +136,13 @@ def upload_cv(request):
                     'education': [],
                 }
                 cv.save()
+                request.session[SESSION_ACTIVE_CV] = cv.pk
                 messages.success(request, 'CV uploaded and parsed successfully.')
                 return redirect('dashboard')
     else:
-        form = CVUploadForm()
+        form = CVUploadForm(instance=active_cv)
 
-    return render(request, 'jobs/upload_cv.html', {'form': form})
+    return render(request, 'jobs/upload_cv.html', {'form': form, 'active_cv': active_cv})
 
 
 @login_required
@@ -105,16 +159,22 @@ def edit_preferences(request):
     else:
         form = UserPreferencesForm(instance=preferences)
 
-    return render(request, 'jobs/preferences.html', {'form': form})
+    return render(
+        request, 'jobs/preferences.html',
+        {'form': form, 'preferences': preferences},
+    )
 
 
 @login_required
 @require_POST
 def start_search(request):
-    """Create a PENDING SearchRun and enqueue the async job-search task."""
-    latest_cv = CV.objects.filter(user=request.user).first()
-    if latest_cv is None:
-        messages.error(request, 'Please upload a CV before starting a search.')
+    """Create a PENDING SearchRun for the active profile and enqueue the task."""
+    active_cv = resolve_active_cv(request)
+    if active_cv is None or not active_cv.has_file:
+        messages.error(
+            request,
+            'Please upload a CV for this profile before starting a search.',
+        )
         return redirect('dashboard')
 
     preferences = UserPreferences.objects.filter(user=request.user).first()
@@ -123,6 +183,7 @@ def start_search(request):
 
     search_run = SearchRun.objects.create(
         user=request.user,
+        cv=active_cv,
         countries=countries,
         min_salary=min_salary,
         status=SearchRun.STATUS_PENDING,

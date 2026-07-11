@@ -5,9 +5,9 @@ from .models import CV, Job, SearchRun, UserPreferences
 
 @admin.register(CV)
 class CVAdmin(admin.ModelAdmin):
-    list_display = ('user', 'original_file', 'upload_date')
+    list_display = ('id', 'name', 'user', 'original_file', 'upload_date')
     list_filter = ('upload_date',)
-    search_fields = ('user__username',)
+    search_fields = ('user__username', 'name')
     readonly_fields = ('upload_date',)
 
 
@@ -26,7 +26,7 @@ class JobInline(admin.TabularInline):
 
 @admin.register(SearchRun)
 class SearchRunAdmin(admin.ModelAdmin):
-    list_display = ('id', 'user', 'status', 'progress', 'min_salary', 'created_at')
+    list_display = ('id', 'user', 'cv', 'status', 'progress', 'min_salary', 'created_at')
     list_filter = ('status', 'created_at')
     search_fields = ('user__username',)
     readonly_fields = ('created_at',)

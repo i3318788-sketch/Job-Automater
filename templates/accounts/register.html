@@ -2,13 +2,13 @@
 {% block title %}Register · Job Automation{% endblock %}
 
 {% block content %}
-<div class="card">
+<div class="card" style="max-width:460px; margin:2rem auto;">
     <h1>Create an account</h1>
     <form method="post">
         {% csrf_token %}
         {{ form.as_p }}
-        <button type="submit">Register</button>
+        <button type="submit" style="width:100%; justify-content:center; margin-top:0.5rem;">Register</button>
     </form>
-    <p style="margin-top:1rem;">Already have an account? <a href="{% url 'login' %}">Log in</a></p>
+    <p class="muted" style="margin-top:1rem;">Already have an account? <a href="{% url 'login' %}">Log in</a></p>
 </div>
 {% endblock %}

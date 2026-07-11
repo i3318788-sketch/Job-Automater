@@ -95,8 +95,9 @@ def run_job_search(search_run_id):
     search_run.error_message = ''
     search_run.save(update_fields=['status', 'progress', 'error_message'])
 
-    latest_cv = CV.objects.filter(user=search_run.user).first()
-    if latest_cv is None:
+    # Prefer the CV the search was started for; fall back to the newest one.
+    cv = search_run.cv or CV.objects.filter(user=search_run.user).order_by('-id').first()
+    if cv is None:
         return _fail(search_run, 'No CV found for user.')
 
     max_jobs = getattr(settings, 'MAX_JOBS_PER_SEARCH', 50)
@@ -113,8 +114,13 @@ def run_job_search(search_run_id):
     except ApifySearchError as exc:
         return _fail(search_run, f'Job search failed: {exc}')
 
-    cv_text = latest_cv.parsed_text or ''
-    candidate_name = search_run.user.profile.candidate_name or search_run.user.username
+    cv_text = cv.parsed_text or ''
+    # Prefer the profile name for PDF naming; fall back to the account's name.
+    candidate_name = (
+        cv.name
+        or search_run.user.profile.candidate_name
+        or search_run.user.username
+    )
 
     total = len(raw_jobs) or 1
     created = 0

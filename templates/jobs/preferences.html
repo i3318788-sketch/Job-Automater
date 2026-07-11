@@ -4,11 +4,45 @@
 {% block content %}
 <div class="card">
     <h1>Job search preferences</h1>
-    <form method="post">
+    <form method="post" data-loading="Saving changes…">
         {% csrf_token %}
-        {{ form.as_p }}
-        <button type="submit">Save preferences</button>
-        <a class="btn" style="background:#6b7280;" href="{% url 'dashboard' %}">Cancel</a>
+
+        {% if form.target_countries.errors %}<ul class="errorlist">{{ form.target_countries.errors }}</ul>{% endif %}
+        <label for="{{ form.target_countries.id_for_label }}">Target countries</label>
+        {{ form.target_countries }}
+        <p class="helptext">{{ form.target_countries.help_text }}</p>
+
+        <label for="{{ form.min_salary.id_for_label }}">Minimum salary</label>
+        <div class="input-group">
+            <span id="currency-symbol" style="display:inline-flex; align-items:center; padding:0 0.75rem; border:1px solid var(--border); border-radius:8px; background:var(--bg); font-weight:600;">
+                {{ preferences.currency_symbol|default:"£" }}
+            </span>
+            {{ form.min_salary }}
+            {{ form.currency }}
+        </div>
+        {% if form.min_salary.errors %}<ul class="errorlist">{{ form.min_salary.errors }}</ul>{% endif %}
+        <p class="helptext">Leave salary blank to use the system default.</p>
+
+        <div style="display:flex; gap:0.6rem; margin-top:1rem;">
+            <button type="submit">💾 Save preferences</button>
+            <a class="btn btn-secondary" href="{% url 'dashboard' %}">Cancel</a>
+        </div>
     </form>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+    // Live-update the currency symbol shown next to the salary input.
+    var symbols = {'GBP': '£', 'USD': '$', 'EUR': '€'};
+    var select = document.getElementById('{{ form.currency.id_for_label }}');
+    var symbolEl = document.getElementById('currency-symbol');
+    if (select && symbolEl) {
+        select.addEventListener('change', function () {
+            symbolEl.textContent = symbols[select.value] || '£';
+        });
+    }
+})();
+</script>
 {% endblock %}
