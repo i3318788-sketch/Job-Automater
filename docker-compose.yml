@@ -29,10 +29,12 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-jobuser}:${POSTGRES_PASSWORD:-jobpass}@db:5432/${POSTGRES_DB:-job_automation}
       REDIS_URL: redis://redis:6379/0
     volumes:
-      - media:/app/media
+      # Bind-mount media to the host so nginx can serve uploaded files/PDFs.
+      - ./media:/app/media
       - ./credentials:/app/credentials:ro
     ports:
-      - "8000:8000"
+      # Bind to localhost only; nginx (on the host) proxies public traffic.
+      - "127.0.0.1:8000:8000"
     depends_on:
       db:
         condition: service_healthy
@@ -48,7 +50,8 @@ services:
       REDIS_URL: redis://redis:6379/0
       RUN_MIGRATIONS: "0"
     volumes:
-      - media:/app/media
+      # Shares the same media directory so generated PDFs land on the host too.
+      - ./media:/app/media
       - ./credentials:/app/credentials:ro
     depends_on:
       db:
@@ -74,4 +77,3 @@ services:
 
 volumes:
   pgdata:
-  media:

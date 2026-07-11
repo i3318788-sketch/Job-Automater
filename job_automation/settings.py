@@ -257,9 +257,13 @@ LOGGING = {
 # Production hardening (applied when DEBUG is False)
 # ---------------------------------------------------------------------------
 if not DEBUG:
+    # Trust the reverse proxy's scheme header (nginx sets X-Forwarded-Proto).
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-    SESSION_COOKIE_SECURE = env.bool('SESSION_COOKIE_SECURE', default=True)
-    CSRF_COOKIE_SECURE = env.bool('CSRF_COOKIE_SECURE', default=True)
+    # IMPORTANT: these default to False so the app works over plain HTTP (e.g. a
+    # fresh IP-based deploy). Once HTTPS is set up, set them to True in .env:
+    #   SESSION_COOKIE_SECURE=True, CSRF_COOKIE_SECURE=True, SECURE_SSL_REDIRECT=True
+    SESSION_COOKIE_SECURE = env.bool('SESSION_COOKIE_SECURE', default=False)
+    CSRF_COOKIE_SECURE = env.bool('CSRF_COOKIE_SECURE', default=False)
     SECURE_SSL_REDIRECT = env.bool('SECURE_SSL_REDIRECT', default=False)
     SECURE_HSTS_SECONDS = env.int('SECURE_HSTS_SECONDS', default=0)
     SECURE_CONTENT_TYPE_NOSNIFF = True

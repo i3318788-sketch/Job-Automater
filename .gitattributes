@@ -1,0 +1,11 @@
+# Force LF on shell scripts so the Docker entrypoint runs on Linux even when
+# the repo is checked out/committed from Windows.
+*.sh text eol=lf
+entrypoint.sh text eol=lf
+
+# Normalize common text files.
+*.py text
+*.html text
+*.yml text
+*.yaml text
+*.md text

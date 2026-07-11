@@ -214,11 +214,16 @@ docker compose up --build
 ```
 
 Services started: **web** (Gunicorn), **db** (PostgreSQL), **redis**,
-**celery-worker**, **celery-beat**. Media is a named volume; Google credentials
-are mounted read-only from `./credentials/` (place your service-account JSON
-there and point `GOOGLE_SHEETS_CREDENTIALS_JSON` at
-`/app/credentials/<file>.json`). Only the `web` service runs migrations
-(`RUN_MIGRATIONS=0` on the workers).
+**celery-worker**, **celery-beat**. Media is bind-mounted to `./media` (so nginx
+can serve uploaded files/PDFs in production); Google credentials are mounted
+read-only from `./credentials/` (place your service-account JSON there and point
+`GOOGLE_SHEETS_CREDENTIALS_JSON` at `/app/credentials/<file>.json`). Only the
+`web` service runs migrations (`RUN_MIGRATIONS=0` on the workers).
+
+**Deploying to a VPS (nginx + HTTPS):** see [deploy/README.md](deploy/README.md)
+for a full production runbook, and `deploy/nginx.conf` for the reverse-proxy
+config. Note: over plain HTTP, keep `SESSION_COOKIE_SECURE`/`CSRF_COOKIE_SECURE`
+`False` (the defaults) or login will fail; flip them to `True` once HTTPS is on.
 
 ### Production settings
 
