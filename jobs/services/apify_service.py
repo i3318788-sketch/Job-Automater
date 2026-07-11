@@ -34,6 +34,35 @@ def _first(mapping, *keys, default=''):
     return default
 
 
+def _as_dict(obj):
+    """Coerce an Apify SDK item/model into a plain dict.
+
+    Newer apify-client versions may return pydantic models instead of dicts.
+    """
+    if isinstance(obj, dict):
+        return obj
+    for attr in ('model_dump', 'dict'):
+        method = getattr(obj, attr, None)
+        if callable(method):
+            try:
+                return method()
+            except Exception:  # pragma: no cover - defensive
+                pass
+    return getattr(obj, '__dict__', {}) or {}
+
+
+def _run_dataset_id(run):
+    """Extract the default dataset id from a Run dict or a typed Run object."""
+    if not run:
+        return None
+    if isinstance(run, dict):
+        return run.get('defaultDatasetId')
+    return (
+        getattr(run, 'default_dataset_id', None)
+        or getattr(run, 'defaultDatasetId', None)
+    )
+
+
 def normalize_job(raw):
     """Map a raw Apify dataset item to our internal job dict.
 
@@ -44,26 +73,80 @@ def normalize_job(raw):
         'title': str(_first(raw, 'title', 'jobTitle', 'position')),
         'company': str(_first(raw, 'company', 'companyName', 'employer')),
         'location': str(_first(raw, 'location', 'jobLocation', 'city')),
-        'datePosted': str(_first(raw, 'datePosted', 'postedAt', 'date', 'publishedAt')),
-        'employmentType': str(_first(raw, 'employmentType', 'jobType', 'contractType')),
+        'datePosted': str(_first(raw, 'datePosted', 'date_posted', 'postedAt', 'posted_at', 'date', 'publishedAt')),
+        'employmentType': str(_first(raw, 'employmentType', 'employment_type', 'jobType', 'job_type', 'contractType')),
         'seniorityLevel': str(_first(raw, 'seniorityLevel', 'seniority', 'experienceLevel')),
-        'salary': str(_first(raw, 'salary', 'salaryRange', 'salaryText', 'compensation')),
-        'description': str(_first(raw, 'description', 'jobDescription', 'descriptionText', 'summary')),
-        'applyLink': str(_first(raw, 'applyLink', 'applicationLink', 'url', 'jobUrl', 'link')),
+        'salary': str(_first(raw, 'salary', 'salary_raw', 'salaryRange', 'salaryText', 'compensation')) or _build_salary(raw),
+        'description': str(_first(raw, 'description', 'jobDescription', 'descriptionText', 'summary', 'snippet')),
+        'applyLink': str(_first(raw, 'applyLink', 'direct_apply_url', 'applyUrl', 'applicationLink', 'url', 'jobUrl', 'redirectUrl', 'link')),
     }
+
+
+def _build_salary(raw):
+    """Compose a salary string from structured salary fields when no raw text exists."""
+    currency = str(raw.get('salary_currency') or '')
+    symbol = {'GBP': '£', 'USD': '$', 'EUR': '€'}.get(currency.upper(), currency)
+
+    def _num(*keys):
+        for k in keys:
+            v = raw.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                return int(v)
+        return None
+
+    lo = _num('salary_annual_min', 'salary_min')
+    hi = _num('salary_annual_max', 'salary_max')
+    if lo and hi and lo != hi:
+        return f'{symbol}{lo:,} - {symbol}{hi:,}'
+    value = lo or hi
+    if value:
+        return f'{symbol}{value:,}'
+    hourly = _num('salary_hourly')
+    if hourly:
+        return f'{symbol}{hourly}/hr'
+    return ''
+
+
+# Maps country/region names to the actor's `country` enum (uk/us/de/fr/nl/au/remote).
+COUNTRY_CODES = {
+    'united kingdom': 'uk', 'uk': 'uk', 'england': 'uk', 'scotland': 'uk',
+    'wales': 'uk', 'northern ireland': 'uk', 'britain': 'uk', 'great britain': 'uk',
+    'united states': 'us', 'usa': 'us', 'us': 'us', 'america': 'us',
+    'germany': 'de', 'deutschland': 'de',
+    'france': 'fr',
+    'netherlands': 'nl', 'holland': 'nl',
+    'australia': 'au',
+    'remote': 'remote',
+}
 
 
 def _build_actor_input(location, min_salary, limit):
-    """Best-effort input for the actor. Extra keys are ignored by most actors."""
+    """Build input for the ``doggo/uk-jobs-board-scraper`` actor.
+
+    The actor requires ``keyword`` and ``location`` (enums, overridable by the
+    ``custom_*`` fields) and expects ``searchTerms`` to be an array. See the
+    actor's input schema for the full field list.
+    """
+    country_code = COUNTRY_CODES.get((location or '').strip().lower(), 'uk')
+    keyword = getattr(settings, 'APIFY_SEARCH_KEYWORD', '') or 'software engineer'
+
     actor_input = {
-        'location': location,
-        'maxItems': limit,
-        # A broad search term keeps most aggregators happy; leave results wide.
-        'searchTerms': '',
-        'country': location,
+        # Required enum preset; custom_keyword overrides it with our real term.
+        'keyword': 'software engineer',
+        'custom_keyword': keyword,
+        # MUST be an array for this actor (empty = rely on keyword only).
+        'searchTerms': [],
+        # Required enum preset; custom_location overrides it with the requested area.
+        'location': 'London',
+        'custom_location': location or 'United Kingdom',
+        'country': country_code,
+        # Actor enforces a minimum of 100.
+        'max_results': max(100, int(limit)),
+        'deduplicate': True,
+        'descriptionFormat': 'plaintext',
     }
     if min_salary is not None:
-        actor_input['minSalary'] = int(min_salary)
+        actor_input['salary_min'] = int(min_salary)
     return actor_input
 
 
@@ -101,14 +184,14 @@ def search_jobs(country_list, min_salary=None, limit=200):
         logger.exception('Apify actor run failed')
         raise ApifySearchError(f'Apify actor run failed: {exc}') from exc
 
-    if not run or not run.get('defaultDatasetId'):
+    dataset_id = _run_dataset_id(run)
+    if not dataset_id:
         raise ApifySearchError('Apify run returned no dataset')
 
-    dataset_id = run['defaultDatasetId']
     jobs = []
     try:
         for item in client.dataset(dataset_id).iterate_items():
-            jobs.append(normalize_job(item))
+            jobs.append(normalize_job(_as_dict(item)))
             if len(jobs) >= limit:
                 break
     except Exception as exc:

@@ -79,6 +79,34 @@ class CVUploadTests(TestCase):
         self.assertFalse(CV.objects.filter(user=self.user).exists())
 
 
+class ApifyInputTests(TestCase):
+    def test_build_actor_input_shape(self):
+        from jobs.services.apify_service import _build_actor_input
+        inp = _build_actor_input('United Kingdom', 30000, 50)
+        # searchTerms must be a list (the actor rejects a string).
+        self.assertIsInstance(inp['searchTerms'], list)
+        # Country name mapped to the actor's enum code.
+        self.assertEqual(inp['country'], 'uk')
+        # Correct field names / minimums for this actor.
+        self.assertEqual(inp['salary_min'], 30000)
+        self.assertGreaterEqual(inp['max_results'], 100)
+        self.assertIn('keyword', inp)
+        self.assertEqual(inp['custom_location'], 'United Kingdom')
+        self.assertNotIn('minSalary', inp)
+        self.assertNotIn('maxItems', inp)
+
+    def test_country_mapping_defaults_to_uk(self):
+        from jobs.services.apify_service import _build_actor_input
+        self.assertEqual(_build_actor_input('Narnia', None, 100)['country'], 'uk')
+        self.assertEqual(_build_actor_input('United States', None, 100)['country'], 'us')
+
+    def test_normalize_job_handles_apply_url_variant(self):
+        from jobs.services.apify_service import normalize_job
+        job = normalize_job({'title': 'Dev', 'company': 'Acme', 'applyUrl': 'https://x/1'})
+        self.assertEqual(job['applyLink'], 'https://x/1')
+        self.assertEqual(job['title'], 'Dev')
+
+
 class MatchingHelperTests(TestCase):
     def test_detect_sponsorship_positive(self):
         text = 'We offer visa sponsorship for skilled worker candidates.'

@@ -40,6 +40,9 @@ DEFAULT_MIN_SALARY = env.int('DEFAULT_MIN_SALARY', default=30000)
 # Apify actor used by the job search service.
 APIFY_JOBS_ACTOR = env('APIFY_JOBS_ACTOR', default='memo23/apify-uk-jobs-aggregator')
 
+# Keyword/role the Apify jobs actor searches for (required by some actors).
+APIFY_SEARCH_KEYWORD = env('APIFY_SEARCH_KEYWORD', default='software engineer')
+
 # OpenAI model used for CV/job match scoring (kept small/cheap).
 OPENAI_MATCH_MODEL = env('OPENAI_MATCH_MODEL', default='gpt-4o-mini')
 
