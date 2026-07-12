@@ -564,6 +564,75 @@ class PdfGeneratorTests(TestCase):
             self.assertEqual(fh.read(5), b'%PDF-')
 
 
+UK_CV_TEXT = """AMANDA TURNER
+07123 456789 | amanda@example.com | London, UK
+
+PROFESSIONAL PROFILE
+Results-driven SEO Executive with 4+ years of experience in organic search and
+content strategy, seeking a role in a dynamic agency.
+
+KEY SKILLS
+- Technical SEO
+- Google Analytics
+- Keyword Research
+- SEMrush & Ahrefs
+
+PROFESSIONAL EXPERIENCE
+SEO Executive | XYZ Agency | London, UK
+Jan 2022 - Present
+- Led SEO strategy for 25+ clients, increasing organic traffic by 150%.
+- Managed a team of 3 junior SEOs.
+
+EDUCATION
+BSc Digital Marketing | University of Manchester | Manchester, UK
+2017 - 2020
+- 2:1 (Upper Second Class Honours)
+
+CERTIFICATIONS
+- Google Analytics Individual Qualification
+"""
+
+
+class UkCvFormatTests(TestCase):
+    def test_parses_all_sections(self):
+        from jobs.services.pdf_generator import parse_cv_sections
+        s = parse_cv_sections(UK_CV_TEXT)
+        self.assertEqual(s['name'], 'AMANDA TURNER')
+        self.assertIn('amanda@example.com', s['contact'])
+        self.assertEqual(len(s['skills']), 4)
+        self.assertIn('SEO Executive | XYZ Agency | London, UK', s['experience'])
+        self.assertTrue(s['education'])
+        self.assertTrue(s['certifications'])
+
+    def test_body_text_containing_section_words_is_not_a_heading(self):
+        """Regression: 'years of experience' must not be read as the EXPERIENCE heading."""
+        from jobs.services.pdf_generator import parse_cv_sections
+        s = parse_cv_sections(UK_CV_TEXT)
+        profile = ' '.join(s['profile'])
+        # The whole profile survives, including the sentence after 'experience'.
+        self.assertIn('seeking a role in a dynamic agency', profile)
+        # And the experience section holds only real roles, not profile prose.
+        self.assertNotIn('Results-driven', ' '.join(s['experience']))
+
+    def test_heading_aliases_and_markdown(self):
+        from jobs.services.pdf_generator import parse_cv_sections
+        s = parse_cv_sections(
+            'Bob\n\n## Personal Statement\nHi.\n\n**Work History**\nAcme | Dev\n'
+        )
+        self.assertIn('Hi.', s['profile'])
+        self.assertIn('Acme | Dev', s['experience'])
+
+    def test_renders_uk_pdf_with_sections(self):
+        from PyPDF2 import PdfReader
+        path = os.path.join(_TEST_MEDIA, 'uk.pdf')
+        generate_tailored_pdf(UK_CV_TEXT, 'Amanda Turner', 'SEO Executive', 'XYZ', path)
+        text = PdfReader(path).pages[0].extract_text()
+        for needle in ['AMANDA TURNER', 'PROFESSIONAL PROFILE', 'KEY SKILLS',
+                       'PROFESSIONAL EXPERIENCE', 'EDUCATION', 'CERTIFICATIONS',
+                       'Technical SEO', 'Upper Second Class']:
+            self.assertIn(needle, text)
+
+
 @override_settings(MEDIA_ROOT=_TEST_MEDIA)
 class ExcelExportTests(TestCase):
     def setUp(self):
