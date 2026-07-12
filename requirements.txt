@@ -7,6 +7,7 @@ requests
 google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
+gspread
 openai>=1.0
 apify-client
 reportlab

@@ -10,6 +10,7 @@ HEADERS = [
     'Job Title', 'Company', 'Location', 'Date Posted', 'Employment Type',
     'Seniority Level', 'Salary', 'Sponsorship Flag', 'Match Score',
     'Match Reason', 'Application Link', 'Tailored CV Filename',
+    'Job Required Skills', 'Missing Skills', 'ATS Score',
 ]
 
 # 1-based index of the Match Score column (for colour coding).
@@ -48,6 +49,9 @@ def _job_row(job):
         job.match_reason,
         job.application_link,
         tailored_name,
+        ', '.join(job.job_skills or []),
+        ', '.join(job.missing_skills or []),
+        job.ats_score if job.ats_score is not None else '',
     ]
 
 
@@ -77,7 +81,7 @@ def build_workbook(search_run):
     ws.freeze_panes = 'A2'
     last_col = get_column_letter(len(HEADERS))
     ws.auto_filter.ref = f'A1:{last_col}{ws.max_row}'
-    widths = [30, 24, 22, 14, 16, 16, 18, 16, 12, 45, 40, 32]
+    widths = [30, 24, 22, 14, 16, 16, 18, 16, 12, 45, 40, 32, 30, 30, 10]
     for col, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(col)].width = width
 

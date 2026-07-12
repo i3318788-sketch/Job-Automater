@@ -53,11 +53,15 @@ OPENAI_TAILOR_MODEL = env('OPENAI_TAILOR_MODEL', default='gpt-4o-mini')
 MATCH_THRESHOLD = env.int('MATCH_THRESHOLD', default=75)
 
 # Max jobs processed per search (bounds task time & API cost).
-MAX_JOBS_PER_SEARCH = env.int('MAX_JOBS_PER_SEARCH', default=50)
+MAX_JOBS_PER_SEARCH = env.int('MAX_JOBS_PER_SEARCH', default=200)
 
 # Cap the number of jobs sent to OpenAI for scoring (cost control). Jobs beyond
 # this limit are stored unscored with a note.
 OPENAI_MAX_SCORED_JOBS = env.int('OPENAI_MAX_SCORED_JOBS', default=50)
+
+# Stage-1 filter: a job needs at least this % keyword overlap with the CV before
+# we spend an OpenAI call on it. Lower it if too few jobs reach OpenAI scoring.
+KEYWORD_PRESCORE_THRESHOLD = env.int('KEYWORD_PRESCORE_THRESHOLD', default=60)
 
 # ---------------------------------------------------------------------------
 # Applications

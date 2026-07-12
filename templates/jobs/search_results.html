@@ -28,8 +28,9 @@
             <table>
                 <thead>
                     <tr>
-                        <th>Score</th><th>Title</th><th>Company</th><th>Location</th>
-                        <th>Salary</th><th>Sponsorship</th><th>Reason</th><th>Tailored CV</th><th>Apply</th>
+                        <th>Score</th><th>ATS</th><th>Title</th><th>Company</th><th>Location</th>
+                        <th>Salary</th><th>Sponsorship</th><th>Reason</th><th>Missing skills</th>
+                        <th>Tailored CV</th><th>Apply</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -40,6 +41,11 @@
                                 {% elif job.match_score >= 50 %}<span class="badge badge-lg badge-yellow">{{ job.match_score }}</span>
                                 {% else %}<span class="badge badge-lg badge-red">{{ job.match_score|default:"0" }}</span>{% endif %}
                             </td>
+                            <td>
+                                {% if job.ats_score %}
+                                    <span class="badge {% if job.ats_score >= 90 %}badge-green{% elif job.ats_score >= 70 %}badge-yellow{% else %}badge-red{% endif %}">{{ job.ats_score }}</span>
+                                {% else %}<span class="muted">—</span>{% endif %}
+                            </td>
                             <td>{{ job.title }}</td>
                             <td>{{ job.company|default:"—" }}</td>
                             <td>{{ job.location|default:"—" }}</td>
@@ -49,6 +55,11 @@
                                 {% else %}<span class="muted">{{ job.get_sponsorship_flag_display }}</span>{% endif %}
                             </td>
                             <td>{{ job.match_reason|default:"—" }}</td>
+                            <td>
+                                {% if job.missing_skills %}
+                                    <span class="muted" title="{{ job.missing_skills|join:', ' }}">{{ job.missing_skills|join:", "|truncatechars:40 }}</span>
+                                {% else %}<span class="muted">—</span>{% endif %}
+                            </td>
                             <td>{% if job.tailored_pdf %}<a href="{{ job.tailored_pdf.url }}" target="_blank" rel="noopener">PDF</a>{% else %}—{% endif %}</td>
                             <td>{% if job.application_link %}<a href="{{ job.application_link }}" target="_blank" rel="noopener">Link</a>{% else %}—{% endif %}</td>
                         </tr>

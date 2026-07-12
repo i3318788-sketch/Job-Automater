@@ -120,22 +120,26 @@ COUNTRY_CODES = {
 }
 
 
-def _build_actor_input(location, min_salary, limit):
+def _build_actor_input(location, min_salary, limit, keywords=None):
     """Build input for the ``doggo/uk-jobs-board-scraper`` actor.
 
-    The actor requires ``keyword`` and ``location`` (enums, overridable by the
-    ``custom_*`` fields) and expects ``searchTerms`` to be an array. See the
-    actor's input schema for the full field list.
+    Field names follow the actor's real input schema: ``keyword``/``location``
+    are required enums (overridden by the ``custom_*`` fields), ``searchTerms``
+    is an array of extra roles searched separately, ``max_results`` has a
+    minimum of 100, and the salary field is ``salary_min``.
     """
     country_code = COUNTRY_CODES.get((location or '').strip().lower(), 'uk')
-    keyword = getattr(settings, 'APIFY_SEARCH_KEYWORD', '') or 'software engineer'
+
+    terms = [str(k).strip() for k in (keywords or []) if str(k).strip()]
+    if not terms:
+        terms = [getattr(settings, 'APIFY_SEARCH_KEYWORD', '') or 'software engineer']
 
     actor_input = {
-        # Required enum preset; custom_keyword overrides it with our real term.
+        # Required enum preset; custom_keyword overrides it with our primary term.
         'keyword': 'software engineer',
-        'custom_keyword': keyword,
-        # MUST be an array for this actor (empty = rely on keyword only).
-        'searchTerms': [],
+        'custom_keyword': terms[0],
+        # Remaining terms are searched separately by the actor (must be an array).
+        'searchTerms': terms[1:],
         # Required enum preset; custom_location overrides it with the requested area.
         'location': 'London',
         'custom_location': location or 'United Kingdom',
@@ -150,7 +154,7 @@ def _build_actor_input(location, min_salary, limit):
     return actor_input
 
 
-def search_jobs(country_list, min_salary=None, limit=200):
+def search_jobs(country_list, min_salary=None, limit=200, keywords=None):
     """Run the Apify jobs actor and return a list of normalized job dicts.
 
     Args:
@@ -158,6 +162,8 @@ def search_jobs(country_list, min_salary=None, limit=200):
             primary location for the actor input.
         min_salary: optional int minimum salary passed to the actor if supported.
         limit: maximum number of jobs to return (default 200).
+        keywords: list of role titles to search (first is the primary keyword,
+            the rest go to ``searchTerms`` and are searched separately).
 
     Raises:
         ApifyConfigError: if APIFY_API_TOKEN is not configured.
@@ -175,9 +181,12 @@ def search_jobs(country_list, min_salary=None, limit=200):
         raise ApifySearchError('apify-client is not installed') from exc
 
     client = ApifyClient(token)
-    actor_input = _build_actor_input(location, min_salary, limit)
+    actor_input = _build_actor_input(location, min_salary, limit, keywords=keywords)
 
-    logger.info('Starting Apify actor %s for location=%s', DEFAULT_ACTOR_ID, location)
+    logger.info(
+        'Starting Apify actor %s for location=%s keywords=%s',
+        DEFAULT_ACTOR_ID, location, [actor_input['custom_keyword']] + actor_input['searchTerms'],
+    )
     try:
         run = client.actor(DEFAULT_ACTOR_ID).call(run_input=actor_input)
     except Exception as exc:
@@ -204,22 +213,53 @@ def search_jobs(country_list, min_salary=None, limit=200):
     return filtered
 
 
-def _filter_by_location(jobs, country_list):
-    """Keep jobs whose location mentions any requested country.
+# Cities/regions accepted as belonging to a requested country. The actor already
+# scopes results by country, so this filter mainly guards against stray results.
+COUNTRY_ALIASES = {
+    'uk': [
+        'uk', 'u.k.', 'united kingdom', 'england', 'scotland', 'wales',
+        'northern ireland', 'britain', 'gb', 'remote',
+        'london', 'manchester', 'birmingham', 'leeds', 'glasgow', 'edinburgh',
+        'liverpool', 'bristol', 'sheffield', 'cardiff', 'belfast', 'nottingham',
+        'newcastle', 'leicester', 'cambridge', 'oxford', 'reading', 'brighton',
+        'southampton', 'coventry', 'hayes', 'milton keynes', 'aberdeen',
+    ],
+    'us': ['us', 'usa', 'u.s.', 'united states', 'new york', 'san francisco',
+           'seattle', 'austin', 'boston', 'chicago', 'remote'],
+    'de': ['germany', 'deutschland', 'berlin', 'munich', 'hamburg', 'remote'],
+    'fr': ['france', 'paris', 'lyon', 'remote'],
+    'nl': ['netherlands', 'holland', 'amsterdam', 'rotterdam', 'remote'],
+    'au': ['australia', 'sydney', 'melbourne', 'brisbane', 'remote'],
+    'remote': ['remote', 'anywhere', 'flexible'],
+}
 
-    If no job matches (e.g. the actor returns short/blank locations), fall back
-    to returning everything rather than silently dropping all results.
+
+def _filter_by_location(jobs, country_list):
+    """Keep jobs whose location plausibly belongs to a requested country.
+
+    Matching is deliberately permissive (country names, synonyms and major
+    cities, substring both ways). If nothing matches — e.g. the actor returns
+    unusual location labels — everything is returned rather than silently
+    dropping all results.
     """
     if not country_list:
         return jobs
-    needles = [c.lower() for c in country_list if c]
-    # "United Kingdom" jobs are often labelled by city/region, so also accept
-    # common UK synonyms when the UK is requested.
-    if any('united kingdom' in n for n in needles):
-        needles += ['uk', 'england', 'scotland', 'wales', 'northern ireland']
 
-    matched = [
-        job for job in jobs
-        if any(n in job['location'].lower() for n in needles)
-    ]
+    needles = set()
+    for country in country_list:
+        if not country:
+            continue
+        lowered = country.strip().lower()
+        needles.add(lowered)
+        code = COUNTRY_CODES.get(lowered)
+        needles.update(COUNTRY_ALIASES.get(code, []))
+
+    matched = []
+    for job in jobs:
+        job_loc = (job.get('location') or '').lower()
+        if not job_loc:
+            matched.append(job)  # unknown location -> don't drop it
+            continue
+        if any(n in job_loc or job_loc in n for n in needles):
+            matched.append(job)
     return matched or jobs

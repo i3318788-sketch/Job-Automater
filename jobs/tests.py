@@ -55,6 +55,7 @@ class PreferencesViewTests(TestCase):
         self.assertEqual(str(prefs.salary_max), '80000.00')
 
 
+@override_settings(OPENAI_API_KEY='')
 class CVUploadTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user(username='dave', password='pw12345!')
@@ -106,6 +107,43 @@ class ApifyInputTests(TestCase):
         job = normalize_job({'title': 'Dev', 'company': 'Acme', 'applyUrl': 'https://x/1'})
         self.assertEqual(job['applyLink'], 'https://x/1')
         self.assertEqual(job['title'], 'Dev')
+
+
+class KeywordExtractorTests(TestCase):
+    def test_extract_skills_from_text(self):
+        from jobs.services.keyword_extractor import extract_skills_from_text
+        skills = extract_skills_from_text('Experienced in Python, Django and AWS. Also SEO.')
+        self.assertIn('python', skills)
+        self.assertIn('django', skills)
+        self.assertIn('aws', skills)
+        self.assertIn('seo', skills)
+        # Word-boundary matching: "r" shouldn't match inside other words.
+        self.assertNotIn('java', extract_skills_from_text('I use javascript only'))
+
+    def test_search_keywords_prefer_job_titles(self):
+        from jobs.services.keyword_extractor import extract_search_keywords
+        data = {'job_titles': ['SEO Executive', 'SEO Specialist'], 'skills': ['seo']}
+        self.assertEqual(extract_search_keywords(data), ['SEO Executive', 'SEO Specialist'])
+
+    def test_search_keywords_fallback_to_raw_text(self):
+        from jobs.services.keyword_extractor import extract_search_keywords
+        kws = extract_search_keywords({'raw_text': 'I am a seo executive with 5 years'})
+        self.assertIn('seo executive', kws)
+
+    def test_keyword_match_score_and_missing(self):
+        from jobs.services.keyword_extractor import keyword_match_score, missing_skills
+        # CV covers 2 of the job's 4 required skills -> 50%.
+        self.assertEqual(keyword_match_score(['python', 'sql'], ['python', 'sql', 'aws', 'go']), 50)
+        # Neutral when either side has no skills (so nothing gets unfairly filtered).
+        self.assertEqual(keyword_match_score([], ['python']), 50)
+        self.assertEqual(missing_skills(['python'], ['python', 'aws']), ['aws'])
+
+    def test_role_salary_range(self):
+        from jobs.services.keyword_extractor import get_salary_range
+        self.assertEqual(get_salary_range(['Junior Developer'])[0], 35000)  # 'developer' wins
+        self.assertEqual(get_salary_range(['SEO Executive'])[0], 25000)
+        self.assertEqual(get_salary_range(['Director of Ops'])[0], 60000)
+        self.assertEqual(get_salary_range(['Unknown Role'], default_min=27000)[0], 27000)
 
 
 class MatchingHelperTests(TestCase):
@@ -194,7 +232,7 @@ TWO_RAW_JOBS = [
 ]
 
 
-@override_settings(MEDIA_ROOT=_TEST_MEDIA)
+@override_settings(MEDIA_ROOT=_TEST_MEDIA, OPENAI_API_KEY='')
 class StartSearchViewTests(TestCase):
     """The view only enqueues a task; the workflow itself is tested separately."""
 
@@ -260,7 +298,7 @@ class SearchStatusViewTests(TestCase):
         self.assertEqual(response.status_code, 404)
 
 
-@override_settings(MEDIA_ROOT=_TEST_MEDIA)
+@override_settings(MEDIA_ROOT=_TEST_MEDIA, OPENAI_API_KEY='')
 class ProfileManagementTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user(username='pat', password='pw12345!')
@@ -385,7 +423,7 @@ class ClearHistoryAndStatusTests(TestCase):
         self.assertEqual(data['progress'], 50)
 
 
-@override_settings(MEDIA_ROOT=_TEST_MEDIA)
+@override_settings(MEDIA_ROOT=_TEST_MEDIA, OPENAI_API_KEY='')
 class RunJobSearchTests(TestCase):
     """Exercises the async workflow function directly (no Celery/broker needed)."""
 
@@ -397,7 +435,7 @@ class RunJobSearchTests(TestCase):
             status=SearchRun.STATUS_PENDING,
         )
 
-    @mock.patch('jobs.tasks.log_job_to_sheet')
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
     @mock.patch('jobs.tasks.compute_match_score')
     @mock.patch('jobs.tasks.search_jobs')
     def test_workflow_creates_jobs_and_completes(self, mock_search, mock_score, mock_sheet):
@@ -421,7 +459,8 @@ class RunJobSearchTests(TestCase):
         self.assertEqual(jobs['Junior Dev'].match_reason, 'Salary below minimum')
         self.assertFalse(jobs['Junior Dev'].tailored_pdf)
         self.assertEqual(mock_score.call_count, 1)
-        self.assertEqual(mock_sheet.call_count, 2)
+        # Every job is logged to the candidate's Google Sheets tab.
+        self.assertEqual(mock_sheet.return_value.log_job.call_count, 2)
 
     @mock.patch('jobs.tasks.search_jobs')
     def test_workflow_marks_failed_on_apify_error(self, mock_search):
@@ -437,7 +476,7 @@ class RunJobSearchTests(TestCase):
         self.assertEqual(self.run.jobs.count(), 0)
 
     @override_settings(OPENAI_MAX_SCORED_JOBS=1)
-    @mock.patch('jobs.tasks.log_job_to_sheet')
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
     @mock.patch('jobs.tasks.compute_match_score')
     @mock.patch('jobs.tasks.search_jobs')
     def test_scoring_cap_respected(self, mock_search, mock_score, mock_sheet):
@@ -459,7 +498,7 @@ class RunJobSearchTests(TestCase):
         self.assertIn('Not scored (scoring limit reached)', reasons)
 
 
-@override_settings(MEDIA_ROOT=_TEST_MEDIA, CELERY_TASK_ALWAYS_EAGER=True)
+@override_settings(MEDIA_ROOT=_TEST_MEDIA, CELERY_TASK_ALWAYS_EAGER=True, OPENAI_API_KEY='')
 class CeleryTaskTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user(username='oscar', password='pw12345!')
@@ -468,7 +507,7 @@ class CeleryTaskTests(TestCase):
             user=self.user, countries=['United Kingdom'], status=SearchRun.STATUS_PENDING,
         )
 
-    @mock.patch('jobs.tasks.log_job_to_sheet')
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
     @mock.patch('jobs.tasks.compute_match_score')
     @mock.patch('jobs.tasks.search_jobs')
     def test_task_runs_workflow(self, mock_search, mock_score, mock_sheet):
@@ -574,23 +613,58 @@ class GoogleSheetsTests(TestCase):
         self.job = Job.objects.create(
             search_run=self.run, title='Dev', company='Acme', location='London',
             match_score=90, application_link='https://x.com/1',
+            job_skills=['python', 'sql'], missing_skills=['sql'], ats_score=92,
         )
 
-    def test_skips_when_not_configured(self):
-        from jobs.services.google_sheets import log_job_to_sheet
+    def test_disabled_when_not_configured(self):
+        from jobs.services.google_sheets import GoogleSheetsLogger
         with override_settings(GOOGLE_SHEET_ID='', GOOGLE_SHEETS_CREDENTIALS_JSON=''):
-            self.assertFalse(log_job_to_sheet(self.job))
+            sheets = GoogleSheetsLogger()
+        self.assertFalse(sheets.enabled)
+        self.assertFalse(sheets.log_job(self.job, 'Gina'))
+
+    def test_sanitize_tab_name(self):
+        from jobs.services.google_sheets import sanitize_tab_name
+        self.assertEqual(sanitize_tab_name('Haseeb Ijaz'), 'Haseeb Ijaz')
+        self.assertEqual(sanitize_tab_name('A/B:C[D]'), 'A-B-C-D-')
+        self.assertEqual(sanitize_tab_name(''), 'Candidate')
+        self.assertEqual(len(sanitize_tab_name('x' * 80)), 50)
+
+    def test_build_row_matches_headers(self):
+        from jobs.services.google_sheets import HEADERS, GoogleSheetsLogger
+        with override_settings(GOOGLE_SHEET_ID='', GOOGLE_SHEETS_CREDENTIALS_JSON=''):
+            sheets = GoogleSheetsLogger()
+        row = sheets.build_row(self.job, cv_skills=['python', 'django'])
+        self.assertEqual(len(row), len(HEADERS))
+        self.assertIn('Dev', row)
+        self.assertEqual(row[HEADERS.index('Match Score')], 90)
+        self.assertEqual(row[HEADERS.index('ATS Score')], 92)
+        self.assertEqual(row[HEADERS.index('CV Parsed Skills')], 'python, django')
+        self.assertEqual(row[HEADERS.index('Job Required Skills')], 'python, sql')
+        self.assertEqual(row[HEADERS.index('Missing Skills')], 'sql')
 
     @mock.patch('jobs.services.google_sheets.os.path.exists', return_value=True)
-    @mock.patch('jobs.services.google_sheets._get_service')
-    def test_appends_row_when_configured(self, mock_service, _exists):
-        from jobs.services.google_sheets import log_job_to_sheet
-        append = mock_service.return_value.spreadsheets.return_value.values.return_value.append
-        append.return_value.execute.return_value = {}
+    def test_creates_tab_per_candidate_and_appends(self, _exists):
+        from jobs.services.google_sheets import GoogleSheetsLogger, HEADERS
+        import gspread
+
         with override_settings(GOOGLE_SHEET_ID='sheet123',
                                GOOGLE_SHEETS_CREDENTIALS_JSON='/fake/creds.json'):
-            self.assertTrue(log_job_to_sheet(self.job))
-        append.assert_called_once()
-        # The appended row carries the job's values.
-        body = append.call_args.kwargs['body']
-        self.assertIn('Dev', body['values'][0])
+            with mock.patch('gspread.authorize') as authorize, \
+                 mock.patch('google.oauth2.service_account.Credentials.from_service_account_file'):
+                sheet = authorize.return_value.open_by_key.return_value
+                # Candidate has no tab yet -> a new one is created with headers.
+                sheet.worksheet.side_effect = gspread.exceptions.WorksheetNotFound('nope')
+                new_tab = sheet.add_worksheet.return_value
+
+                sheets = GoogleSheetsLogger()
+                self.assertTrue(sheets.enabled)
+                self.assertTrue(sheets.log_job(self.job, 'Haseeb Ijaz', cv_skills=['python']))
+
+        sheet.add_worksheet.assert_called_once()
+        self.assertEqual(sheet.add_worksheet.call_args.kwargs['title'], 'Haseeb Ijaz')
+        # First append writes headers, second writes the job row.
+        first_call = new_tab.append_row.call_args_list[0].args[0]
+        second_call = new_tab.append_row.call_args_list[1].args[0]
+        self.assertEqual(first_call, HEADERS)
+        self.assertIn('Dev', second_call)

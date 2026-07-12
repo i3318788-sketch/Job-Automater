@@ -160,9 +160,26 @@ python manage.py test_openai
   downloads `search_results_<id>.xlsx` with all fields, frozen header, autofilter,
   bold grey header, and a colour-coded Match Score column (green ≥75, yellow
   50–74, red <50). Available only for COMPLETED runs.
-- **Google Sheets** (`jobs/services/google_sheets.py`): `log_job_to_sheet()`
-  appends one row per job via a service account. Best-effort — missing
+- **Google Sheets** (`jobs/services/google_sheets.py`): `GoogleSheetsLogger`
+  appends one row per job into a **tab per candidate** (created on demand with
+  headers) inside a single sheet. Columns include the job fields plus CV skills,
+  job-required skills, missing skills and the ATS score. Best-effort — missing
   credentials or API errors are logged, never fatal.
+
+## Matching pipeline
+
+- **CV keyword extraction** (`jobs/services/keyword_extractor.py`): on upload the
+  CV is mined for `skills` and `job_titles` (via OpenAI, with a deterministic
+  vocabulary fallback). Those job titles become the **Apify search terms**, so
+  each candidate is searched for their own roles instead of a hardcoded keyword.
+- **Two-stage scoring**: Stage 1 computes a cheap keyword-overlap score against
+  the skills mined from the job description. Only jobs scoring at least
+  `KEYWORD_PRESCORE_THRESHOLD` (default 60) go to Stage 2 (OpenAI), which keeps
+  cost down. Jobs below the bar are still saved, scored by keyword overlap and
+  labelled — they're never silently dropped. The gate is skipped entirely when
+  either side yields no skills, so a CV we can't mine is never filtered out.
+- **ATS score**: after a tailored CV is generated, a second OpenAI check
+  estimates how it would score in an ATS for that job (`Job.ats_score`).
 
 ### Setting up Google Sheets (optional)
 

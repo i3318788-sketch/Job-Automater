@@ -12,6 +12,11 @@ from django.views.decorators.http import require_POST
 from .forms import CVUploadForm, ProfileForm, UserPreferencesForm
 from .models import CV, Job, SearchRun, UserPreferences
 from .services.excel_export import build_workbook
+from .services.keyword_extractor import (
+    extract_cv_profile,
+    extract_search_keywords,
+    get_salary_range,
+)
 from .tasks import process_job_search
 from .utils import SESSION_ACTIVE_CV, extract_cv_text, resolve_active_cv
 
@@ -146,16 +151,23 @@ def upload_cv(request):
                 )
             else:
                 cv.parsed_text = parsed_text
-                # Simple structured data for now; refined in a later phase.
+                # Mine skills and the roles this candidate should search for; these
+                # drive the job-search keywords and the keyword pre-scoring stage.
+                profile_data = extract_cv_profile(parsed_text)
                 cv.parsed_data = {
                     'raw_text': parsed_text,
-                    'skills': [],
+                    'skills': profile_data['skills'],
+                    'job_titles': profile_data['job_titles'],
                     'experience': [],
                     'education': [],
                 }
                 cv.save()
                 request.session[SESSION_ACTIVE_CV] = cv.pk
-                messages.success(request, 'CV uploaded and parsed successfully.')
+                messages.success(
+                    request,
+                    'CV uploaded and parsed. Search keywords: '
+                    + (', '.join(profile_data['job_titles'][:5]) or 'default'),
+                )
                 return redirect('dashboard')
     else:
         form = CVUploadForm(instance=active_cv)
@@ -198,6 +210,15 @@ def start_search(request):
     preferences = UserPreferences.objects.filter(user=request.user).first()
     countries = (preferences.target_countries if preferences else None) or ['United Kingdom']
     min_salary, max_salary = get_effective_salary_range(request.user)
+
+    # If the user never set a minimum, derive a sensible one from the CV's target
+    # roles instead of a flat system default (a junior role shouldn't be filtered
+    # out by a £30k floor, and a director role shouldn't use one either).
+    if preferences is None or preferences.salary_min is None:
+        keywords = extract_search_keywords(active_cv.parsed_data or {})
+        role_min, _role_max = get_salary_range(keywords, default_min=int(min_salary))
+        min_salary = role_min
+        logger.info('Derived role-based minimum salary %s from %s', role_min, keywords)
 
     search_run = SearchRun.objects.create(
         user=request.user,

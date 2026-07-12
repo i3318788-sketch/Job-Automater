@@ -15,8 +15,15 @@ from django.core.mail import send_mail
 
 from .models import CV, Job, SearchRun
 from .services.apify_service import ApifyConfigError, ApifySearchError, search_jobs
-from .services.google_sheets import log_job_to_sheet
+from .services.google_sheets import GoogleSheetsLogger
+from .services.keyword_extractor import (
+    extract_search_keywords,
+    extract_skills_from_text,
+    keyword_match_score,
+    missing_skills,
+)
 from .services.matching import (
+    compute_ats_score,
     compute_match_score,
     detect_sponsorship,
     salary_within_range,
@@ -36,6 +43,9 @@ def _generate_tailored_pdf_for_job(job, cv_text, candidate_name):
     try:
         tailored = tailor_cv_for_job(cv_text, job.description, job.title, job.company)
         job.tailored_text = tailored
+
+        # Estimate how the tailored CV would fare in an ATS for this job.
+        job.ats_score = compute_ats_score(tailored, job.description)
 
         filename = build_pdf_filename(candidate_name, job.title, job.company)
         tmp_path = os.path.join(tempfile.gettempdir(), filename)
@@ -100,16 +110,25 @@ def run_job_search(search_run_id):
     if cv is None:
         return _fail(search_run, 'No CV found for user.')
 
-    max_jobs = getattr(settings, 'MAX_JOBS_PER_SEARCH', 50)
+    max_jobs = getattr(settings, 'MAX_JOBS_PER_SEARCH', 200)
     match_threshold = getattr(settings, 'MATCH_THRESHOLD', 75)
     max_scored = getattr(settings, 'OPENAI_MAX_SCORED_JOBS', 50)
+    prescore_threshold = getattr(settings, 'KEYWORD_PRESCORE_THRESHOLD', 60)
 
     countries = search_run.countries or ['United Kingdom']
     min_salary = search_run.min_salary
     max_salary = search_run.max_salary
 
+    # Search terms come from the CV itself (roles the candidate should target).
+    cv_data = cv.parsed_data or {}
+    cv_skills = cv_data.get('skills') or []
+    keywords = extract_search_keywords(cv_data)
+    logger.info('Search %s using keywords: %s', search_run.pk, keywords)
+
     try:
-        raw_jobs = search_jobs(countries, min_salary=min_salary, limit=max_jobs)
+        raw_jobs = search_jobs(
+            countries, min_salary=min_salary, limit=max_jobs, keywords=keywords,
+        )
     except ApifyConfigError as exc:
         return _fail(search_run, f'Apify not configured: {exc}')
     except ApifySearchError as exc:
@@ -128,6 +147,9 @@ def run_job_search(search_run_id):
     search_run.total_jobs = len(raw_jobs)
     search_run.save(update_fields=['total_jobs'])
 
+    # One Sheets client per run (authenticating per job would be very slow).
+    sheets = GoogleSheetsLogger()
+
     created = 0
     tailored = 0
     scored = 0
@@ -139,17 +161,32 @@ def run_job_search(search_run_id):
                 raw.get('salary', ''), min_salary, max_salary,
             )
 
+            # Stage 1: cheap keyword pre-score against the job's required skills.
+            job_skills = extract_skills_from_text(f"{description} {raw.get('title', '')}")
+            gaps = missing_skills(cv_skills, job_skills)
+            prescore = keyword_match_score(cv_skills, job_skills)
+            # Only gate on the pre-score when both sides actually yielded skills —
+            # otherwise we'd filter out every job for a CV we couldn't mine.
+            can_prescore = bool(cv_skills) and bool(job_skills)
+
             if not within:
                 score, reason = 0, range_reason  # below min or above max
             elif scored >= max_scored:
                 # Cost cap reached: store the job but skip OpenAI scoring.
                 score, reason = 0, 'Not scored (scoring limit reached)'
+            elif can_prescore and prescore < prescore_threshold:
+                # Stage 1 filter: too little skill overlap to spend an OpenAI call.
+                score = prescore
+                reason = f'Pre-screened: {prescore}% keyword overlap (below threshold)'
             else:
+                # Stage 2: precise OpenAI scoring for the jobs that qualified.
                 result = compute_match_score(cv_text, description)
                 score, reason = result['score'], result['reason']
                 scored += 1
 
             job = Job.objects.create(
+                job_skills=job_skills,
+                missing_skills=gaps,
                 search_run=search_run,
                 title=raw.get('title', '')[:255] or 'Untitled',
                 company=raw.get('company', '')[:255],
@@ -172,7 +209,9 @@ def run_job_search(search_run_id):
                     tailored += 1
                 job.save()
 
-            log_job_to_sheet(job)
+            # Best-effort logging to the candidate's own tab in the Google Sheet.
+            if sheets.enabled:
+                sheets.log_job(job, candidate_name, cv_skills=cv_skills)
             _set_progress(search_run, index / total * 100)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception('Search %s failed during processing', search_run.pk)

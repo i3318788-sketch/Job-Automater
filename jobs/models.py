@@ -160,6 +160,11 @@ class Job(models.Model):
     )
     match_score = models.IntegerField(null=True, blank=True)
     match_reason = models.TextField(blank=True)
+    # Skills mined from the job description, and those the CV is missing.
+    job_skills = models.JSONField(default=list, blank=True)
+    missing_skills = models.JSONField(default=list, blank=True)
+    # Estimated ATS score (0-100) of the tailored CV against this job.
+    ats_score = models.IntegerField(null=True, blank=True)
     application_link = models.URLField(max_length=500)
     tailored_pdf = models.FileField(
         upload_to='tailored_cvs/', null=True, blank=True
