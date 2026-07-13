@@ -1,19 +1,22 @@
 """ATS-style CV checker.
 
-Simulates how an Applicant Tracking System reads and ranks a CV against a job
-description, in seven phases:
+Scores a CV against a job description the way an Applicant Tracking System reads
+it, in five phases:
 
-    1. Parsing & technical formatting  (hard filter — needs the CV *file*)
-    2. Knock-out filters               (hard filter — needs the job's requirements)
+    1. Parsing & technical formatting  (scored — needs the CV *file*)
     3. Keyword matching                (scored)
     4. Context & proximity             (scored)
     5. Experience & chronology         (scored)
     6. Education parsing               (scored)
-    7. Final scoring & ranking
 
-Phases 1 and 2 are pass/fail: failing either means the CV would never reach a
-human, so the caller should treat the result as "ATS Rejected" regardless of the
-score. Phases 3-6 produce the weighted 0-100 score.
+Every phase is scored; NONE of them rejects. There is deliberately no knock-out
+phase: a checker that answers "would a real ATS bin this?" produces a wall of
+rejections that tells the candidate nothing about which jobs are worth their
+time, which is the only question this app exists to answer. The phase numbering
+keeps its historical gap at 2 so the report keys stay stable.
+
+Phases 3-6 dominate the weighted 0-100 score; phase 1 contributes a little and
+mainly exists to produce formatting advice.
 
 The checker is deterministic and offline — no API calls — so it is cheap enough
 to run on every job in a search, and its scores are reproducible.
@@ -116,7 +119,8 @@ SYNONYMS = {
     'devops': ['sre', 'site reliability'],
 }
 
-# Certifications an ATS knock-out filter commonly searches for by exact name.
+# Certifications an ATS searches for by exact name. They are scored keywords, not
+# a filter: a missing certification costs points, it never bins the job.
 CERTIFICATIONS = [
     'pmp', 'prince2', 'capm', 'csm', 'safe', 'cpa', 'acca', 'cima', 'cfa',
     'shrm-cp', 'shrm-scp', 'cipd', 'phr', 'sphr', 'cissp', 'cisa', 'cism',
@@ -128,7 +132,8 @@ CERTIFICATIONS = [
     'chartered engineer', 'rics', 'acca', 'aat',
 ]
 
-# Degree hierarchy. Higher number = higher level; a knock-out compares levels.
+# Degree hierarchy. Higher number = higher level. Read to score (and to protect)
+# the education section — never to disqualify a candidate.
 DEGREE_LEVELS = [
     (5, 'Doctorate', [
         'phd', 'ph.d', 'doctorate', 'doctoral', 'dphil', 'md', 'edd',
@@ -158,27 +163,6 @@ UK_CLASSIFICATIONS = {
     'distinction': 4.0, 'merit': 3.3, 'pass': 2.5,
 }
 
-WORK_AUTH_PATTERNS = [
-    ('Citizen', r'\b(?:uk|us|british|american|eu)\s+citizen(?:ship)?\b|\bcitizen of\b'),
-    ('Permanent Resident', r'\b(?:green card|permanent resident|indefinite leave to remain|ilr|settled status)\b'),
-    ('Authorised to Work', r'\b(?:right to work|authoriz?sed to work|authorized to work|work permit|no sponsorship required|eligible to work)\b'),
-    ('Requires Sponsorship', r'\b(?:requires? sponsorship|need(?:s|ing)? sponsorship|visa sponsorship required|tier 2 sponsorship|skilled worker visa)\b'),
-]
-
-RELOCATION_RE = re.compile(
-    r'\b(?:willing to relocate|open to relocation|happy to relocate|will relocate|'
-    r'relocating to|open to relocating)\b',
-    re.IGNORECASE,
-)
-
-# "5+ years", "at least 3 years", "minimum of 7 years' experience"
-YEARS_REQUIRED_RE = re.compile(
-    r'(\d{1,2})\s*\+?\s*(?:-\s*\d{1,2}\s*)?(?:or more\s+)?year[s]?(?:’|\')?'
-    r'(?:\s+of)?(?:\s+(?:relevant|proven|professional|commercial|hands-on|industry))?'
-    r'(?:\s+work)?\s+experience',
-    re.IGNORECASE,
-)
-
 # Numbers, percentages, currency, and magnitudes — evidence of quantified impact.
 QUANTIFIER_RE = re.compile(
     r'(?:\d+(?:[.,]\d+)*\s*%|[£$€]\s?\d|\b\d+(?:[.,]\d+)*\s*(?:k|m|bn|million|billion)\b|\b\d+(?:[.,]\d+)*\b)',
@@ -186,13 +170,6 @@ QUANTIFIER_RE = re.compile(
 )
 
 GPA_RE = re.compile(r'\bgpa[:\s]*(?:of\s*)?(\d\.\d{1,2})\b', re.IGNORECASE)
-
-# "Minimum GPA 3.5", "GPA of 3.5 or higher", "minimum 2:1 degree"
-GPA_REQUIRED_RE = re.compile(
-    r'(?:minimum|min\.?|at least|above|requires?)\s*(?:a\s*)?(?:gpa\s*(?:of\s*)?)?'
-    r'(\d\.\d{1,2})|gpa\s*(?:of\s*)?(\d\.\d{1,2})\s*(?:or\s+(?:higher|above)|\+)',
-    re.IGNORECASE,
-)
 
 MONTHS = {
     'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6, 'jul': 7,
@@ -505,65 +482,27 @@ def total_experience_years(text):
 
 
 # ---------------------------------------------------------------------------
-# Job-description requirement extraction (drives the Phase 2 knock-outs)
+# Job context
 # ---------------------------------------------------------------------------
 
-def extract_job_requirements(job_description, job_title='', job_location=''):
-    """Mine the hard requirements an ATS would knock candidates out on.
+def extract_job_context(job_description, job_title='', job_location=''):
+    """The job's identifying context: what it is called and where it is.
 
-    Every key is optional: a requirement the job description never states cannot
-    knock anybody out, so it is left as None/empty and the corresponding check
-    is skipped.
+    Deliberately thin. This used to mine "hard requirements" (years, degree,
+    certifications, GPA, work authorisation, location) that the checker then used
+    as knock-out filters, and the result was a search that rejected almost every
+    job: an advert saying "5 years' experience" or "PMP" would bin a strong
+    candidate outright, and a CV without a parsable postcode failed the location
+    filter on every single job in the run.
+
+    Those requirements are still *read* — they surface as scored keywords in
+    phase 3 and as advice in the recommendations — but nothing disqualifies a job
+    any more. The title is used to score title match (phase 4); the location is
+    carried for display only.
     """
-    text = job_description or ''
-    lowered = text.lower()
-
-    years = [int(m.group(1)) for m in YEARS_REQUIRED_RE.finditer(text)]
-    # Several figures usually means "3 years in X, 5 in Y" — the highest is the bar.
-    required_years = max(years) if years else None
-
-    required_education = None
-    for level, label, keywords in DEGREE_LEVELS:
-        if level < 3:
-            continue  # only degree-level requirements are true knock-outs
-        if any(_contains_term(lowered, kw) for kw in keywords):
-            # Take the *lowest* degree mentioned: "BSc or MSc" means a BSc suffices.
-            if required_education is None or level < required_education[0]:
-                required_education = (level, label)
-    required_education = required_education[1] if required_education else None
-
-    required_certs = [c for c in CERTIFICATIONS if _contains_term(lowered, c)]
-
-    required_gpa = None
-    gpa_match = GPA_REQUIRED_RE.search(text)
-    if gpa_match:
-        required_gpa = float(gpa_match.group(1) or gpa_match.group(2))
-    else:
-        # UK adverts state a classification ("2:1 or above"), not a GPA.
-        for phrase, value in UK_CLASSIFICATIONS.items():
-            if re.search(
-                r'(?:minimum|min\.?|at least|or above|or higher)[^.]{0,20}'
-                + re.escape(phrase) + r'|' + re.escape(phrase)
-                + r'[^.]{0,20}(?:or above|or higher|minimum)',
-                lowered,
-            ):
-                required_gpa = value
-                break
-
-    requires_auth = None
-    for label, pattern in WORK_AUTH_PATTERNS:
-        if re.search(pattern, lowered):
-            requires_auth = label
-            break
-
     return {
         'title': job_title or '',
-        'required_years': required_years,
-        'required_education': required_education,
-        'required_certifications': required_certs,
-        'required_gpa': required_gpa,
-        'required_location': job_location or '',
-        'work_authorization': requires_auth,
+        'location': job_location or '',
     }
 
 
@@ -935,23 +874,26 @@ def find_headings(cv_text):
 class ATSChecker:
     """Score a CV against a job description the way an ATS would.
 
+    Scores; never rejects. Every phase produces a number and some advice, and no
+    combination of them disqualifies the job.
+
     ``cv_text``          plain text of the CV (already extracted).
     ``job_description``  the job advert text.
-    ``job_requirements`` optional dict of hard requirements; when omitted they
-                         are mined from the job description itself.
+    ``job_context``      optional dict with the job's ``title`` and ``location``;
+                         when omitted it is taken from the description.
     ``file_path``        optional path to the original CV file. Without it the
                          Phase 1 file checks are skipped (headers are still
                          checked, as those come from the text).
     """
 
-    def __init__(self, cv_text, job_description, job_requirements=None, file_path=None):
+    def __init__(self, cv_text, job_description, job_context=None, file_path=None):
         self.cv_text = cv_text or ''
         self.job_description = job_description or ''
         self.file_path = file_path
-        self.job_requirements = (
-            job_requirements
-            if job_requirements is not None
-            else extract_job_requirements(self.job_description)
+        self.job_context = (
+            job_context
+            if job_context is not None
+            else extract_job_context(self.job_description)
         )
 
         self.cv_lower = self.cv_text.lower()
@@ -1247,60 +1189,7 @@ class ATSChecker:
         self.results['phase1_parsing'] = result
         return result
 
-    # -- Phase 2: knock-out filters -----------------------------------------
-
-    def check_experience_years(self, required_years=None):
-        required = required_years if required_years is not None \
-            else self.job_requirements.get('required_years')
-        found = total_experience_years(self.work_history_text)
-        if required is None:
-            return {'required': None, 'found': found, 'pass': True, 'skipped': True}
-
-        if found == 0:
-            # No parsable dates at all. That is a CV problem, not proof the
-            # candidate is unqualified — flag it, but never knock them out on it.
-            self._recommend(
-                'No employment dates could be read from your CV. Add them as '
-                '"Jan 2020 - Mar 2023" under each role, or an ATS cannot verify '
-                'your years of experience.'
-            )
-            return {
-                'required': required, 'found': 0.0, 'pass': True,
-                'skipped': True, 'unverifiable': True,
-            }
-
-        # Half a year of grace: date parsing rounds, and so do recruiters.
-        passed = found >= (required - 0.5)
-        if not passed:
-            self._recommend(
-                f'This role asks for {required} years of experience; your CV shows '
-                f'{found}. Make sure every role\'s dates are present and formatted '
-                f'as "Jan 2020 - Mar 2023".'
-            )
-        return {'required': required, 'found': found, 'pass': passed, 'skipped': False}
-
-    def check_education_level(self, required_level=None):
-        required = required_level if required_level is not None \
-            else self.job_requirements.get('required_education')
-        found_level, found_label = self._highest_degree()
-        if not required:
-            return {
-                'required': None, 'found': found_label, 'pass': True, 'skipped': True,
-            }
-
-        required_rank = next(
-            (lvl for lvl, label, _ in DEGREE_LEVELS if label == required), 3
-        )
-        passed = found_level >= required_rank
-        if not passed:
-            self._recommend(
-                f'This role requires a {required} degree; the CV shows '
-                f'{found_label or "no degree"}. If you hold one, state it explicitly '
-                f'under an EDUCATION heading.'
-            )
-        return {
-            'required': required, 'found': found_label, 'pass': passed, 'skipped': False,
-        }
+    # -- CV facts read by the scored phases ----------------------------------
 
     def _highest_degree(self):
         """Highest degree on the CV as (rank, label)."""
@@ -1309,82 +1198,6 @@ class ATSChecker:
             if any(_contains_term(education, kw) for kw in keywords):
                 return level, label
         return 0, ''
-
-    def check_certifications(self, required_certs=None):
-        required = required_certs if required_certs is not None \
-            else self.job_requirements.get('required_certifications') or []
-        if not required:
-            return {'required': [], 'found': [], 'missing': [], 'pass': True, 'skipped': True}
-
-        found = [c for c in required if _contains_term(self.cv_lower, c)]
-        missing = [c for c in required if c not in found]
-        if missing:
-            self._recommend(
-                'The job requires these certification(s): '
-                + ', '.join(c.upper() for c in missing)
-                + '. If you hold them, list them under a CERTIFICATIONS heading — '
-                'an ATS looks for the exact name.'
-            )
-        return {
-            'required': required, 'found': found, 'missing': missing,
-            'pass': not missing, 'skipped': False,
-        }
-
-    def check_location(self, required_location=None):
-        required = required_location if required_location is not None \
-            else self.job_requirements.get('required_location') or ''
-        if not required:
-            return {'required': '', 'found': '', 'pass': True, 'skipped': True}
-
-        # Compare on the place names, not the whole "London, England, UK" string.
-        parts = [p.strip().lower() for p in re.split(r'[,/]', required) if p.strip()]
-        matched = any(_contains_term(self.cv_lower, p) for p in parts if len(p) > 2)
-        remote = _contains_term(required.lower(), 'remote') or _contains_term(
-            self.job_description.lower(), 'fully remote'
-        )
-        willing = bool(RELOCATION_RE.search(self.cv_text))
-        cv_location = self._cv_location()
-
-        if matched or remote or willing:
-            return {
-                'required': required, 'found': cv_location or required,
-                'relocation_stated': willing, 'pass': True, 'skipped': False,
-            }
-
-        if not cv_location:
-            # We could not read a location off the CV. That is not evidence the
-            # candidate is in the wrong place, so it must not knock them out —
-            # otherwise every CV without a parsable address is rejected.
-            self._recommend(
-                f'The role is based in {required}, but no location could be read '
-                f'from your CV. Add "City, Country" to your contact line (and '
-                f'"Willing to relocate" if that applies).'
-            )
-            return {
-                'required': required, 'found': '', 'relocation_stated': False,
-                'pass': True, 'skipped': True, 'unverifiable': True,
-            }
-
-        # A location was found and it genuinely conflicts — a real knock-out.
-        self._recommend(
-            f'The role is based in {required} but your CV shows {cv_location}. '
-            f'Add "Willing to relocate" if you are.'
-        )
-        return {
-            'required': required, 'found': cv_location, 'relocation_stated': False,
-            'pass': False, 'skipped': False,
-        }
-
-    def _cv_location(self):
-        """Best guess at the candidate's location: the contact line, usually."""
-        contact = self.sections.get('contact') or ''
-        header = f"{self.sections.get('name', '')} {contact}"
-        match = re.search(
-            r'([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)?,\s*(?:UK|United Kingdom|England|'
-            r'Scotland|Wales|USA|US|United States))',
-            header,
-        )
-        return match.group(1) if match else ''
 
     def _cv_gpa(self):
         """The CV's GPA, or a UK classification (2:1, First) mapped onto a 4.0 scale."""
@@ -1397,81 +1210,6 @@ class ATSChecker:
             if _contains_term(lowered, phrase):
                 return value
         return None
-
-    def check_gpa(self, required_gpa=None):
-        """Phase 2: does the CV meet the job's minimum GPA / degree classification?"""
-        required = required_gpa if required_gpa is not None \
-            else self.job_requirements.get('required_gpa')
-        found = self._cv_gpa()
-        if required is None:
-            return {'required': None, 'found': found, 'pass': True, 'skipped': True}
-
-        if found is None:
-            # The job wants a GPA and the CV states none. That is a CV omission,
-            # not proof of a low grade, so it must not knock the candidate out.
-            self._recommend(
-                f'This role asks for a minimum grade ({required} GPA or equivalent) '
-                f'and your CV states none. Add your GPA or degree classification '
-                f'(e.g. "2:1") to the education section.'
-            )
-            return {
-                'required': required, 'found': None, 'pass': True,
-                'skipped': True, 'unverifiable': True,
-            }
-
-        passed = found >= required
-        if not passed:
-            self._recommend(
-                f'This role requires a minimum GPA of {required}; your CV shows '
-                f'{found}. This is a hard filter for this job.'
-            )
-        return {
-            'required': required, 'found': found, 'pass': passed, 'skipped': False,
-        }
-
-    def check_work_authorization(self):
-        required = self.job_requirements.get('work_authorization')
-        found = None
-        for label, pattern in WORK_AUTH_PATTERNS:
-            if re.search(pattern, self.cv_lower):
-                found = label
-                break
-
-        if not required:
-            return {'required': None, 'found': found, 'pass': True, 'skipped': True}
-
-        # The only genuine knock-out: the job won't sponsor and the CV needs it.
-        needs_sponsorship = found == 'Requires Sponsorship'
-        job_wont_sponsor = required in ('Citizen', 'Permanent Resident', 'Authorised to Work')
-        passed = not (needs_sponsorship and job_wont_sponsor)
-        if not passed:
-            self._recommend(
-                'This employer does not sponsor visas and your CV states that you '
-                'require sponsorship. This is a hard knock-out for this role.'
-            )
-        return {'required': required, 'found': found, 'pass': passed, 'skipped': False}
-
-    def run_phase2(self):
-        """Knock-out filters. Any failure here is disqualifying."""
-        experience = self.check_experience_years()
-        education = self.check_education_level()
-        certifications = self.check_certifications()
-        location = self.check_location()
-        authorization = self.check_work_authorization()
-        gpa = self.check_gpa()
-
-        checks = {
-            'experience_years': experience,
-            'education': education,
-            'certifications': certifications,
-            'gpa': gpa,
-            'location': location,
-            'work_authorization': authorization,
-        }
-        failed = [name for name, c in checks.items() if not c['pass']]
-        result = {'pass': not failed, 'failed_filters': failed, **checks}
-        self.results['phase2_knockout'] = result
-        return result
 
     # -- Phase 3: keyword matching ------------------------------------------
 
@@ -1598,7 +1336,7 @@ class ATSChecker:
 
     def check_job_title_match(self):
         """Does the CV carry job titles resembling the target title?"""
-        target = (self.job_requirements.get('title') or '').strip()
+        target = (self.job_context.get('title') or '').strip()
         if not target:
             return 50, []
 
@@ -1990,12 +1728,16 @@ class ATSChecker:
         return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
 
     def get_detailed_report(self):
-        """Run every phase and return the full ATS report."""
+        """Run every phase and return the full ATS report.
+
+        ``pass`` means "scored at or above the threshold", nothing more. There is
+        no rejected/failed outcome: a low score is a low score, and the job is
+        still shown to the candidate with it.
+        """
         self.results = {}
         self._recommendations = []
 
         self.run_phase1()
-        self.run_phase2()
         self.calculate_keyword_match()
         self.run_phase4()
         self.check_chronology()
@@ -2004,37 +1746,25 @@ class ATSChecker:
         overall = self.calculate_overall_score()
         threshold = getattr(settings, 'ATS_THRESHOLD', DEFAULT_THRESHOLD)
 
-        phase1_ok = self.results['phase1_parsing']['pass']
-        phase2_ok = self.results['phase2_knockout']['pass']
-        rejected = not (phase1_ok and phase2_ok)
-
         return {
             'overall_score': overall,
             'ats_score': overall,
-            'pass': (not rejected) and overall >= threshold,
-            'rejected': rejected,
-            'rejection_reasons': self._rejection_reasons(),
-            # Split out, because the two are acted on differently: a parsing
-            # failure is a problem with the CV for every job, a knock-out is
-            # specific to this one.
-            'parsing_failures': self._parsing_reasons(),
-            'knockout_reasons': self._knockout_reasons(),
+            'pass': overall >= threshold,
+            # Formatting problems with the CV itself. Advisory: they cost a little
+            # score and generate recommendations, and that is all they do.
+            'formatting_issues': self._formatting_issues(),
             'threshold': threshold,
             'score_needed': getattr(settings, 'ATS_TARGET_SCORE', 90),
             'phases': self.results,
             'categories': self._categories(),
             'sectional_scores': self._sectional_scores(),
             'recommendations': self._recommendations,
-            'job_requirements': self.job_requirements,
+            'job_context': self.job_context,
             'text_hash': self.text_hash(),
         }
 
-    def _rejection_reasons(self):
-        """Every reason the CV would never reach a human, if it wouldn't."""
-        return self._parsing_reasons() + self._knockout_reasons()
-
-    def _parsing_reasons(self):
-        """Phase 1 failures — problems with the CV itself, for any job."""
+    def _formatting_issues(self):
+        """Phase 1 findings — problems with the CV itself, for any job."""
         reasons = []
         phase1 = self.results.get('phase1_parsing', {})
         if not phase1.get('pass', True):
@@ -2054,41 +1784,6 @@ class ATSChecker:
                 reasons.append(f'Layout is {phase1["layout"]}, not single-column')
         return reasons
 
-    def _knockout_reasons(self):
-        """Phase 2 failures — reasons specific to this job's hard requirements."""
-        reasons = []
-        phase2 = self.results.get('phase2_knockout', {})
-        for name in phase2.get('failed_filters', []):
-            check = phase2[name]
-            if name == 'experience_years':
-                reasons.append(
-                    f'Requires {check["required"]} years of experience; CV shows '
-                    f'{check["found"]}'
-                )
-            elif name == 'education':
-                reasons.append(
-                    f'Requires a {check["required"]} degree; CV shows '
-                    f'{check["found"] or "none"}'
-                )
-            elif name == 'certifications':
-                reasons.append(
-                    'Missing required certification(s): '
-                    + ', '.join(c.upper() for c in check['missing'])
-                )
-            elif name == 'gpa':
-                reasons.append(
-                    f'Requires a minimum GPA of {check["required"]}; CV shows '
-                    f'{check["found"]}'
-                )
-            elif name == 'location':
-                reasons.append(
-                    f'Role is in {check["required"]}; no matching location or '
-                    f'relocation statement on the CV'
-                )
-            elif name == 'work_authorization':
-                reasons.append('CV requires visa sponsorship; this role does not offer it')
-        return reasons
-
 
 # ---------------------------------------------------------------------------
 # Convenience entry points
@@ -2096,13 +1791,9 @@ class ATSChecker:
 
 def check_cv_against_job(cv_text, job_description, job_title='', job_location='',
                          file_path=None):
-    """Run the full ATS check and return the report dict.
-
-    The convenience wrapper used across the app: mines the job's requirements
-    from its description, then runs all seven phases.
-    """
-    requirements = extract_job_requirements(job_description, job_title, job_location)
-    checker = ATSChecker(cv_text, job_description, requirements, file_path=file_path)
+    """Run the full ATS check and return the report dict. Scores; never rejects."""
+    context = extract_job_context(job_description, job_title, job_location)
+    checker = ATSChecker(cv_text, job_description, context, file_path=file_path)
     return checker.get_detailed_report()
 
 
@@ -2232,8 +1923,8 @@ def score_cv_against_contract(cv_text, contract):
     from .job_keywords import term_present
 
     empty = {
-        'score': 0, 'missing_hard': [], 'missing_must': [], 'missing_acronyms': [],
-        'title_ok': False, 'breakdown': {},
+        'score': None, 'scorable': False, 'missing_hard': [], 'missing_must': [],
+        'missing_acronyms': [], 'found_hard': [], 'title_ok': False, 'breakdown': {},
     }
     if not (cv_text and contract):
         return empty
@@ -2273,6 +1964,21 @@ def score_cv_against_contract(cv_text, contract):
 
         titles = [contract.get('job_title') or ''] + (contract.get('title_variants') or [])
         titles = [t for t in titles if t]
+
+        # Nothing job-specific to measure against: the advert yielded no skills, no
+        # must-haves, no acronyms and no title. There is no honest score to give —
+        # and emphatically not the CV's section-heading coverage, which is a
+        # property of the CV alone and used to hand these jobs a silent 100/100
+        # while the reason column said "no screenable skills could be mined". The
+        # caller shows these as "Not scored" and sorts them last.
+        if not (hard or must or acronyms or titles):
+            logger.info(
+                'Contract carries no skills, must-haves, acronyms or title '
+                '(source=%s) — not scorable, returning None.',
+                contract.get('source'),
+            )
+            return dict(empty, breakdown={'sections': float(_section_coverage(cv_text))})
+
         title_ok = any(term_present(t, lowered) for t in titles)
         if not title_ok and titles:
             # Partial credit for a close title ("Backend Engineer" vs "Senior
@@ -2313,6 +2019,7 @@ def score_cv_against_contract(cv_text, contract):
 
         return {
             'score': score,
+            'scorable': True,
             'missing_hard': missing_hard,
             'missing_must': missing_must,
             'missing_acronyms': missing_acronyms,
@@ -2574,5 +2281,5 @@ def check_cv_format(cv_text, file_path=None):
 
     Used at upload time, where there is no job description to score against.
     """
-    checker = ATSChecker(cv_text, '', job_requirements={}, file_path=file_path)
+    checker = ATSChecker(cv_text, '', job_context={}, file_path=file_path)
     return checker.run_phase1() | {'recommendations': checker._recommendations}

@@ -55,24 +55,24 @@ MATCH_THRESHOLD = env.int('MATCH_THRESHOLD', default=75)
 # Max jobs processed per search (bounds task time & API cost).
 MAX_JOBS_PER_SEARCH = env.int('MAX_JOBS_PER_SEARCH', default=200)
 
-# Cap the number of jobs sent to OpenAI for scoring (cost control). Jobs beyond
-# this limit are stored unscored with a note.
+# Cap the number of jobs whose keyword contract is extracted by OpenAI (cost
+# control). Every job is still scored and shown; the ones past this cap are scored
+# from the cheaper deterministic contract instead.
 OPENAI_MAX_SCORED_JOBS = env.int('OPENAI_MAX_SCORED_JOBS', default=50)
 
-# Stage-1 filter: a job needs at least this % keyword overlap with the CV before
-# we spend an OpenAI call on it. Lower it if too few jobs reach OpenAI scoring.
-KEYWORD_PRESCORE_THRESHOLD = env.int('KEYWORD_PRESCORE_THRESHOLD', default=60)
+# The only optional job filter, and it is OFF by default: when on, jobs paying
+# above the user's stated maximum are dropped from the results instead of being
+# flagged "above salary preference". Leave it off unless a user asks — an advert's
+# figure is a range, and a job over the ceiling is still worth seeing.
+SALARY_HARD_FILTER = env.bool('SALARY_HARD_FILTER', default=False)
 
 # ---------------------------------------------------------------------------
 # ATS checker
 # ---------------------------------------------------------------------------
-# A tailored CV scoring below this is reported as "below threshold".
+# A tailored CV scoring below this is reported as "below threshold". Informational
+# only: the ATS checker scores jobs, it never rejects them, and no job is withheld
+# from the results whatever it scores.
 ATS_THRESHOLD = env.int('ATS_THRESHOLD', default=75)
-
-# When True, a job whose tailored CV lands below ATS_THRESHOLD is rejected
-# outright rather than merely flagged. Jobs that fail a *hard* filter (phase 1
-# parsing or a phase 2 knock-out) are rejected regardless of this setting.
-ATS_STRICT_MODE = env.bool('ATS_STRICT_MODE', default=False)
 
 # Tailoring aims for this ATS score, re-running with targeted feedback when the
 # first attempt falls short.

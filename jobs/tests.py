@@ -482,12 +482,14 @@ class RunJobSearchTests(TestCase):
         self.assertTrue(jobs['Backend Engineer'].tailored_pdf)
         self.assertTrue(jobs['Backend Engineer'].processed)
 
-        # Every job is scored, including one outside the salary range: its skills
-        # match is a real fact about the CV, and reporting it as 0 would be a lie
-        # about the fit. It is simply not pursued, and the reason says why.
+        # The £20k job is under the run's minimum, and it is still here, still
+        # scored, and still tailored. The minimum is a hint to the Apify actor, not
+        # a filter we re-apply to bin what came back — an advert's figure is a
+        # range, and the candidate can decide for themselves.
         self.assertEqual(jobs['Junior Dev'].match_score, 85)
-        self.assertIn('Salary below minimum', jobs['Junior Dev'].match_reason)
-        self.assertFalse(jobs['Junior Dev'].tailored_pdf)
+        self.assertNotIn('below minimum', jobs['Junior Dev'].match_reason)
+        self.assertFalse(jobs['Junior Dev'].above_salary_preference)
+        self.assertTrue(jobs['Junior Dev'].tailored_pdf)
 
         self.assertEqual(mock_score.call_count, 2)  # every job scored, not just one
         # Every job is logged to the candidate's Google Sheets tab.
@@ -776,22 +778,25 @@ class ATSTextHelperTests(TestCase):
         self.assertEqual(total_experience_years('I have loads of experience'), 0.0)
 
 
-class ATSJobRequirementsTests(TestCase):
-    def test_extracts_requirements_from_description(self):
-        from jobs.services.ats_checker import extract_job_requirements
-        req = extract_job_requirements(ATS_JOB_DESCRIPTION, 'Senior Backend Engineer',
-                                       'London, UK')
-        self.assertEqual(req['required_years'], 5)
-        self.assertEqual(req['required_education'], "Bachelor's")
-        self.assertEqual(req['work_authorization'], 'Authorised to Work')
-        self.assertEqual(req['title'], 'Senior Backend Engineer')
+class ATSJobContextTests(TestCase):
+    def test_carries_title_and_location(self):
+        from jobs.services.ats_checker import extract_job_context
+        context = extract_job_context(ATS_JOB_DESCRIPTION, 'Senior Backend Engineer',
+                                      'London, UK')
+        self.assertEqual(context['title'], 'Senior Backend Engineer')
+        self.assertEqual(context['location'], 'London, UK')
 
-    def test_unstated_requirements_are_none(self):
-        from jobs.services.ats_checker import extract_job_requirements
-        req = extract_job_requirements('We need someone nice to join the team.')
-        self.assertIsNone(req['required_years'])
-        self.assertIsNone(req['required_education'])
-        self.assertEqual(req['required_certifications'], [])
+    def test_mines_no_hard_requirements(self):
+        """The requirement mining is gone, and with it every knock-out it fed.
+
+        An advert demanding "5 years" and a "PMP" used to produce filters that
+        binned the candidate outright. Nothing is mined to filter on any more.
+        """
+        from jobs.services.ats_checker import extract_job_context
+        context = extract_job_context(
+            ATS_JOB_DESCRIPTION + '\n10 years experience and a PMP are required.'
+        )
+        self.assertEqual(set(context), {'title', 'location'})
 
     def test_keywords_rank_hard_skills_above_soft(self):
         from jobs.services.ats_checker import extract_jd_keywords
@@ -803,70 +808,55 @@ class ATSJobRequirementsTests(TestCase):
         )
 
 
-class ATSKnockoutTests(TestCase):
-    """Phase 2 must reject on genuine conflicts — and never on missing data."""
+class NoKnockoutTests(TestCase):
+    """The checker scores. It never rejects — whatever the CV or the advert says.
 
-    def _phase2(self, cv_text, job=ATS_JOB_DESCRIPTION, title='', location=''):
-        from jobs.services.ats_checker import ATSChecker, extract_job_requirements
-        checker = ATSChecker(cv_text, job,
-                             extract_job_requirements(job, title, location))
-        return checker.run_phase2()
+    Each case below used to be a hard knock-out that binned the job outright.
+    Every one of them must now come back with a real score and no rejection, and
+    the report must carry no rejection machinery at all for a caller to trip over.
+    """
 
-    def test_good_cv_passes_all_knockouts(self):
-        result = self._phase2(ATS_GOOD_CV, location='London, UK')
-        self.assertTrue(result['pass'], result['failed_filters'])
+    def _report(self, cv_text, job=ATS_JOB_DESCRIPTION, location='London, UK'):
+        from jobs.services.ats_checker import check_cv_against_job
+        return check_cv_against_job(
+            cv_text, job, 'Senior Backend Engineer', location,
+        )
 
-    def test_insufficient_experience_is_a_knockout(self):
+    def test_report_carries_no_rejection_verdict(self):
+        report = self._report(ATS_GOOD_CV)
+        for key in ('rejected', 'rejection_reasons', 'knockout_reasons'):
+            self.assertNotIn(key, report)
+        self.assertNotIn('phase2_knockout', report['phases'])
+
+    def test_too_little_experience_still_scores(self):
         cv = ATS_GOOD_CV.replace('Jan 2021 - Present', 'Jan 2024 - Present') \
                         .replace('Feb 2019 - Dec 2020', 'Feb 2023 - Dec 2023')
-        result = self._phase2(cv)
-        self.assertFalse(result['pass'])
-        self.assertIn('experience_years', result['failed_filters'])
+        report = self._report(cv)
+        self.assertIsInstance(report['overall_score'], int)
+        self.assertGreater(report['overall_score'], 0)
 
-    def test_unparsable_dates_never_knock_out(self):
-        """A CV with no dates is a CV problem, not proof of being unqualified."""
-        result = self._phase2('John Smith\nEDUCATION\nBSc Computer Science\nPython')
-        self.assertTrue(result['experience_years']['pass'])
-        self.assertTrue(result['experience_years']['skipped'])
-        self.assertNotIn('experience_years', result['failed_filters'])
-
-    def test_missing_degree_is_a_knockout(self):
+    def test_missing_degree_still_scores(self):
         cv = ATS_GOOD_CV.replace('BSc Computer Science', 'Evening course in coding')
-        result = self._phase2(cv)
-        self.assertFalse(result['pass'])
-        self.assertIn('education', result['failed_filters'])
+        self.assertGreater(self._report(cv)['overall_score'], 0)
 
-    def test_missing_certification_is_a_knockout(self):
+    def test_missing_certification_still_scores(self):
         job = ATS_JOB_DESCRIPTION + '\nYou must hold a valid PMP certification.'
-        result = self._phase2(ATS_GOOD_CV, job=job, location='London, UK')
-        self.assertFalse(result['pass'])
-        self.assertIn('certifications', result['failed_filters'])
-        self.assertEqual(result['certifications']['missing'], ['pmp'])
+        self.assertGreater(self._report(ATS_GOOD_CV, job=job)['overall_score'], 0)
 
-    def test_conflicting_location_is_a_knockout(self):
+    def test_conflicting_location_still_scores(self):
+        """The knock-out that hurt most: a candidate in the wrong city, binned."""
         cv = ATS_GOOD_CV.replace('London, UK', 'Edinburgh, Scotland')
-        result = self._phase2(cv, location='London, UK')
-        self.assertFalse(result['pass'])
-        self.assertIn('location', result['failed_filters'])
+        self.assertGreater(self._report(cv)['overall_score'], 0)
 
-    def test_relocation_statement_rescues_a_location_mismatch(self):
-        cv = ATS_GOOD_CV.replace('London, UK', 'Edinburgh, Scotland') \
-             + '\nWilling to relocate.'
-        result = self._phase2(cv, location='London, UK')
-        self.assertTrue(result['location']['pass'])
-
-    def test_unknown_location_never_knocks_out(self):
-        """The common case: no readable address. Must not reject."""
-        cv = 'John Smith\nPython Django engineer\nJan 2015 - Present\nBSc Computer Science'
-        result = self._phase2(cv, location='London, UK')
-        self.assertTrue(result['location']['pass'])
-        self.assertTrue(result['location']['skipped'])
-
-    def test_sponsorship_conflict_is_a_knockout(self):
+    def test_cv_requiring_sponsorship_still_scores(self):
         cv = ATS_GOOD_CV + '\nI require sponsorship to work in the UK.'
-        result = self._phase2(cv, location='London, UK')
-        self.assertFalse(result['pass'])
-        self.assertIn('work_authorization', result['failed_filters'])
+        self.assertGreater(self._report(cv)['overall_score'], 0)
+
+    def test_unparsable_cv_still_scores(self):
+        """An 'unparsable CV' is a formatting note, not a verdict on 200 jobs."""
+        report = self._report('John Smith\nPython Django engineer')
+        self.assertIsInstance(report['overall_score'], int)
+        self.assertNotIn('rejected', report)
 
 
 class ATSScoringTests(TestCase):
@@ -881,7 +871,6 @@ class ATSScoringTests(TestCase):
     def test_strong_cv_scores_well_and_passes(self):
         report = self._report(ATS_GOOD_CV)
         self.assertGreaterEqual(report['overall_score'], 75)
-        self.assertFalse(report['rejected'])
         self.assertTrue(report['pass'])
 
     def test_weak_cv_scores_low(self):
@@ -890,13 +879,16 @@ class ATSScoringTests(TestCase):
         self.assertFalse(report['pass'])
         self.assertTrue(report['recommendations'])
 
-    def test_weak_cv_is_rejected_for_missing_sections(self):
-        """Creative headings ('My Journey') mean an ATS cannot file the content."""
+    def test_missing_sections_are_advice_not_a_rejection(self):
+        """Creative headings ('My Journey') are hard to parse — and nothing more."""
         report = self._report(ATS_BAD_CV)
-        self.assertTrue(report['rejected'])
         phase1 = report['phases']['phase1_parsing']
         self.assertIn('Experience', phase1['missing_headers'])
         self.assertIn('My Journey', phase1['creative_headers'])
+        # Reported as an advisory formatting issue; the job is still scored, and
+        # the report has no rejection verdict to act on.
+        self.assertTrue(report['formatting_issues'])
+        self.assertNotIn('rejected', report)
 
     def test_keyword_phase_finds_and_misses_the_right_skills(self):
         cv = ATS_GOOD_CV.replace('- Kubernetes\n', '').replace(
@@ -982,7 +974,8 @@ BSc Computing | Leeds | 2012 - 2015
         for key in ('overall_score', 'ats_score', 'pass', 'phases',
                     'sectional_scores', 'recommendations', 'text_hash'):
             self.assertIn(key, report)
-        for phase in ('phase1_parsing', 'phase2_knockout', 'phase3_keyword',
+        # No phase 2: the knock-out phase is gone, and the numbering keeps its gap.
+        for phase in ('phase1_parsing', 'phase3_keyword',
                       'phase4_context', 'phase5_experience', 'phase6_education'):
             self.assertIn(phase, report['phases'])
         self.assertEqual(
@@ -1082,42 +1075,31 @@ def _tokens_of(text):
     return _tokens(text)
 
 
-class ATSGpaFilterTests(TestCase):
-    def _phase2(self, cv, job):
-        from jobs.services.ats_checker import ATSChecker, extract_job_requirements
-        return ATSChecker(cv, job, extract_job_requirements(job)).run_phase2()
+class ATSGradeReadingTests(TestCase):
+    """Grades are read to SCORE the education section, never to filter on."""
 
-    def test_jd_minimum_gpa_is_extracted(self):
-        from jobs.services.ats_checker import extract_job_requirements
-        req = extract_job_requirements('Requires a minimum GPA of 3.5 and a degree.')
-        self.assertEqual(req['required_gpa'], 3.5)
+    def _gpa(self, cv):
+        from jobs.services.ats_checker import ATSChecker
+        return ATSChecker(cv, ATS_JOB_DESCRIPTION)._cv_gpa()
 
-    def test_low_gpa_is_a_knockout(self):
-        cv = ATS_GOOD_CV.replace('First Class Honours', 'GPA 2.8')
-        result = self._phase2(cv, 'Minimum GPA 3.5 required. Bachelor degree.')
-        self.assertFalse(result['gpa']['pass'])
-        self.assertIn('gpa', result['failed_filters'])
-
-    def test_sufficient_gpa_passes(self):
-        cv = ATS_GOOD_CV.replace('First Class Honours', 'GPA 3.9')
-        result = self._phase2(cv, 'Minimum GPA 3.5 required. Bachelor degree.')
-        self.assertTrue(result['gpa']['pass'])
+    def test_gpa_is_read_from_the_cv(self):
+        self.assertEqual(self._gpa(ATS_GOOD_CV.replace('First Class Honours', 'GPA 3.9')),
+                         3.9)
 
     def test_uk_classification_maps_onto_the_gpa_scale(self):
-        # "First Class Honours" clears a 3.5 minimum; a 2:2 does not.
-        first = self._phase2(ATS_GOOD_CV, 'Minimum GPA 3.5. Bachelor degree.')
-        self.assertTrue(first['gpa']['pass'])
-        lower = self._phase2(
-            ATS_GOOD_CV.replace('First Class Honours', 'Lower Second Class (2:2)'),
-            'Minimum GPA 3.5. Bachelor degree.',
+        self.assertEqual(self._gpa(ATS_GOOD_CV), 4.0)  # First Class Honours
+        self.assertEqual(
+            self._gpa(ATS_GOOD_CV.replace('First Class Honours',
+                                          'Lower Second Class (2:2)')),
+            3.0,
         )
-        self.assertFalse(lower['gpa']['pass'])
 
-    def test_missing_gpa_never_knocks_out(self):
-        cv = ATS_GOOD_CV.replace('- First Class Honours\n', '')
-        result = self._phase2(cv, 'Minimum GPA 3.5 required. Bachelor degree.')
-        self.assertTrue(result['gpa']['pass'])
-        self.assertTrue(result['gpa']['unverifiable'])
+    def test_a_low_grade_never_bins_the_job(self):
+        from jobs.services.ats_checker import check_cv_against_job
+        cv = ATS_GOOD_CV.replace('First Class Honours', 'GPA 2.8')
+        report = check_cv_against_job(cv, 'Minimum GPA 3.5 required. Bachelor degree.')
+        self.assertNotIn('rejected', report)
+        self.assertGreater(report['overall_score'], 0)
 
 
 class ATSGarbledFontTests(TestCase):
@@ -1530,8 +1512,33 @@ BSc Computing | Leeds | 2015 - 2018
 
     def test_scoring_never_raises_on_junk(self):
         from jobs.services.ats_checker import score_cv_against_contract
-        self.assertEqual(score_cv_against_contract('', MODERN_CONTRACT)['score'], 0)
-        self.assertEqual(score_cv_against_contract('cv text', None)['score'], 0)
+        # Nothing to score against -> None ("not scored"), never a number.
+        self.assertIsNone(score_cv_against_contract('', MODERN_CONTRACT)['score'])
+        self.assertIsNone(score_cv_against_contract('cv text', None)['score'])
+
+    def test_an_empty_contract_is_not_scored_rather_than_scored_100(self):
+        """The bug this replaces: an advert with no minable skills scored 100/100.
+
+        With no hard skills, must-haves, acronyms or title, the only measurable
+        category left was 'sections' — the CV's own heading coverage, which has
+        nothing to do with the job. A well-formatted CV therefore scored a perfect
+        100 against an advert nobody could read, while the reason column cheerfully
+        said "no screenable skills could be mined from this job description".
+        """
+        from jobs.services.ats_checker import score_cv_against_contract
+        empty_contract = {
+            'job_title': '', 'title_variants': [], 'hard_skills': [],
+            'acronyms': [], 'soft_skills': [], 'must_have': [], 'source': 'empty',
+        }
+        result = score_cv_against_contract(ATS_GOOD_CV, empty_contract)
+        self.assertIsNone(result['score'])
+        self.assertFalse(result['scorable'])
+
+    def test_a_real_contract_is_scorable(self):
+        from jobs.services.ats_checker import score_cv_against_contract
+        result = score_cv_against_contract(ATS_GOOD_CV, MODERN_CONTRACT)
+        self.assertTrue(result['scorable'])
+        self.assertIsInstance(result['score'], int)
 
     def test_contract_catches_skills_the_hardcoded_vocab_cannot_see(self):
         """The whole point: dbt/Snowflake/Dagster are invisible to SKILL_VOCAB."""
@@ -1941,24 +1948,32 @@ class ATSWorkflowIntegrationTests(TestCase):
     @mock.patch('jobs.tasks.GoogleSheetsLogger')
     @mock.patch('jobs.tasks._score_job')
     @mock.patch('jobs.tasks.search_jobs')
-    def test_knockout_marks_job_rejected_and_skips_tailoring(
+    def test_former_knockouts_are_shown_scored_and_tailored(
         self, mock_search, mock_score, _sheets
     ):
+        """The advert that used to bin the candidate now just gets scored.
+
+        A PMP requirement, a degree requirement and a city the candidate does not
+        live in were each a hard knock-out. Together they used to reject the job
+        outright and skip tailoring. Now the job appears with its real score, and
+        because that score clears the threshold it is tailored like any other.
+        """
         from jobs.tasks import run_job_search
-        # This job demands a PMP the candidate does not hold -> hard knock-out.
         mock_search.return_value = [self._raw_job(
-            description=ATS_JOB_DESCRIPTION + '\nA valid PMP certification is required.'
+            location='Aberdeen, UK',
+            description=ATS_JOB_DESCRIPTION
+            + '\nA valid PMP certification is required. Must hold a PhD. '
+              '10 years of experience required. Based in Aberdeen.',
         )]
         mock_score.side_effect = fake_score(95, 'Strong match')
 
         run_job_search(self.run.pk)
 
         job = self.run.jobs.get()
-        self.assertEqual(job.ats_status, Job.ATS_REJECTED)
-        self.assertTrue(job.ats_rejected)
-        # No tailored CV is produced for a job the candidate is auto-rejected from.
-        self.assertFalse(job.tailored_pdf)
-        self.assertIn('ATS Rejected', job.match_reason)
+        self.assertNotEqual(job.ats_status, 'REJECTED')
+        self.assertEqual(job.match_score, 95)
+        self.assertNotIn('Rejected', job.match_reason)
+        self.assertTrue(job.tailored_pdf)
 
     @mock.patch('jobs.tasks.GoogleSheetsLogger')
     @mock.patch('jobs.tasks._score_job')
@@ -1966,12 +1981,7 @@ class ATSWorkflowIntegrationTests(TestCase):
     def test_badly_formatted_cv_does_not_reject_every_job(
         self, mock_search, mock_score, _sheets
     ):
-        """Phase 1 is a CV-wide problem, not a per-job one.
-
-        A CV with no standard headings fails phase 1 for every job in the run.
-        Rejecting all of them would tell the user nothing per-job and would wipe
-        out their entire search, so only phase 2 knock-outs reject a job.
-        """
+        """A hard-to-parse CV is advice about the CV, not a verdict on the search."""
         from jobs.tasks import run_job_search
         self.cv.parsed_text = 'Python Django engineer, London UK. BSc Computer Science.'
         self.cv.save()
@@ -1981,7 +1991,7 @@ class ATSWorkflowIntegrationTests(TestCase):
         run_job_search(self.run.pk)
 
         job = self.run.jobs.get()
-        self.assertNotEqual(job.ats_status, Job.ATS_REJECTED)
+        self.assertNotEqual(job.ats_status, 'REJECTED')
         self.assertTrue(job.tailored_pdf)  # still tailored despite poor formatting
 
     @mock.patch('jobs.tasks.GoogleSheetsLogger')
@@ -2008,36 +2018,25 @@ class ATSWorkflowIntegrationTests(TestCase):
         flagged = [t for t, d in reports.items() if d.get('duplicate_application')]
         self.assertEqual(len(flagged), 1)
 
-    @override_settings(ATS_STRICT_MODE=True, ATS_THRESHOLD=100)
+    @override_settings(ATS_THRESHOLD=100)
     @mock.patch('jobs.tasks.GoogleSheetsLogger')
     @mock.patch('jobs.tasks._score_job')
     @mock.patch('jobs.tasks.search_jobs')
-    def test_strict_mode_rejects_below_threshold(self, mock_search, mock_score, _sheets):
+    def test_unreachable_ats_threshold_only_flags(self, mock_search, mock_score, _s):
+        """An unreachable ATS threshold flags the job. It cannot reject it.
+
+        There is no strict mode any more: a threshold is a label on a score, and
+        the only status a low one can produce is BELOW_THRESHOLD.
+        """
         from jobs.tasks import run_job_search
         mock_search.return_value = [self._raw_job()]
         mock_score.side_effect = fake_score(90, 'Strong match')
 
         run_job_search(self.run.pk)
         job = self.run.jobs.get()
-        # Passes every hard filter and scores well, but an unreachable threshold
-        # plus strict mode turns "below threshold" into an outright rejection.
-        self.assertEqual(job.ats_status, Job.ATS_REJECTED)
-        self.assertGreater(job.ats_score, 75)
-
-    @override_settings(ATS_STRICT_MODE=False, ATS_THRESHOLD=100)
-    @mock.patch('jobs.tasks.GoogleSheetsLogger')
-    @mock.patch('jobs.tasks._score_job')
-    @mock.patch('jobs.tasks.search_jobs')
-    def test_lenient_mode_only_flags_below_threshold(self, mock_search, mock_score, _s):
-        from jobs.tasks import run_job_search
-        mock_search.return_value = [self._raw_job()]
-        mock_score.side_effect = fake_score(90, 'Strong match')
-
-        run_job_search(self.run.pk)
-        job = self.run.jobs.get()
-        # Same score, strict mode off -> flagged, not rejected, and still tailored.
         self.assertEqual(job.ats_status, Job.ATS_BELOW_THRESHOLD)
         self.assertTrue(job.tailored_pdf)
+        self.assertNotIn('REJECTED', dict(Job.ATS_STATUS_CHOICES))
 
 
 @override_settings(MEDIA_ROOT=_TEST_MEDIA, OPENAI_API_KEY='')
@@ -2067,8 +2066,11 @@ class ATSReportViewTests(TestCase):
         self._make_report()
         response = self.client.get(reverse('ats_report', args=[self.job.pk]))
         self.assertEqual(response.status_code, 200)
-        for needle in ['Phase 1', 'Phase 2', 'Phase 3', 'ATS score']:
+        for needle in ['Phase 1', 'Phase 3', 'ATS score']:
             self.assertContains(response, needle)
+        # The knock-out phase is gone from the report, and so is its verdict.
+        self.assertNotContains(response, 'Knock-out')
+        self.assertNotContains(response, 'ATS Rejected')
 
     def test_missing_report_redirects(self):
         response = self.client.get(reverse('ats_report', args=[self.job.pk]))
@@ -2208,6 +2210,36 @@ class MatchThresholdDisplayTests(TestCase):
         self.assertEqual(response.context['above_count'], 1)
         self.assertEqual(response.context['below_count'], 1)
 
+    def test_results_page_never_says_rejected(self):
+        """No job is rejected any more, so the word cannot appear on the page."""
+        Job.objects.create(
+            search_run=self.run, title='Unreadable Advert', company='Gamma',
+            location='Cardiff', match_score=None, application_link='https://x/3',
+        )
+        response = self.client.get(reverse('search_results', args=[self.run.pk]))
+        content = response.content.decode()
+        self.assertNotIn('Rejected', content)
+        self.assertNotIn('ATS Rejected', content)
+
+    def test_unscored_job_is_shown_last_and_labelled(self):
+        unscored = Job.objects.create(
+            search_run=self.run, title='Unreadable Advert', company='Gamma',
+            location='Cardiff', match_score=None, application_link='https://x/3',
+        )
+        response = self.client.get(reverse('search_results', args=[self.run.pk]))
+
+        # Sorted last: unknown is not the same as zero, and it must not outrank
+        # the job that scored 40.
+        self.assertEqual(
+            [j.pk for j in response.context['jobs']],
+            [self.good.pk, self.weak.pk, unscored.pk],
+        )
+        self.assertEqual(response.context['not_scored_count'], 1)
+        self.assertContains(response, 'Not scored')
+        # It is never counted as "above 75".
+        self.assertEqual(response.context['above_count'], 1)
+        self.assertEqual(response.context['total_found'], 3)
+
     def test_every_row_carries_the_score_the_tabs_filter_on(self):
         response = self.client.get(reverse('search_results', args=[self.run.pk]))
         content = response.content.decode()
@@ -2287,11 +2319,10 @@ class SearchProgressPhaseTests(TestCase):
         jobs = {j.title: j for j in self.run.jobs.all()}
         self.assertEqual(jobs['Backend Engineer'].match_score, 90)
         self.assertEqual(jobs['Backend Engineer'].match_reason, 'backend')
-        # Scored on its merits even though its salary rules it out; the reason
-        # carries the salary note in front of the real explanation.
+        # Each job keeps its own real score and its own real reason — no salary
+        # note bolted on the front, because salary no longer rules anything out.
         self.assertEqual(jobs['Junior Dev'].match_score, 62)
-        self.assertIn('Salary below minimum', jobs['Junior Dev'].match_reason)
-        self.assertIn('entry', jobs['Junior Dev'].match_reason)
+        self.assertEqual(jobs['Junior Dev'].match_reason, 'entry')
 
 
 @override_settings(MEDIA_ROOT=_TEST_MEDIA, OPENAI_API_KEY='')
@@ -2370,6 +2401,168 @@ class ScoreVarianceTests(TestCase):
             extract_job_keywords(ATS_JOB_DESCRIPTION, 'Backend Engineer'),
         )['score']
         self.assertEqual(job.match_score, expected)
+
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_an_empty_description_is_not_scored_rather_than_scored_100(
+        self, mock_search, _sheets
+    ):
+        """The headline bug: an unreadable advert used to score a perfect 100.
+
+        With no keywords to mine, the only measurable thing left was the CV's own
+        section coverage — so a well-formatted CV scored 100/100 against an empty
+        advert. It must come back as "not scored" (None) instead, and sort below
+        every job that has a real score.
+        """
+        from jobs.tasks import run_job_search
+        mock_search.return_value = [
+            self._raw('Backend Engineer', ATS_JOB_DESCRIPTION),
+            self._raw('Mystery Role', ''),
+        ]
+
+        run_job_search(self.run.pk)
+
+        jobs = {j.title: j for j in self.run.jobs.all()}
+        self.assertIsNone(jobs['Mystery Role'].match_score)
+        self.assertIn('Not scored', jobs['Mystery Role'].match_reason)
+        # It is still in the results — just unscored, and never tailored.
+        self.assertEqual(len(jobs), 2)
+        self.assertFalse(jobs['Mystery Role'].tailored_pdf)
+        self.assertIsNotNone(jobs['Backend Engineer'].match_score)
+
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_no_job_is_ever_scored_a_blanket_100(self, mock_search, _sheets):
+        """No job may score 100 unless it genuinely covers everything the ad asks."""
+        from jobs.tasks import run_job_search
+        mock_search.return_value = [
+            self._raw('Pastry Chef', 'Baking, patisserie and cake decoration.'),
+            self._raw('Mystery Role', ''),
+            self._raw('Welder', 'MIG welding, TIG welding, fabrication, blueprints.'),
+        ]
+
+        run_job_search(self.run.pk)
+
+        for job in self.run.jobs.all():
+            self.assertNotEqual(job.match_score, 100, f'{job.title} scored a fake 100')
+
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks._score_job')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_jobs_from_every_uk_city_reach_the_results(
+        self, mock_search, mock_score, _sheets
+    ):
+        """No location filter survives: a CV in London does not lose Manchester.
+
+        The location knock-out compared the advert's city to the CV's, so a
+        candidate whose CV said "London" was rejected from every job outside it —
+        and a CV with no readable address was rejected from all of them.
+        """
+        from jobs.tasks import run_job_search
+        cities = ['London', 'Manchester', 'Edinburgh', 'Bristol', 'Cardiff',
+                  'Leeds', 'Belfast', 'Aberdeen']
+        mock_search.return_value = [
+            dict(self._raw(f'Backend Engineer {city}', ATS_JOB_DESCRIPTION),
+                 location=f'{city}, UK')
+            for city in cities
+        ]
+        mock_score.side_effect = fake_score(80, 'Strong match')
+
+        run_job_search(self.run.pk)
+
+        jobs = list(self.run.jobs.all())
+        self.assertEqual(len(jobs), len(cities))
+        self.assertEqual(
+            {j.location.split(',')[0] for j in jobs}, set(cities),
+        )
+        for job in jobs:
+            self.assertNotEqual(job.ats_status, 'REJECTED')
+            self.assertEqual(job.match_score, 80)
+
+
+@override_settings(MEDIA_ROOT=_TEST_MEDIA, OPENAI_API_KEY='')
+class SalaryPreferenceTests(TestCase):
+    """Salary is the one optional filter, and by default it only flags."""
+
+    def setUp(self):
+        from jobs.models import CV as CVModel
+        self.user = User.objects.create_user(username='sal', password='pw12345!')
+        self.cv = CVModel.objects.create(
+            user=self.user, name='Sam',
+            original_file=SimpleUploadedFile('cv.docx', build_docx_bytes()),
+            parsed_text=ATS_GOOD_CV,
+            parsed_data={'skills': ['python', 'django'],
+                         'job_titles': ['Backend Engineer']},
+        )
+        self.run = SearchRun.objects.create(
+            user=self.user, cv=self.cv, countries=['United Kingdom'],
+            max_salary=70000, status=SearchRun.STATUS_PENDING,
+        )
+
+    def _raw(self, title, salary):
+        return {
+            'title': title, 'company': 'Acme', 'location': 'London',
+            'salary': salary, 'description': ATS_JOB_DESCRIPTION,
+            'applyLink': 'https://x/1', 'datePosted': '',
+            'employmentType': '', 'seniorityLevel': '',
+        }
+
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks._score_job')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_over_ceiling_job_is_flagged_not_hidden(
+        self, mock_search, mock_score, _sheets
+    ):
+        from jobs.tasks import run_job_search
+        mock_search.return_value = [
+            self._raw('Within budget', '£60,000'),
+            self._raw('Over budget', '£95,000'),
+        ]
+        mock_score.side_effect = fake_score(85, 'Strong match')
+
+        run_job_search(self.run.pk)
+
+        jobs = {j.title: j for j in self.run.jobs.all()}
+        self.assertEqual(len(jobs), 2)  # nothing dropped
+        self.assertTrue(jobs['Over budget'].above_salary_preference)
+        self.assertIn('Above your salary preference', jobs['Over budget'].match_reason)
+        # Flagged, but still worth pursuing: the tailored CV is still generated.
+        self.assertTrue(jobs['Over budget'].tailored_pdf)
+        self.assertFalse(jobs['Within budget'].above_salary_preference)
+
+    @override_settings(SALARY_HARD_FILTER=True)
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks._score_job')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_hard_filter_drops_only_when_explicitly_enabled(
+        self, mock_search, mock_score, _sheets
+    ):
+        from jobs.tasks import run_job_search
+        mock_search.return_value = [
+            self._raw('Within budget', '£60,000'),
+            self._raw('Over budget', '£95,000'),
+        ]
+        mock_score.side_effect = fake_score(85, 'Strong match')
+
+        run_job_search(self.run.pk)
+
+        titles = {j.title for j in self.run.jobs.all()}
+        self.assertEqual(titles, {'Within budget'})
+
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks._score_job')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_unparseable_salary_is_never_flagged(self, mock_search, mock_score, _s):
+        """"Competitive" is not evidence of anything, least of all overpayment."""
+        from jobs.tasks import run_job_search
+        mock_search.return_value = [self._raw('Mystery pay', 'Competitive')]
+        mock_score.side_effect = fake_score(85, 'Strong match')
+
+        run_job_search(self.run.pk)
+
+        job = self.run.jobs.get()
+        self.assertFalse(job.above_salary_preference)
+        self.assertNotIn('Above your salary preference', job.match_reason)
 
 
 class FactIntegrityTests(TestCase):

@@ -23,8 +23,7 @@
         <div class="stat-card">
             <div class="stat-label">Status</div>
             <div class="stat-value-sm">
-                {% if job.ats_status == 'REJECTED' %}<span class="badge badge-red">ATS Rejected</span>
-                {% elif job.ats_status == 'PASSED' %}<span class="badge badge-green">Passed</span>
+                {% if job.ats_status == 'PASSED' %}<span class="badge badge-green">At or above threshold</span>
                 {% else %}<span class="badge badge-yellow">Below threshold</span>{% endif %}
             </div>
         </div>
@@ -113,12 +112,17 @@
 </div>
 {% endif %}
 
-{% if data.rejection_reasons %}
+{% if data.formatting_issues %}
 <div class="card">
-    <h2>Why this CV would be rejected</h2>
+    <h2>Formatting worth fixing <span class="badge badge-yellow">Advisory</span></h2>
+    <p class="muted">
+        These make your CV harder for a parser to read, and they cost you a little
+        score. They do not disqualify you from this job or any other — nothing here
+        removed it from your results.
+    </p>
     <ul>
-        {% for reason in data.rejection_reasons %}
-            <li><span class="badge badge-red">✗</span> {{ reason }}</li>
+        {% for reason in data.formatting_issues %}
+            <li><span class="badge badge-yellow">!</span> {{ reason }}</li>
         {% endfor %}
     </ul>
 </div>
@@ -128,8 +132,9 @@
 {% with p1=phases.phase1_parsing %}
 <div class="card">
     <h2>Phase 1 — Parsing &amp; formatting
-        {% if p1.pass %}<span class="badge badge-green">Pass</span>{% else %}<span class="badge badge-red">Fail</span>{% endif %}
+        {% if p1.pass %}<span class="badge badge-green">Clean</span>{% else %}<span class="badge badge-yellow">Room to improve</span>{% endif %}
     </h2>
+    <p class="muted">How readable your CV file is to a parser. Advisory only.</p>
     <div class="table-wrap">
         <table>
             <tbody>
@@ -150,59 +155,6 @@
                 <tr>
                     <td>Font issues</td>
                     <td>{% if p1.font_issues %}<span class="badge badge-yellow">{{ p1.font_issues|join:", " }}</span>{% else %}<span class="muted">None</span>{% endif %}</td>
-                </tr>
-            </tbody>
-        </table>
-    </div>
-</div>
-{% endwith %}
-{% endif %}
-
-{% if phases.phase2_knockout %}
-{% with p2=phases.phase2_knockout %}
-<div class="card">
-    <h2>Phase 2 — Knock-out filters
-        {% if p2.pass %}<span class="badge badge-green">Pass</span>{% else %}<span class="badge badge-red">Fail</span>{% endif %}
-    </h2>
-    <div class="table-wrap">
-        <table>
-            <thead><tr><th>Filter</th><th>Required</th><th>Found on CV</th><th>Result</th></tr></thead>
-            <tbody>
-                <tr>
-                    <td>Years of experience</td>
-                    <td>{{ p2.experience_years.required|default:"—" }}</td>
-                    <td>{{ p2.experience_years.found }}</td>
-                    <td>{% if p2.experience_years.skipped %}<span class="muted">n/a</span>{% elif p2.experience_years.pass %}<span class="badge badge-green">Pass</span>{% else %}<span class="badge badge-red">Fail</span>{% endif %}</td>
-                </tr>
-                <tr>
-                    <td>Education</td>
-                    <td>{{ p2.education.required|default:"—" }}</td>
-                    <td>{{ p2.education.found|default:"—" }}</td>
-                    <td>{% if p2.education.skipped %}<span class="muted">n/a</span>{% elif p2.education.pass %}<span class="badge badge-green">Pass</span>{% else %}<span class="badge badge-red">Fail</span>{% endif %}</td>
-                </tr>
-                <tr>
-                    <td>Certifications</td>
-                    <td>{{ p2.certifications.required|join:", "|default:"—" }}</td>
-                    <td>{{ p2.certifications.found|join:", "|default:"—" }}</td>
-                    <td>{% if p2.certifications.skipped %}<span class="muted">n/a</span>{% elif p2.certifications.pass %}<span class="badge badge-green">Pass</span>{% else %}<span class="badge badge-red">Fail</span>{% endif %}</td>
-                </tr>
-                <tr>
-                    <td>Minimum GPA</td>
-                    <td>{{ p2.gpa.required|default:"—" }}</td>
-                    <td>{{ p2.gpa.found|default:"—" }}</td>
-                    <td>{% if p2.gpa.skipped %}<span class="muted">n/a</span>{% elif p2.gpa.pass %}<span class="badge badge-green">Pass</span>{% else %}<span class="badge badge-red">Fail</span>{% endif %}</td>
-                </tr>
-                <tr>
-                    <td>Location</td>
-                    <td>{{ p2.location.required|default:"—" }}</td>
-                    <td>{{ p2.location.found|default:"—" }}</td>
-                    <td>{% if p2.location.skipped %}<span class="muted">n/a</span>{% elif p2.location.pass %}<span class="badge badge-green">Pass</span>{% else %}<span class="badge badge-red">Fail</span>{% endif %}</td>
-                </tr>
-                <tr>
-                    <td>Work authorisation</td>
-                    <td>{{ p2.work_authorization.required|default:"—" }}</td>
-                    <td>{{ p2.work_authorization.found|default:"—" }}</td>
-                    <td>{% if p2.work_authorization.skipped %}<span class="muted">n/a</span>{% elif p2.work_authorization.pass %}<span class="badge badge-green">Pass</span>{% else %}<span class="badge badge-red">Fail</span>{% endif %}</td>
                 </tr>
             </tbody>
         </table>

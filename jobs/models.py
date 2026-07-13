@@ -176,17 +176,15 @@ class Job(models.Model):
         (NOT_SPONSORED, 'Not Sponsored'),
     ]
 
-    # ATS outcome. REJECTED means the CV failed a hard filter (parsing or a
-    # knock-out) and would never reach a human for this job, whatever its score.
+    # ATS outcome. A description of the score, never a verdict on the job: there
+    # is no rejected state, and every job reaches the user whatever it scores.
     ATS_NOT_CHECKED = 'NOT_CHECKED'
     ATS_PASSED = 'PASSED'
     ATS_BELOW_THRESHOLD = 'BELOW_THRESHOLD'
-    ATS_REJECTED = 'REJECTED'
     ATS_STATUS_CHOICES = [
         (ATS_NOT_CHECKED, 'Not checked'),
         (ATS_PASSED, 'Passed'),
         (ATS_BELOW_THRESHOLD, 'Below threshold'),
-        (ATS_REJECTED, 'ATS Rejected'),
     ]
 
     search_run = models.ForeignKey(
@@ -205,8 +203,15 @@ class Job(models.Model):
     sponsorship_flag = models.CharField(
         max_length=20, choices=SPONSORSHIP_CHOICES, default=NOT_MENTIONED
     )
+    # The CV's real coverage of this job's keyword contract (0-100). NULL means
+    # "not scored" — the advert carried no readable description, so there was
+    # nothing to match against. Null is not zero and it is never a placeholder
+    # number; these jobs are shown, labelled "Not scored", and sorted last.
     match_score = models.IntegerField(null=True, blank=True)
     match_reason = models.TextField(blank=True)
+    # Advisory only: the job pays above the user's stated maximum. It is still
+    # shown (and still applicable to) unless SALARY_HARD_FILTER is switched on.
+    above_salary_preference = models.BooleanField(default=False)
     # Skills mined from the job description, and those the CV is missing.
     job_skills = models.JSONField(default=list, blank=True)
     missing_skills = models.JSONField(default=list, blank=True)
@@ -214,7 +219,8 @@ class Job(models.Model):
     ats_score = models.IntegerField(null=True, blank=True)
     ats_status = models.CharField(
         max_length=20, choices=ATS_STATUS_CHOICES, default=ATS_NOT_CHECKED,
-        help_text='Outcome of the ATS check (phases 1 & 2 are hard filters).',
+        help_text='Whether the tailored CV scored at or above the ATS threshold. '
+                  'Informational — it never withholds a job.',
     )
     application_link = models.URLField(max_length=500)
     tailored_pdf = models.FileField(
@@ -227,8 +233,8 @@ class Job(models.Model):
         return f'{self.title} @ {self.company}'
 
     @property
-    def ats_rejected(self):
-        return self.ats_status == self.ATS_REJECTED
+    def is_scored(self):
+        return self.match_score is not None
 
 
 class ATSReport(models.Model):
@@ -258,5 +264,6 @@ class ATSReport(models.Model):
         return (self.report_data or {}).get('recommendations', [])
 
     @property
-    def rejection_reasons(self):
-        return (self.report_data or {}).get('rejection_reasons', [])
+    def formatting_issues(self):
+        """Advisory formatting problems with the CV. Never a reason to hide a job."""
+        return (self.report_data or {}).get('formatting_issues', [])

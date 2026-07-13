@@ -4,7 +4,7 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ValidationError
-from django.db.models import Q
+from django.db.models import F, Q
 from django.http import FileResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
@@ -404,20 +404,24 @@ def clear_search_history(request):
 
 @login_required
 def search_results(request, run_id):
-    """List all jobs found for a given search run, ordered by match score."""
+    """List all jobs found for a given search run, ordered by real match score."""
     search_run = get_object_or_404(SearchRun, pk=run_id, user=request.user)
     threshold = settings.MATCH_THRESHOLD
 
-    # Every job is shown here; the three tabs filter client-side, so switching
-    # between them is instant and no job is hidden from the user. (The Excel
-    # export stays limited to >= threshold — that is a "what should I act on"
-    # artefact, whereas this page is "what did the search find".)
+    # Every job the search found is shown here — nothing is rejected and nothing
+    # is withheld. The three tabs filter client-side, so switching between them is
+    # instant. (The Excel export stays limited to >= threshold — that is a "what
+    # should I act on" artefact, whereas this page is "what did the search find".)
+    #
+    # An unscored job (empty advert, nothing to match against) sorts last rather
+    # than being treated as a zero: its score is unknown, not bad.
     jobs = list(
         search_run.jobs
         .select_related('ats_report')
-        .order_by('-match_score', 'title')
+        .order_by(F('match_score').desc(nulls_last=True), 'title')
     )
-    above = [j for j in jobs if (j.match_score or 0) >= threshold]
+    scored = [j for j in jobs if j.match_score is not None]
+    above = [j for j in scored if j.match_score >= threshold]
 
     return render(
         request,
@@ -429,8 +433,10 @@ def search_results(request, run_id):
             'ATS_THRESHOLD': settings.ATS_THRESHOLD,
             'total_found': len(jobs),
             'above_count': len(above),
+            # Everything that isn't above the bar, including the unscored: the two
+            # tabs must account for every row in "All Jobs".
             'below_count': len(jobs) - len(above),
-            'ats_rejected_count': sum(1 for j in jobs if j.ats_rejected),
+            'not_scored_count': len(jobs) - len(scored),
         },
     )
 

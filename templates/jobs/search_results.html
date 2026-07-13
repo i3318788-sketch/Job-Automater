@@ -38,11 +38,12 @@
         </button>
     </div>
 
-    {% if ats_rejected_count %}
+    {% if not_scored_count %}
         <p class="muted">
-            <span class="badge badge-red">{{ ats_rejected_count }} ATS Rejected</span>
-            These jobs failed a hard ATS filter (unparsable CV, or a knock-out such as
-            required years, degree or certification), so no tailored CV was generated.
+            <span class="badge badge-yellow">{{ not_scored_count }} not scored</span>
+            These adverts arrived without a readable description, so there was
+            nothing to match your CV against. They are listed last — open one to
+            read it on the employer's site.
         </p>
     {% endif %}
     {% if jobs %}
@@ -60,27 +61,31 @@
                 </thead>
                 <tbody>
                     {% for job in jobs %}
-                        <tr class="job-row" data-score="{{ job.match_score|default:0 }}">
+                        {# data-score is empty for an unscored job, so the tab filter can tell "unknown" from "zero". #}
+                        <tr class="job-row" data-score="{% if job.match_score is not None %}{{ job.match_score }}{% endif %}">
                             <td>
-                                {% if job.match_score >= 75 %}<span class="badge badge-lg badge-green">{{ job.match_score }}</span>
+                                {% if job.match_score is None %}
+                                    <span class="badge badge-lg badge-grey" title="This advert had no readable description to match against">Not scored</span>
+                                {% elif job.match_score >= MATCH_THRESHOLD %}<span class="badge badge-lg badge-green">{{ job.match_score }}</span>
                                 {% elif job.match_score >= 50 %}<span class="badge badge-lg badge-yellow">{{ job.match_score }}</span>
-                                {% else %}<span class="badge badge-lg badge-red">{{ job.match_score|default:"0" }}</span>{% endif %}
+                                {% else %}<span class="badge badge-lg badge-red">{{ job.match_score }}</span>{% endif %}
                             </td>
                             <td>
-                                {% if job.ats_status == 'REJECTED' %}
-                                    <a href="{% url 'ats_report' job.id %}" title="Failed a hard ATS filter — see the report">
-                                        <span class="badge badge-red">Rejected</span>
-                                    </a>
-                                {% elif job.ats_score is not None %}
+                                {% if job.ats_score is not None %}
                                     <a href="{% url 'ats_report' job.id %}" title="View the full ATS report">
                                         <span class="badge {% if job.ats_score >= ATS_THRESHOLD %}badge-green{% elif job.ats_score >= 60 %}badge-yellow{% else %}badge-red{% endif %}">{{ job.ats_score }}</span>
                                     </a>
-                                {% else %}<span class="muted">—</span>{% endif %}
+                                {% else %}<span class="muted" title="No tailored CV was generated for this job, so there is no ATS score for it">Not scored</span>{% endif %}
                             </td>
                             <td>{{ job.title }}</td>
                             <td>{{ job.company|default:"—" }}</td>
                             <td>{{ job.location|default:"—" }}</td>
-                            <td>{% if job.salary %}{{ job.salary }}{% else %}<span class="muted">Salary not listed</span>{% endif %}</td>
+                            <td>
+                                {% if job.salary %}{{ job.salary }}{% else %}<span class="muted">Salary not listed</span>{% endif %}
+                                {% if job.above_salary_preference %}
+                                    <span class="badge badge-yellow" title="Above the maximum in your preferences — shown anyway, since pay is negotiable">above preference</span>
+                                {% endif %}
+                            </td>
                             <td>
                                 {% if job.sponsorship_flag == 'SPONSORED' %}<span class="badge badge-green">Sponsored</span>
                                 {% else %}<span class="muted">{{ job.get_sponsorship_flag_display }}</span>{% endif %}
@@ -119,10 +124,15 @@
     function apply(filter) {
         var shown = 0;
         rows.forEach(function (row) {
-            var score = parseInt(row.dataset.score, 10) || 0;
+            // An unscored job has no score at all. It is NOT a zero, so it never
+            // claims to be above the threshold — but it stays visible in "All
+            // Jobs" and in "Below", so the two tabs still account for every row.
+            var raw = row.dataset.score;
+            var scored = raw !== '';
+            var score = scored ? parseInt(raw, 10) : null;
             var show = filter === 'all'
-                || (filter === 'above' && score >= threshold)
-                || (filter === 'below' && score < threshold);
+                || (filter === 'above' && scored && score >= threshold)
+                || (filter === 'below' && (!scored || score < threshold));
             row.style.display = show ? '' : 'none';
             if (show) { shown++; }
         });

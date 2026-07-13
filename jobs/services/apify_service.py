@@ -63,12 +63,45 @@ def _run_dataset_id(run):
     )
 
 
+DESCRIPTION_FIELDS = (
+    'description', 'jobDescription', 'descriptionText', 'descriptionHtml',
+    'jobDescriptionText', 'fullDescription', 'summary', 'snippet',
+)
+
+
+def _best_description(raw):
+    """The fullest description text the item carries.
+
+    Deliberately the LONGEST candidate, not the first one present. Taking the
+    first meant a two-line ``summary`` or a truncated ``snippet`` could win over
+    the complete ``description`` sitting in the same item, and every downstream
+    number is computed from this text: a truncated advert mines few keywords, and
+    an empty one mines none at all. Whatever the actor gives us in full, the
+    keyword contract gets in full.
+    """
+    best = ''
+    for field in DESCRIPTION_FIELDS:
+        value = raw.get(field)
+        if isinstance(value, str) and len(value.strip()) > len(best):
+            best = value.strip()
+    return best
+
+
 def normalize_job(raw):
     """Map a raw Apify dataset item to our internal job dict.
 
     Handles the field-name variance between actors gracefully; anything missing
     falls back to an empty string.
     """
+    description = _best_description(raw)
+    if not description:
+        logger.warning(
+            'Apify item for "%s" @ "%s" carries no description in any of %s — it '
+            'will be shown as "Not scored".',
+            raw.get('title', '?'), raw.get('company', '?'),
+            ', '.join(DESCRIPTION_FIELDS),
+        )
+
     return {
         'title': str(_first(raw, 'title', 'jobTitle', 'position')),
         'company': str(_first(raw, 'company', 'companyName', 'employer')),
@@ -77,7 +110,7 @@ def normalize_job(raw):
         'employmentType': str(_first(raw, 'employmentType', 'employment_type', 'jobType', 'job_type', 'contractType')),
         'seniorityLevel': str(_first(raw, 'seniorityLevel', 'seniority', 'experienceLevel')),
         'salary': str(_first(raw, 'salary', 'salary_raw', 'salaryRange', 'salaryText', 'compensation')) or _build_salary(raw),
-        'description': str(_first(raw, 'description', 'jobDescription', 'descriptionText', 'summary', 'snippet')),
+        'description': description,
         'applyLink': str(_first(raw, 'applyLink', 'direct_apply_url', 'applyUrl', 'applicationLink', 'url', 'jobUrl', 'redirectUrl', 'link')),
     }
 
@@ -223,9 +256,11 @@ def search_jobs(country_list, min_salary=None, limit=200, keywords=None, city=''
 
     # Post-fetch location filter (some actors ignore the location input).
     filtered = _filter_by_location(jobs, country_list, city=city)
+    empty = sum(1 for job in filtered if not job['description'].strip())
     logger.info(
-        'Apify returned %d jobs (%d after location filter for %s)',
-        len(jobs), len(filtered), city or location,
+        'Apify returned %d jobs (%d after location filter for %s); %d have no '
+        'description and cannot be scored',
+        len(jobs), len(filtered), city or location, empty,
     )
     return filtered
 

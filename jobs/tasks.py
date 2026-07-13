@@ -17,11 +17,7 @@ from django.utils import timezone
 
 from .models import ATSReport, CV, Job, SearchRun
 from .services.apify_service import ApifyConfigError, ApifySearchError, search_jobs
-from .services.ats_checker import (
-    ATSChecker,
-    extract_job_requirements,
-    score_cv_against_contract,
-)
+from .services.ats_checker import score_cv_against_contract
 from .services.google_sheets import GoogleSheetsLogger
 from .services.job_keywords import (
     all_contract_terms,
@@ -35,37 +31,11 @@ from .services.keyword_extractor import (
     missing_skills,
     prescore_job,
 )
-from .services.matching import detect_sponsorship, salary_within_range
+from .services.matching import detect_sponsorship, parse_salary
 from .services.pdf_generator import build_pdf_filename, generate_tailored_pdf
 from .services.tailoring import tailor_cv_for_job_with_ats
 
 logger = logging.getLogger(__name__)
-
-
-def _ats_check(cv_text, job):
-    """Full ATS report for the candidate's CV against this job.
-
-    Offline and deterministic, so it is cheap enough to run on every job. Returns
-    None if the check itself blows up — a broken checker must never reject a job.
-    """
-    try:
-        requirements = extract_job_requirements(job.description, job.title, job.location)
-        checker = ATSChecker(cv_text, job.description, requirements)
-        return checker.get_detailed_report()
-    except Exception:
-        logger.exception('ATS check failed for job %s', job.pk)
-        return None
-
-
-def _knocked_out(report):
-    """Would this CV be auto-rejected *for this job*?
-
-    Only the phase 2 knock-outs count here. Phase 1 (parsing/formatting) is a
-    property of the CV itself, identical for every job in the run — it is
-    reported once at upload time, and rejecting all 200 jobs over it would tell
-    the user nothing per-job. It still costs the CV 10% of its score.
-    """
-    return not report['phases']['phase2_knockout']['pass']
 
 
 def _check_duplicate_application(job, report):
@@ -101,16 +71,15 @@ def _check_duplicate_application(job, report):
 
 
 def _save_ats_report(job, report):
-    """Persist the full report and mirror its headline figures onto the job."""
+    """Persist the full report and mirror its headline figures onto the job.
+
+    The status is a description of the score and nothing more. There is no
+    rejected outcome: a job the CV scores badly against is still a job the
+    candidate gets to see, decide on, and apply to if they want to.
+    """
     _check_duplicate_application(job, report)
     job.ats_score = report['overall_score']
-    strict = getattr(settings, 'ATS_STRICT_MODE', False)
-    if _knocked_out(report) or (strict and not report['pass']):
-        job.ats_status = Job.ATS_REJECTED
-    elif report['pass']:
-        job.ats_status = Job.ATS_PASSED
-    else:
-        job.ats_status = Job.ATS_BELOW_THRESHOLD
+    job.ats_status = Job.ATS_PASSED if report['pass'] else Job.ATS_BELOW_THRESHOLD
 
     ATSReport.objects.update_or_create(
         job=job,
@@ -264,24 +233,73 @@ def _tailor_workers():
     return max(1, min(8, getattr(settings, 'SEARCH_TAILORING_WORKERS', 4)))
 
 
+NOT_SCORED_REASON = (
+    'Not scored: this advert carried no readable description, so there is nothing '
+    'to match your CV against.'
+)
+
+
 def _match_reason(coverage, contract):
     """A one-line explanation of a match score, from the coverage that produced it."""
-    hard = contract.get('hard_skills') or []
-    if not hard:
-        return 'No screenable skills could be mined from this job description.'
+    if not coverage.get('scorable'):
+        return NOT_SCORED_REASON
 
+    hard = contract.get('hard_skills') or []
     found = len(coverage.get('found_hard') or [])
     missing = coverage.get('missing_hard') or []
     must_missing = coverage.get('missing_must') or []
 
-    parts = [f'Covers {found}/{len(hard)} of the skills this job asks for']
+    parts = []
+    if hard:
+        parts.append(f'Covers {found}/{len(hard)} of the skills this job asks for')
     if must_missing:
         parts.append('missing must-haves: ' + ', '.join(must_missing[:4]))
     elif missing:
         parts.append('missing: ' + ', '.join(missing[:4]))
     if coverage.get('title_ok'):
         parts.append('job title matches')
-    return '. '.join(parts) + '.'
+    return '. '.join(parts) + '.' if parts else 'Matched on job title only.'
+
+
+def _apply_salary_preference(salary_text, min_salary, max_salary, reason,
+                             title='', run_id=None):
+    """Compare a job's pay against the candidate's ceiling. Returns (over_max, reason).
+
+    The only optional filter left in the pipeline, and even it does not filter by
+    default: a job above the stated maximum is *flagged*, not hidden. An advert's
+    figure is a range and an opening position, and a candidate who capped their
+    preference at £70k still wants to see the £80k role. Dropping it needs
+    SALARY_HARD_FILTER explicitly on.
+
+    A salary below the minimum is not acted on at all here: the minimum is already
+    passed to the Apify actor, and re-applying it as a client-side filter is how
+    "Salary below minimum" ended up prefixed onto jobs whose pay simply wasn't
+    parseable.
+
+    The comparison is logged either way, because a job silently flagged on an
+    unparseable salary string is the bug you cannot find without it.
+    """
+    if max_salary is None:
+        return False, reason
+
+    parsed = parse_salary(salary_text)
+    if parsed is None:
+        logger.debug(
+            'Search %s: salary "%s" on "%s" is not parseable — no comparison made.',
+            run_id, salary_text, title,
+        )
+        return False, reason
+
+    over = parsed > float(max_salary)
+    logger.info(
+        'Search %s: salary check on "%s" — advert "%s" parsed as %s vs ceiling %s '
+        '-> %s',
+        run_id, title, salary_text, parsed, max_salary,
+        'above preference' if over else 'within preference',
+    )
+    if over:
+        return True, f'Above your salary preference ({salary_text}). {reason}'
+    return False, reason
 
 
 def _score_job(job_data, cv_text, use_openai):
@@ -294,24 +312,45 @@ def _score_job(job_data, cv_text, use_openai):
     job is worth pursuing at all. (The tailored CV's coverage is a different
     number, stored separately as ats_score.)
 
+    ``score`` is None when the advert yielded nothing to screen against — an empty
+    or unreadable description. None is not zero and it is certainly not 100: it
+    means "we don't know", the UI says exactly that, and the job sorts last.
+
     Touches no DB and no model instance, so it is safe to run concurrently.
     """
     result = {'position': job_data['position'], 'contract': None,
-              'score': 0, 'reason': 'Unable to compute'}
+              'score': None, 'reason': NOT_SCORED_REASON}
+    description = job_data['description'] or ''
+    if not description.strip():
+        logger.warning(
+            'Job "%s" at position %s arrived with an empty description — not scored.',
+            job_data['title'], job_data['position'],
+        )
+        return result
+
     try:
         contract = extract_job_keywords(
-            job_data['description'], job_data['title'], use_openai=use_openai,
+            description, job_data['title'], use_openai=use_openai,
         )
         coverage = score_cv_against_contract(cv_text, contract)
         result.update({
             'contract': contract,
             'coverage': coverage,
+            # None when the contract had nothing job-specific in it. Passed
+            # straight through: inventing a number here is what produced the
+            # 100/100 "no screenable skills could be mined" jobs.
             'score': coverage['score'],
             'reason': _match_reason(coverage, contract),
         })
+        if coverage['score'] is None:
+            logger.warning(
+                'Job "%s" (%s chars of description) yielded no screenable '
+                'contract — not scored.',
+                job_data['title'], len(description),
+            )
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception('Match scoring failed for job at %s', job_data['position'])
-        result['reason'] = f'Unable to compute: {exc}'
+        result['reason'] = f'Not scored: {exc}'
     return result
 
 
@@ -340,7 +379,10 @@ def run_job_search(search_run_id):
     max_jobs = getattr(settings, 'MAX_JOBS_PER_SEARCH', 200)
     match_threshold = getattr(settings, 'MATCH_THRESHOLD', 75)
     max_scored = getattr(settings, 'OPENAI_MAX_SCORED_JOBS', 50)
-    prescore_threshold = getattr(settings, 'KEYWORD_PRESCORE_THRESHOLD', 60)
+    # The one optional filter left, and it is off by default: even a job over the
+    # candidate's ceiling is worth seeing (adverts state ranges, and pay is
+    # negotiable), so by default it is flagged rather than hidden.
+    salary_hard_filter = getattr(settings, 'SALARY_HARD_FILTER', False)
 
     countries = search_run.countries or ['United Kingdom']
     min_salary = search_run.min_salary
@@ -390,27 +432,19 @@ def run_job_search(search_run_id):
             'can_prescore': bool(cv_skills) and bool(job_skills),
         }
 
-    # Every job gets a real, per-job score. The pre-rank no longer decides WHETHER
-    # a job is scored — only how precisely: the best-ranked jobs get a
-    # model-extracted keyword contract, the long tail gets the deterministic one.
-    # Previously everything past the cap was stored with a hardcoded 0, which made
-    # the scores meaningless and hid good jobs at the bottom of the list.
-    eligible = [
-        index for index, data in prescores.items()
-        if salary_within_range(
-            raw_jobs[index].get('salary', ''), min_salary, max_salary
-        )[0]
-        and not (data['can_prescore'] and data['score'] < prescore_threshold)
-    ]
-    eligible.sort(key=lambda i: prescores[i]['score'], reverse=True)
-    precise = set(eligible[:max_scored])
+    # The pre-rank decides nothing about WHETHER a job is scored or shown — only
+    # how precisely it is scored. Every fetched job is scored and every fetched
+    # job appears in the results; the best-ranked ones simply get a model-extracted
+    # keyword contract, and the long tail gets the deterministic one, because the
+    # OpenAI budget is finite. Nothing is filtered out here.
+    ranked = sorted(prescores, key=lambda i: prescores[i]['score'], reverse=True)
+    precise = set(ranked[:max_scored])
     logger.info(
-        'Search %s: %d jobs fetched, %d passed stage 1, %d get a model-extracted '
-        'contract (the rest are scored from the deterministic one)',
-        search_run.pk, len(raw_jobs), len(eligible), len(precise),
+        'Search %s: %d jobs fetched, all of them scored and shown; the top %d by '
+        'pre-rank get a model-extracted contract, the rest the deterministic one',
+        search_run.pk, len(raw_jobs), len(precise),
     )
 
-    total = len(raw_jobs) or 1
     # Record the fetched total so the UI can show "processing X of Y".
     search_run.total_jobs = len(raw_jobs)
     search_run.save(update_fields=['total_jobs'])
@@ -420,7 +454,8 @@ def run_job_search(search_run_id):
 
     created = 0
     tailored = 0
-    rejected = 0
+    not_scored = 0
+    over_budget = 0
     try:
         # ------------------------------------------------------------------
         # Phase: scoring (15 -> 75%)
@@ -456,29 +491,43 @@ def run_job_search(search_run_id):
                 _phase_progress(
                     search_run, (PHASE_SCORING[0], 65), done, len(raw_jobs),
                 )
-        scored = len(scores)
 
         # Create the Job rows (main thread, so DB access stays single-threaded).
+        # EVERY fetched job becomes a row: nothing is knocked out, nothing is
+        # hidden. The score decides what the candidate is shown first, not whether
+        # they are shown it at all.
         jobs_to_tailor = []
         contracts = {}
         for position, raw in enumerate(raw_jobs):
             description = raw.get('description', '')
             sponsorship = detect_sponsorship(f"{description} {raw.get('title', '')}")
-            within, _parsed, range_reason = salary_within_range(
-                raw.get('salary', ''), min_salary, max_salary,
-            )
 
             result = scores.get(position) or {}
             contract = result.get('contract')
             coverage = result.get('coverage') or {}
 
-            # The score is the real one either way. A job outside the salary range
-            # keeps its true skills match — it just isn't pursued, and the reason
-            # says so. Reporting it as 0 would be a lie about the fit.
-            score = result.get('score', 0)
-            reason = result.get('reason', 'Unable to compute')
-            if not within:
-                reason = f'{range_reason}. {reason}'
+            # None means "not scored" — the advert gave us nothing to measure. It
+            # is never silently turned into a number.
+            score = result.get('score')
+            reason = result.get('reason') or NOT_SCORED_REASON
+            if score is None:
+                not_scored += 1
+
+            over_max, reason = _apply_salary_preference(
+                raw.get('salary', ''), min_salary, max_salary, reason,
+                title=raw.get('title', ''), run_id=search_run.pk,
+            )
+            if over_max:
+                over_budget += 1
+                if salary_hard_filter:
+                    # Opt-in only (SALARY_HARD_FILTER). Off by default: the job is
+                    # kept and flagged instead.
+                    logger.info(
+                        'Search %s: dropping "%s" — over the salary ceiling and '
+                        'SALARY_HARD_FILTER is on.',
+                        search_run.pk, raw.get('title', ''),
+                    )
+                    continue
 
             # The contract sees the whole advert, not just the 115-word vocabulary,
             # so it is the better record of what the job wants and what the CV
@@ -506,28 +555,17 @@ def run_job_search(search_run_id):
                 sponsorship_flag=sponsorship,
                 match_score=score,
                 match_reason=reason,
+                above_salary_preference=over_max,
                 application_link=raw.get('applyLink', '')[:500],
             )
             created += 1
 
-            # Phase 2 knock-outs: if this CV would be auto-rejected for this job,
-            # there is no point spending an OpenAI call tailoring a CV that will
-            # never reach a human.
-            ats = _ats_check(cv_text, job)
-            if ats and _knocked_out(ats):
-                _save_ats_report(job, ats)
-                job.match_reason = (
-                    (job.match_reason or '')
-                    + ' (ATS Rejected: '
-                    + '; '.join(ats['knockout_reasons'][:2]) + ')'
-                ).strip()
-                rejected += 1
-                job.processed = True
-                job.save()
-            elif within and score >= match_threshold:
-                # `within` matters: a job can now score well on skills and still be
-                # outside the salary range, and there is no point tailoring a CV
-                # for a job the candidate has ruled out on pay.
+            # Tailoring is the one thing a score still gates, and only because a
+            # tailored CV costs several OpenAI calls. A job the candidate does not
+            # match is still shown — it just doesn't get a bespoke CV written for
+            # it. Being over the salary ceiling does not block tailoring: the job
+            # is in the results, so it must be applicable to.
+            if score is not None and score >= match_threshold:
                 jobs_to_tailor.append((job, contracts.get(position)))
 
             _phase_progress(
@@ -592,13 +630,14 @@ def run_job_search(search_run_id):
     search_run.progress = 100
     search_run.save(update_fields=['status', 'progress'])
     logger.info(
-        'Search %s completed: %d jobs, %d tailored, %d ATS-rejected',
-        search_run.pk, created, tailored, rejected,
+        'Search %s completed: %d jobs shown, %d tailored, %d not scored (empty '
+        'description), %d flagged above the salary preference',
+        search_run.pk, created, tailored, not_scored, over_budget,
     )
     _notify_user(search_run, created, tailored)
     return {
         'status': 'COMPLETED', 'created': created, 'tailored': tailored,
-        'ats_rejected': rejected,
+        'not_scored': not_scored, 'above_salary_preference': over_budget,
     }
 
 

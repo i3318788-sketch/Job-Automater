@@ -117,7 +117,9 @@ class GoogleSheetsLogger:
             job.company,
             job.location,
             job.salary or '',
-            job.match_score if job.match_score is not None else 0,
+            # Blank, not 0: an unscored job has no score, and writing a zero into
+            # the sheet would read as "terrible match" rather than "not measured".
+            job.match_score if job.match_score is not None else '',
             job.match_reason or '',
             job.get_sponsorship_flag_display(),
             job.application_link or '',

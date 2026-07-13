@@ -172,14 +172,32 @@ python manage.py test_openai
   CV is mined for `skills` and `job_titles` (via OpenAI, with a deterministic
   vocabulary fallback). Those job titles become the **Apify search terms**, so
   each candidate is searched for their own roles instead of a hardcoded keyword.
-- **Two-stage scoring**: Stage 1 computes a cheap keyword-overlap score against
-  the skills mined from the job description. Only jobs scoring at least
-  `KEYWORD_PRESCORE_THRESHOLD` (default 60) go to Stage 2 (OpenAI), which keeps
-  cost down. Jobs below the bar are still saved, scored by keyword overlap and
-  labelled — they're never silently dropped. The gate is skipped entirely when
-  either side yields no skills, so a CV we can't mine is never filtered out.
-- **ATS score**: after a tailored CV is generated, a second OpenAI check
-  estimates how it would score in an ATS for that job (`Job.ats_score`).
+- **Nothing is rejected.** Every job the search fetches is scored and shown. There
+  are no knock-out filters: not location, not "5 years required", not a demanded
+  degree or certification, not an awkwardly formatted CV. Those filters answered
+  "would a real ATS bin this?", and the honest answer was usually yes — which left
+  the user with an empty page and nothing to act on. The score ranks the list; it
+  never decides what is on it.
+- **Every score is real.** A job's `match_score` is the original CV's measured
+  coverage of *that job's* keyword contract, so it varies with the advert. A weak
+  match shows its true low score.
+- **"Not scored" is a real answer.** When an advert arrives with no readable
+  description there is nothing to match against, so `match_score` is `NULL` and the
+  UI says "Not scored". It is never turned into a number — least of all a 100,
+  which is what the old code silently produced by falling back to measuring the
+  CV's own section headings.
+- **Pre-ranking spends the OpenAI budget, it does not filter.** A cheap keyword
+  overlap ranks the fetched jobs; the top `OPENAI_MAX_SCORED_JOBS` get a
+  model-extracted keyword contract and the rest get the deterministic one. Both are
+  real per-job contracts — the difference is precision, not whether a job is scored
+  or shown.
+- **Salary is the only optional filter, and by default it only flags.** With a
+  maximum set, a job above it is marked "above salary preference" and *kept* — an
+  advert's figure is a range and pay is negotiable. Set `SALARY_HARD_FILTER=True`
+  to drop those jobs instead.
+- **ATS score**: after a tailored CV is generated, the ATS checker scores it for
+  that job (`Job.ats_score`). Informational: a low score labels the job, it never
+  withholds it.
 
 ### Setting up Google Sheets (optional)
 

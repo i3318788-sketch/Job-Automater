@@ -12,7 +12,7 @@ import sys
 
 from django.core.management.base import BaseCommand, CommandError
 
-from jobs.services.ats_checker import ATSChecker, check_cv_format, extract_job_requirements
+from jobs.services.ats_checker import ATSChecker, check_cv_format, extract_job_context
 from jobs.utils import extract_text_from_docx, extract_text_from_pdf
 
 
@@ -90,10 +90,10 @@ class Command(BaseCommand):
             self._print_format_only(report, cv_text)
             return
 
-        requirements = extract_job_requirements(
+        context = extract_job_context(
             job_text, options['title'], options['location']
         )
-        checker = ATSChecker(cv_text, job_text, requirements, file_path=cv_path)
+        checker = ATSChecker(cv_text, job_text, context, file_path=cv_path)
         report = checker.get_detailed_report()
 
         if options['as_json']:
@@ -119,20 +119,19 @@ class Command(BaseCommand):
         self._check_line('Standard fonts', not phase1['font_issues'],
                          ', '.join(phase1['font_issues']) or 'ok')
 
-        verdict = 'READABLE' if phase1['pass'] else 'WOULD BE REJECTED'
-        style = self.style.SUCCESS if phase1['pass'] else self.style.ERROR
+        verdict = 'READABLE' if phase1['pass'] else 'HARD TO PARSE  - worth fixing'
+        style = self.style.SUCCESS if phase1['pass'] else self.style.WARNING
         self.stdout.write('')
         self.stdout.write(style(f'  Verdict: {verdict}'))
         self._print_recommendations(phase1.get('recommendations', []))
         self.stdout.write('')
         self.stdout.write(self.style.HTTP_INFO(
-            '  (No job description given  - pass --job for the full 7-phase check.)'
+            '  (No job description given  - pass --job for the full check.)'
         ))
 
     def _print_report(self, report, cv_text):
         phases = report['phases']
         p1 = phases['phase1_parsing']
-        p2 = phases['phase2_knockout']
         p3 = phases['phase3_keyword']
         p4 = phases['phase4_context']
         p5 = phases['phase5_experience']
@@ -144,20 +143,18 @@ class Command(BaseCommand):
         self.stdout.write(self._verdict_style(score)(
             f'  ATS SCORE: {score}/100   (threshold {report["threshold"]})'
         ))
-        if report['rejected']:
-            self.stdout.write(self.style.ERROR('  STATUS: ATS REJECTED  - hard filter failed'))
-        elif report['pass']:
-            self.stdout.write(self.style.SUCCESS('  STATUS: PASS'))
+        if report['pass']:
+            self.stdout.write(self.style.SUCCESS('  STATUS: AT OR ABOVE THRESHOLD'))
         else:
             self.stdout.write(self.style.WARNING('  STATUS: BELOW THRESHOLD'))
 
-        if report['rejection_reasons']:
+        if report['formatting_issues']:
             self.stdout.write('')
-            for reason in report['rejection_reasons']:
-                self.stdout.write(self.style.ERROR(f'  x {reason}'))
+            for reason in report['formatting_issues']:
+                self.stdout.write(self.style.WARNING(f'  ! {reason}'))
 
         # Phase 1
-        self._rule('PHASE 1  - PARSING & FORMATTING (hard filter)')
+        self._rule('PHASE 1  - PARSING & FORMATTING (advisory)')
         if p1.get('file_checks_skipped'):
             self.stdout.write(self.style.WARNING(
                 '  File-level checks skipped (install pdfplumber for PDF layout checks).'
@@ -171,38 +168,6 @@ class Command(BaseCommand):
                          if p1['missing_headers'] else ', '.join(p1['standard_headers']))
         self._check_line('Standard fonts', not p1['font_issues'],
                          ', '.join(p1['font_issues']) or 'ok')
-
-        # Phase 2
-        self._rule('PHASE 2  - KNOCK-OUT FILTERS (hard filter)')
-        checks = [
-            ('Years of experience', p2['experience_years'],
-             lambda c: f'requires {c["required"]}, CV shows {c["found"]}'),
-            ('Education level', p2['education'],
-             lambda c: f'requires {c["required"]}, CV shows {c["found"] or "none"}'),
-            ('Certifications', p2['certifications'],
-             lambda c: f'requires {", ".join(c["required"])}; missing '
-                       f'{", ".join(c["missing"]) or "none"}'),
-            ('Minimum GPA', p2['gpa'],
-             lambda c: f'requires {c["required"]}, CV shows {c["found"]}'),
-            ('Location', p2['location'],
-             lambda c: f'role in {c["required"]}, CV shows {c["found"] or "unknown"}'),
-            ('Work authorisation', p2['work_authorization'],
-             lambda c: f'job wants {c["required"]}, CV states {c["found"] or "nothing"}'),
-        ]
-        for label, check, describe in checks:
-            if check.get('unverifiable'):
-                # The job does require this, but the CV gives nothing to check it
-                # against — which is never grounds for a knock-out.
-                self.stdout.write(
-                    f'  [{self.style.WARNING("WARN")}] {label} - required, but nothing '
-                    f'on the CV to verify it against (not treated as a knock-out)'
-                )
-            elif check.get('skipped'):
-                self.stdout.write(
-                    f'  [{self.style.HTTP_INFO("SKIP")}] {label} - not required by this job'
-                )
-            else:
-                self._check_line(label, check['pass'], describe(check))
 
         # Phase 3
         self._rule('PHASE 3  - KEYWORD MATCHING')
