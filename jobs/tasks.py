@@ -7,6 +7,7 @@ directly. ``process_job_search`` is the Celery task wrapper invoked via
 import logging
 import os
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from celery import shared_task
 from django.conf import settings
@@ -116,42 +117,86 @@ def _save_ats_report(job, report):
     )
 
 
-def _generate_tailored_pdf_for_job(job, cv_text, candidate_name, contract=None):
-    """Tailor the CV for a high-scoring job, ATS-score it, and attach a PDF.
+def _build_tailored_cv(job_data, cv_text, candidate_name):
+    """Do the network-bound tailoring work for one job. Runs on a worker thread.
 
-    The keyword contract is built once for the job and shared by tailoring and
-    scoring, so the CV is written towards exactly the terms it is then measured
-    on. Tailoring loops against that score, aiming for ATS_TARGET_SCORE.
+    Touches no database and no model instance — it takes a plain dict and returns
+    a plain dict — so it is safe to run concurrently. Every DB write for these
+    results happens back on the main thread in ``_apply_tailored_cv``.
 
-    Best-effort: on failure the job is still marked processed and a note is added
-    to match_reason; the search itself is never aborted.
+    Returns a payload dict, including an ``error`` key when the work failed; a
+    single bad job must not abort the whole search.
     """
+    payload = {'job_id': job_data['id'], 'error': None}
     try:
-        if contract is None:
-            contract = extract_job_keywords(job.description, job.title)
+        contract = extract_job_keywords(job_data['description'], job_data['title'])
         tailored, report, attempts = tailor_cv_for_job_with_ats(
-            cv_text, job.description, job.title, job.company, job.location,
-            contract=contract,
+            cv_text, job_data['description'], job_data['title'], job_data['company'],
+            job_data['location'], contract=contract,
         )
-        job.tailored_text = tailored
-        _save_ats_report(job, report)
+        filename = build_pdf_filename(
+            candidate_name, job_data['title'], job_data['company'],
+        )
+        # Unique temp path per job: workers run concurrently and two jobs at the
+        # same company would otherwise race on the same filename.
+        tmp_path = os.path.join(
+            tempfile.gettempdir(), f'{job_data["id"]}_{filename}',
+        )
+        generate_tailored_pdf(
+            tailored, candidate_name, job_data['title'], job_data['company'], tmp_path,
+        )
+        payload.update({
+            'contract': contract,
+            'tailored_text': tailored,
+            'report': report,
+            'attempts': attempts,
+            'filename': filename,
+            'tmp_path': tmp_path,
+        })
+    except Exception as exc:
+        logger.exception('Tailoring failed for job %s', job_data['id'])
+        payload['error'] = str(exc)
+    return payload
+
+
+def _apply_tailored_cv(job, payload, cv_text):
+    """Persist a worker's tailoring payload. Main thread only (it writes to the DB)."""
+    if payload.get('error'):
+        note = ' (tailored CV generation failed)'
+        if note not in (job.match_reason or ''):
+            job.match_reason = (job.match_reason or '') + note
+        job.processed = True
+        return
+
+    try:
+        contract = payload.get('contract')
+        contract_terms = sorted(all_contract_terms(contract)) if contract else []
+        if contract_terms:
+            # The contract sees the whole advert, not just our 115-word vocabulary,
+            # so it is the better record of what the job actually wants.
+            cv_lower = (cv_text or '').lower()
+            job.job_skills = contract_terms
+            job.missing_skills = [
+                term for term in contract_terms if not term_present(term, cv_lower)
+            ]
+
+        job.tailored_text = payload['tailored_text']
+        _save_ats_report(job, payload['report'])
         logger.info(
             'Job %s tailored in %s attempt(s); ATS %s/100 (%s) against %s',
-            job.pk, attempts, report['overall_score'], job.ats_status,
-            contract_summary(contract),
+            job.pk, payload['attempts'], payload['report']['overall_score'],
+            job.ats_status, contract_summary(contract),
         )
 
-        filename = build_pdf_filename(candidate_name, job.title, job.company)
-        tmp_path = os.path.join(tempfile.gettempdir(), filename)
-        generate_tailored_pdf(tailored, candidate_name, job.title, job.company, tmp_path)
+        tmp_path = payload['tmp_path']
         with open(tmp_path, 'rb') as fh:
-            job.tailored_pdf.save(filename, File(fh), save=False)
+            job.tailored_pdf.save(payload['filename'], File(fh), save=False)
         try:
             os.remove(tmp_path)
         except OSError:
             pass
     except Exception:
-        logger.exception('Tailoring/PDF generation failed for job %s', job.pk)
+        logger.exception('Saving tailored CV failed for job %s', job.pk)
         note = ' (tailored CV generation failed)'
         if note not in (job.match_reason or ''):
             job.match_reason = (job.match_reason or '') + note
@@ -182,9 +227,47 @@ def _notify_user(search_run, job_count, tailored_count):
         logger.exception('Failed to send completion email for run %s', search_run.pk)
 
 
+# Progress is reported in phases so the bar moves steadily instead of sitting at
+# 0 and then snapping to 100. Each phase owns a band of the bar.
+PHASE_FETCH = (0, 15)       # Apify fetch
+PHASE_SCORING = (15, 75)    # pre-rank, OpenAI match scoring, Job row creation
+PHASE_TAILORING = (75, 95)  # tailoring + PDF generation for the matched jobs
+PHASE_FINALISE = (95, 100)  # Sheets logging, final save
+
+
 def _set_progress(search_run, value):
     search_run.progress = max(0, min(100, int(value)))
     search_run.save(update_fields=['progress'])
+
+
+def _phase_progress(search_run, phase, done, total):
+    """Advance the bar within a phase's band, in proportion to work completed.
+
+    Always called from the main thread — never from inside a worker — so the
+    counter can't be updated concurrently.
+    """
+    low, high = phase
+    fraction = (done / total) if total else 1.0
+    _set_progress(search_run, low + (high - low) * min(1.0, max(0.0, fraction)))
+
+
+def _score_workers():
+    """Concurrency for match scoring. Bounded: these are OpenAI calls, not CPU."""
+    return max(1, min(8, getattr(settings, 'SEARCH_SCORING_WORKERS', 6)))
+
+
+def _tailor_workers():
+    """Concurrency for tailoring. Lower than scoring: each job is several calls."""
+    return max(1, min(8, getattr(settings, 'SEARCH_TAILORING_WORKERS', 4)))
+
+
+def _score_job(cv_text, description):
+    """One OpenAI match call. Runs on a worker thread: no DB, no model instances."""
+    try:
+        return compute_match_score(cv_text, description)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception('Match scoring failed')
+        return {'score': 0, 'reason': f'Unable to compute: {exc}'}
 
 
 def run_job_search(search_run_id):
@@ -219,14 +302,17 @@ def run_job_search(search_run_id):
     keywords = extract_search_keywords(cv_data)
     logger.info('Search %s using keywords: %s', search_run.pk, keywords)
 
+    _set_progress(search_run, PHASE_FETCH[0])
     try:
         raw_jobs = search_jobs(
             countries, min_salary=min_salary, limit=max_jobs, keywords=keywords,
+            city=search_run.city,
         )
     except ApifyConfigError as exc:
         return _fail(search_run, f'Apify not configured: {exc}')
     except ApifySearchError as exc:
         return _fail(search_run, f'Job search failed: {exc}')
+    _set_progress(search_run, PHASE_FETCH[1])  # fetch done: 15%
 
     cv_text = cv.parsed_text or ''
     # Prefer the profile name for PDF naming; fall back to the account's name.
@@ -279,11 +365,40 @@ def run_job_search(search_run_id):
 
     created = 0
     tailored = 0
-    scored = 0
     rejected = 0
     try:
-        for index, raw in enumerate(raw_jobs, start=1):
-            position = index - 1  # index into the pre-ranking, which is 0-based
+        # ------------------------------------------------------------------
+        # Phase: scoring (15 -> 75%)
+        # ------------------------------------------------------------------
+        # The OpenAI match calls are network-bound and independent, so they run
+        # concurrently. The workers touch no database and no model instances —
+        # they take plain strings and return plain dicts — so there is no shared
+        # connection or cursor to worry about. Every Job row is created below, on
+        # the main thread.
+        scores = {}
+        if to_score:
+            done = 0
+            with ThreadPoolExecutor(max_workers=_score_workers()) as pool:
+                futures = {
+                    pool.submit(
+                        _score_job, cv_text, raw_jobs[i].get('description', ''),
+                    ): i
+                    for i in to_score
+                }
+                for future in as_completed(futures):
+                    position = futures[future]
+                    scores[position] = future.result()
+                    done += 1
+                    # Progress is advanced here, on the main thread, as each
+                    # future lands — never from inside a worker.
+                    _phase_progress(
+                        search_run, (PHASE_SCORING[0], 65), done, len(to_score),
+                    )
+        scored = len(scores)
+
+        # Create the Job rows (main thread, so DB access stays single-threaded).
+        jobs_to_tailor = []
+        for position, raw in enumerate(raw_jobs):
             description = raw.get('description', '')
             sponsorship = detect_sponsorship(f"{description} {raw.get('title', '')}")
             within, _parsed, range_reason = salary_within_range(
@@ -297,11 +412,9 @@ def run_job_search(search_run_id):
 
             if not within:
                 score, reason = 0, range_reason  # below min or above max
-            elif position in to_score:
-                # Stage 2: precise OpenAI scoring, spent on the top-ranked jobs.
-                result = compute_match_score(cv_text, description)
-                score, reason = result['score'], result['reason']
-                scored += 1
+            elif position in scores:
+                score = scores[position]['score']
+                reason = scores[position]['reason']
             elif stage1['can_prescore'] and prescore < prescore_threshold:
                 # Too little skill overlap to be worth an OpenAI call.
                 score = prescore
@@ -344,31 +457,59 @@ def run_job_search(search_run_id):
                 job.processed = True
                 job.save()
             elif score >= match_threshold:
-                # Build the keyword contract once, here: only jobs good enough to
-                # tailor for are worth an extraction call, and the same contract
-                # then drives the rewrite, the score and the skills we record.
-                contract = extract_job_keywords(job.description, job.title)
-                contract_terms = sorted(all_contract_terms(contract))
-                if contract_terms:
-                    # The contract sees the whole advert, not just our 115-word
-                    # vocabulary, so it is the better record of what the job wants.
-                    cv_lower = cv_text.lower()
-                    job.job_skills = contract_terms
-                    job.missing_skills = [
-                        term for term in contract_terms
-                        if not term_present(term, cv_lower)
-                    ]
-                _generate_tailored_pdf_for_job(
-                    job, cv_text, candidate_name, contract=contract,
-                )
-                if job.tailored_pdf:
-                    tailored += 1
-                job.save()
+                jobs_to_tailor.append(job)
 
-            # Best-effort logging to the candidate's own tab in the Google Sheet.
+            _phase_progress(
+                search_run, (65, PHASE_SCORING[1]), position + 1, len(raw_jobs),
+            )
+
+        # ------------------------------------------------------------------
+        # Phase: tailoring (75 -> 95%)
+        # ------------------------------------------------------------------
+        # Same shape as the scoring phase: the slow, network-bound work (contract
+        # extraction, the two-pass tailoring loop, PDF rendering to a temp file)
+        # runs on workers against plain dicts; the resulting payloads are written
+        # to the DB here, on the main thread. Each job keeps its full two-pass
+        # tailoring — the concurrency is across jobs, not within one.
+        _set_progress(search_run, PHASE_TAILORING[0])
+        if jobs_to_tailor:
+            by_id = {job.pk: job for job in jobs_to_tailor}
+            job_data = [
+                {
+                    'id': job.pk, 'title': job.title, 'company': job.company,
+                    'location': job.location, 'description': job.description,
+                }
+                for job in jobs_to_tailor
+            ]
+            done = 0
+            with ThreadPoolExecutor(max_workers=_tailor_workers()) as pool:
+                futures = [
+                    pool.submit(_build_tailored_cv, data, cv_text, candidate_name)
+                    for data in job_data
+                ]
+                for future in as_completed(futures):
+                    payload = future.result()
+                    job = by_id[payload['job_id']]
+                    _apply_tailored_cv(job, payload, cv_text)
+                    job.save()
+                    if job.tailored_pdf:
+                        tailored += 1
+                    done += 1
+                    _phase_progress(
+                        search_run, PHASE_TAILORING, done, len(job_data),
+                    )
+        _set_progress(search_run, PHASE_TAILORING[1])
+
+        # ------------------------------------------------------------------
+        # Phase: finalise (95 -> 100%)
+        # ------------------------------------------------------------------
+        # Sheets logging happens here rather than mid-loop, so every row is
+        # written with its final match and ATS scores already in place.
+        all_jobs = list(search_run.jobs.all())
+        for i, job in enumerate(all_jobs, start=1):
             if sheets.enabled:
                 sheets.log_job(job, candidate_name, cv_skills=cv_skills)
-            _set_progress(search_run, index / total * 100)
+            _phase_progress(search_run, PHASE_FINALISE, i, len(all_jobs))
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception('Search %s failed during processing', search_run.pk)
         return _fail(search_run, f'Processing error: {exc}')

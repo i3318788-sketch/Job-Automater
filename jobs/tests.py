@@ -1980,6 +1980,8 @@ class ATSReportViewTests(TestCase):
             search_run=self.run, title='Backend Engineer', company='Acme',
             location='London', application_link='https://x/1', ats_score=88,
             ats_status=Job.ATS_PASSED,
+            # Results only show jobs at or above the match threshold.
+            match_score=90,
         )
 
     def _make_report(self):
@@ -2015,6 +2017,241 @@ class ATSReportViewTests(TestCase):
         response = self.client.get(reverse('search_results', args=[self.run.pk]))
         self.assertContains(response, '88')
         self.assertContains(response, reverse('ats_report', args=[self.job.pk]))
+
+
+class CityFilterTests(TestCase):
+    def test_cities_are_listed_per_country(self):
+        from jobs.services.locations import cities_for_country
+        self.assertIn('Bristol', cities_for_country('United Kingdom'))
+        self.assertIn('Bristol', cities_for_country('uk'))  # code or name
+        self.assertIn('Berlin', cities_for_country('Germany'))
+        self.assertEqual(cities_for_country('Narnia'), [])
+
+    def test_city_map_is_keyed_by_the_names_the_form_offers(self):
+        from jobs.services.locations import cities_by_country_name
+        mapping = cities_by_country_name()
+        self.assertIn('United Kingdom', mapping)
+        self.assertIn('London', mapping['United Kingdom'])
+
+    def test_city_goes_into_the_actor_input(self):
+        from jobs.services.apify_service import _build_actor_input
+        inp = _build_actor_input('United Kingdom', 30000, 50, city='Bristol')
+        # The actor searches the city, not just the country.
+        self.assertEqual(inp['custom_location'], 'Bristol, United Kingdom')
+        self.assertEqual(inp['country'], 'uk')
+        # No city -> country-level search, as before.
+        self.assertEqual(
+            _build_actor_input('United Kingdom', None, 50)['custom_location'],
+            'United Kingdom',
+        )
+
+    def test_location_filter_keeps_only_the_chosen_city(self):
+        from jobs.services.apify_service import _filter_by_location
+        jobs = [
+            {'title': 'A', 'location': 'Bristol, UK'},
+            {'title': 'B', 'location': 'London, UK'},
+            {'title': 'C', 'location': 'Greater Bristol'},
+            {'title': 'D', 'location': ''},  # unknown -> kept, not dropped
+        ]
+        kept = {j['title'] for j in _filter_by_location(jobs, ['United Kingdom'],
+                                                        city='Bristol')}
+        self.assertEqual(kept, {'A', 'C', 'D'})
+
+    def test_no_city_falls_back_to_country_matching(self):
+        from jobs.services.apify_service import _filter_by_location
+        jobs = [{'title': 'A', 'location': 'London, UK'},
+                {'title': 'B', 'location': 'Berlin, Germany'}]
+        kept = {j['title'] for j in _filter_by_location(jobs, ['United Kingdom'])}
+        self.assertEqual(kept, {'A'})
+
+    def test_empty_city_result_is_not_backfilled(self):
+        """If the user asked for Bristol, don't hand them a page of London jobs."""
+        from jobs.services.apify_service import _filter_by_location
+        jobs = [{'title': 'A', 'location': 'London, UK'}]
+        self.assertEqual(_filter_by_location(jobs, ['United Kingdom'], city='Bristol'), [])
+
+    def test_preferences_form_rejects_a_city_outside_the_chosen_country(self):
+        from jobs.forms import UserPreferencesForm
+        form = UserPreferencesForm(data={
+            'target_countries': ['United Kingdom'], 'target_city': 'Berlin',
+            'currency': 'GBP',
+        })
+        self.assertFalse(form.is_valid())
+        self.assertIn('target_city', form.errors)
+
+    def test_preferences_form_accepts_a_valid_city(self):
+        from jobs.forms import UserPreferencesForm
+        form = UserPreferencesForm(data={
+            'target_countries': ['United Kingdom'], 'target_city': 'Bristol',
+            'currency': 'GBP',
+        })
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.cleaned_data['target_city'], 'Bristol')
+
+
+class CityPersistenceTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='cityuser', password='pw12345!')
+        self.client.login(username='cityuser', password='pw12345!')
+
+    def test_city_saved_and_threaded_into_the_search_run(self):
+        response = self.client.post(reverse('edit_preferences'), {
+            'target_countries': ['United Kingdom'], 'target_city': 'Manchester',
+            'salary_min': '40000', 'currency': 'GBP',
+        })
+        self.assertEqual(response.status_code, 302)
+        prefs = UserPreferences.objects.get(user=self.user)
+        self.assertEqual(prefs.target_city, 'Manchester')
+
+        _make_cv_for(self.user)
+        with mock.patch('jobs.views.process_job_search.delay'):
+            self.client.post(reverse('start_search'))
+        run = SearchRun.objects.get(user=self.user)
+        self.assertEqual(run.city, 'Manchester')  # snapshot on the run
+
+
+@override_settings(MEDIA_ROOT=_TEST_MEDIA, OPENAI_API_KEY='')
+class MatchThresholdDisplayTests(TestCase):
+    """Sub-75 jobs are stored but shown nowhere — not in the app, not in Excel."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='thr', password='pw12345!')
+        self.client.login(username='thr', password='pw12345!')
+        self.run = SearchRun.objects.create(
+            user=self.user, status=SearchRun.STATUS_COMPLETED,
+        )
+        self.good = Job.objects.create(
+            search_run=self.run, title='Strong Match', company='Acme',
+            location='London', match_score=88, application_link='https://x/1',
+        )
+        self.weak = Job.objects.create(
+            search_run=self.run, title='Weak Match', company='Beta',
+            location='Leeds', match_score=40, application_link='https://x/2',
+        )
+
+    def test_results_page_hides_sub_threshold_jobs(self):
+        response = self.client.get(reverse('search_results', args=[self.run.pk]))
+        self.assertContains(response, 'Strong Match')
+        self.assertNotContains(response, 'Weak Match')
+        self.assertEqual(response.context['hidden_count'], 1)
+
+    def test_weak_jobs_are_still_stored_not_deleted(self):
+        self.assertEqual(Job.objects.filter(search_run=self.run).count(), 2)
+        self.assertTrue(Job.objects.filter(pk=self.weak.pk).exists())
+
+    def test_excel_export_excludes_sub_threshold_jobs(self):
+        from openpyxl import load_workbook
+        response = self.client.get(reverse('export_excel', args=[self.run.pk]))
+        wb = load_workbook(io.BytesIO(b''.join(response.streaming_content)))
+        titles = [row[0] for row in wb['Jobs'].iter_rows(min_row=2, values_only=True)]
+        self.assertIn('Strong Match', titles)
+        self.assertNotIn('Weak Match', titles)
+
+
+@override_settings(MEDIA_ROOT=_TEST_MEDIA, OPENAI_API_KEY='')
+class SearchProgressPhaseTests(TestCase):
+    """Progress must climb through its phases, not sit at 0 and snap to 100."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='prog', password='pw12345!')
+        _make_cv_for(self.user)
+        self.run = SearchRun.objects.create(
+            user=self.user, countries=['United Kingdom'], min_salary=30000,
+            status=SearchRun.STATUS_PENDING,
+        )
+
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_progress_moves_through_the_phases(self, mock_search, mock_score, _sheets):
+        from jobs.tasks import run_job_search
+        mock_search.return_value = TWO_RAW_JOBS
+        mock_score.return_value = {'score': 85, 'reason': 'Strong match'}
+
+        seen = []
+        original = SearchRun.save
+
+        def record(self_run, *args, **kwargs):
+            if self_run.pk == self.run.pk:
+                seen.append(self_run.progress)
+            return original(self_run, *args, **kwargs)
+
+        with mock.patch.object(SearchRun, 'save', record):
+            run_job_search(self.run.pk)
+
+        self.assertTrue(seen)
+        # Monotonic, and it visits the intermediate bands rather than jumping.
+        self.assertEqual(seen, sorted(seen))
+        self.assertIn(15, seen)  # fetch complete
+        self.assertTrue(any(15 < p < 75 for p in seen), f'no scoring phase: {seen}')
+        self.assertTrue(any(75 <= p < 100 for p in seen), f'no tailoring phase: {seen}')
+        self.assertEqual(seen[-1], 100)
+
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_parallel_scoring_preserves_per_job_results(self, mock_search, mock_score, _s):
+        """Concurrency must not shuffle which score belongs to which job."""
+        from jobs.tasks import run_job_search
+
+        mock_search.return_value = TWO_RAW_JOBS
+
+        def score_by_description(cv_text, description):
+            # Distinct score per job, so a mix-up would be visible.
+            return ({'score': 90, 'reason': 'backend'} if 'Django' in description
+                    else {'score': 80, 'reason': 'entry'})
+
+        mock_score.side_effect = score_by_description
+        run_job_search(self.run.pk)
+
+        jobs = {j.title: j for j in self.run.jobs.all()}
+        self.assertEqual(jobs['Backend Engineer'].match_score, 90)
+        self.assertEqual(jobs['Backend Engineer'].match_reason, 'backend')
+        # The second job is below the salary minimum, so it is never scored.
+        self.assertEqual(jobs['Junior Dev'].match_reason, 'Salary below minimum')
+
+
+class ProfilePageTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='pia', password='pw12345!', email='pia@example.com',
+        )
+
+    def test_profile_requires_login(self):
+        response = self.client.get(reverse('profile'))
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse('login'), response.url)
+
+    def test_profile_shows_account_details(self):
+        self.client.login(username='pia', password='pw12345!')
+        UserPreferences.objects.create(
+            user=self.user, target_countries=['United Kingdom'],
+            target_city='Bristol', salary_min=50000, currency='GBP',
+        )
+        response = self.client.get(reverse('profile'))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'pia')
+        self.assertContains(response, 'pia@example.com')
+        self.assertContains(response, 'Bristol')
+        self.assertContains(response, 'Change password')
+
+    def test_profile_never_shows_a_password(self):
+        """Only a salted hash exists; there is nothing to show and we must not try."""
+        self.client.login(username='pia', password='pw12345!')
+        response = self.client.get(reverse('profile'))
+        self.assertNotContains(response, 'pw12345!')
+        self.assertNotContains(response, self.user.password)  # not even the hash
+
+    def test_password_change_works(self):
+        self.client.login(username='pia', password='pw12345!')
+        response = self.client.post(reverse('password_change'), {
+            'old_password': 'pw12345!',
+            'new_password1': 'BrandNewPw99!',
+            'new_password2': 'BrandNewPw99!',
+        })
+        self.assertRedirects(response, reverse('password_change_done'))
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password('BrandNewPw99!'))
 
 
 @override_settings(MEDIA_ROOT=_TEST_MEDIA)

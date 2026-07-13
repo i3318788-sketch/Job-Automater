@@ -2,6 +2,7 @@
 import os
 from io import BytesIO
 
+from django.conf import settings
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -69,8 +70,14 @@ def build_workbook(search_run):
         cell.fill = _HEADER_FILL
         cell.alignment = Alignment(vertical='center')
 
-    # Data rows.
-    for row_idx, job in enumerate(search_run.jobs.all().order_by('-match_score'), start=2):
+    # Data rows. Only jobs at or above the match threshold are exported — the
+    # rest stay in the database (nothing is deleted), they are just not something
+    # the user should be spending time on.
+    threshold = getattr(settings, 'MATCH_THRESHOLD', 75)
+    exportable = (
+        search_run.jobs.filter(match_score__gte=threshold).order_by('-match_score')
+    )
+    for row_idx, job in enumerate(exportable, start=2):
         for col, value in enumerate(_job_row(job), start=1):
             ws.cell(row=row_idx, column=col, value=value)
         fill = _score_fill(job.match_score)

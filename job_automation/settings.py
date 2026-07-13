@@ -85,6 +85,15 @@ ATS_TARGET_SCORE = env.int('ATS_TARGET_SCORE', default=90)
 ATS_MAX_TAILOR_ATTEMPTS = env.int('ATS_MAX_TAILOR_ATTEMPTS', default=3)
 
 # ---------------------------------------------------------------------------
+# Search concurrency
+# ---------------------------------------------------------------------------
+# The OpenAI calls in a search are network-bound and independent, so they run on
+# a thread pool. Raise to speed a search up; lower if you hit OpenAI rate limits.
+SEARCH_SCORING_WORKERS = env.int('SEARCH_SCORING_WORKERS', default=6)
+# Lower, because each tailoring job is several chained calls rather than one.
+SEARCH_TAILORING_WORKERS = env.int('SEARCH_TAILORING_WORKERS', default=4)
+
+# ---------------------------------------------------------------------------
 # Applications
 # ---------------------------------------------------------------------------
 INSTALLED_APPS = [

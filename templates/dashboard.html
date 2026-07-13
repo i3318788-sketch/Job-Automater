@@ -10,8 +10,21 @@
     </div>
 {% else %}
     <div class="card">
-        <h1>{{ active_cv.display_name }}</h1>
-        <p class="muted">Signed in as {{ user.username }} · {{ profile.get_role_display }}</p>
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:1rem; flex-wrap:wrap;">
+            <div>
+                <h1>{{ active_cv.display_name }}</h1>
+                <p class="muted">
+                    Signed in as {{ user.username }} · {{ profile.get_role_display }}
+                    {% if user.email %} · {{ user.email }}{% endif %}
+                    <br>
+                    Searching
+                    <strong>{% if preferences.target_city %}{{ preferences.target_city }}{% else %}all cities{% endif %}</strong>
+                    in {{ preferences.target_countries|join:", "|default:"United Kingdom" }}
+                    · joined {{ user.date_joined|date:"d M Y" }}
+                </p>
+            </div>
+            <a class="btn btn-secondary" href="{% url 'profile' %}">👤 View profile</a>
+        </div>
     </div>
 
     <div class="stats-grid">

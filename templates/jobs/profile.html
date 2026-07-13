@@ -1,0 +1,93 @@
+{% extends 'base.html' %}
+{% block title %}Profile · Job Automation{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h1>Profile</h1>
+    <p class="muted">Your account details and current job-search settings.</p>
+</div>
+
+<div class="card">
+    <h2>Account</h2>
+    <div class="table-wrap">
+        <table>
+            <tbody>
+                <tr><td style="width:220px;"><strong>Username</strong></td><td>{{ user.username }}</td></tr>
+                <tr><td><strong>Name</strong></td><td>{{ profile.candidate_name|default:"—" }}</td></tr>
+                <tr><td><strong>Email</strong></td><td>{{ user.email|default:"—" }}</td></tr>
+                <tr><td><strong>Role</strong></td><td>{% if profile %}{{ profile.get_role_display }}{% else %}User{% endif %}</td></tr>
+                <tr><td><strong>Date joined</strong></td><td>{{ user.date_joined|date:"d M Y, H:i" }}</td></tr>
+                <tr>
+                    <td><strong>Last login</strong></td>
+                    <td>{% if user.last_login %}{{ user.last_login|date:"d M Y, H:i" }}{% else %}<span class="muted">Never</span>{% endif %}</td>
+                </tr>
+                <tr>
+                    <td><strong>Password</strong></td>
+                    <td>
+                        <span class="muted">
+                            Not shown. Only a salted hash is stored, so your password
+                            cannot be displayed or recovered — by us or by anyone with
+                            database access.
+                        </span>
+                    </td>
+                </tr>
+                <tr>
+                    <td><strong>Password last changed</strong></td>
+                    <td>
+                        <span class="muted">
+                            Not recorded. Django does not store a timestamp when a
+                            password changes, so there is no honest value to show here.
+                        </span>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+    <div style="display:flex; gap:0.6rem; margin-top:1rem;">
+        <a class="btn" href="{% url 'password_change' %}">🔑 Change password</a>
+    </div>
+</div>
+
+<div class="card">
+    <h2>Job search settings</h2>
+    <div class="table-wrap">
+        <table>
+            <tbody>
+                <tr>
+                    <td style="width:220px;"><strong>Target countries</strong></td>
+                    <td>{{ preferences.target_countries|join:", "|default:"—" }}</td>
+                </tr>
+                <tr>
+                    <td><strong>Target city</strong></td>
+                    <td>
+                        {% if preferences.target_city %}{{ preferences.target_city }}
+                        {% else %}<span class="muted">Any city (whole country)</span>{% endif %}
+                    </td>
+                </tr>
+                <tr>
+                    <td><strong>Salary range</strong></td>
+                    <td>
+                        {{ preferences.currency_symbol|default:"£" }}{{ effective_min_salary|floatformat:0 }}
+                        {% if preferences.salary_max %}
+                            – {{ preferences.currency_symbol|default:"£" }}{{ preferences.salary_max|floatformat:0 }}
+                        {% else %}
+                            <span class="muted">and above (no upper limit)</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                <tr>
+                    <td><strong>Currency</strong></td>
+                    <td>{% if preferences %}{{ preferences.get_currency_display }}{% else %}<span class="muted">£ (GBP)</span>{% endif %}</td>
+                </tr>
+                <tr><td><strong>Active CV profile</strong></td><td>{{ active_cv.display_name|default:"—" }}</td></tr>
+                <tr><td><strong>CV profiles</strong></td><td>{{ cv_count }}</td></tr>
+                <tr><td><strong>Searches run</strong></td><td>{{ search_count }}</td></tr>
+            </tbody>
+        </table>
+    </div>
+    <div style="display:flex; gap:0.6rem; margin-top:1rem;">
+        <a class="btn btn-secondary" href="{% url 'edit_preferences' %}">⚙ Edit preferences</a>
+        <a class="btn btn-secondary" href="{% url 'dashboard' %}">← Dashboard</a>
+    </div>
+</div>
+{% endblock %}

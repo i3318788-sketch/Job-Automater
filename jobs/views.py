@@ -13,6 +13,7 @@ from .forms import CVUploadForm, ProfileForm, UserPreferencesForm
 from .models import CV, Job, SearchRun, UserPreferences
 from .services.ats_checker import check_cv_format
 from .services.excel_export import build_workbook
+from .services.locations import cities_by_country_name
 from .services.keyword_extractor import (
     extract_cv_profile,
     extract_search_keywords,
@@ -257,8 +258,36 @@ def edit_preferences(request):
 
     return render(
         request, 'jobs/preferences.html',
-        {'form': form, 'preferences': preferences},
+        {
+            'form': form,
+            'preferences': preferences,
+            # Rendered into the page as JSON so the city dropdown is populated
+            # client-side, with no external API call.
+            'city_map': cities_by_country_name(),
+        },
     )
+
+
+@login_required
+def profile(request):
+    """The logged-in user's account details, preferences and CV profiles.
+
+    Deliberately shows no password: Django stores only a salted hash and cannot
+    recover the original, so there is nothing to show. "Password last changed" is
+    the closest honest signal available, and it is only approximate — see below.
+    """
+    user = request.user
+    preferences = UserPreferences.objects.filter(user=user).first()
+    active_cv = resolve_active_cv(request)
+
+    return render(request, 'jobs/profile.html', {
+        'profile': getattr(user, 'profile', None),
+        'preferences': preferences,
+        'active_cv': active_cv,
+        'cv_count': CV.objects.filter(user=user).count(),
+        'search_count': SearchRun.objects.filter(user=user).count(),
+        'effective_min_salary': get_effective_min_salary(user),
+    })
 
 
 @login_required
@@ -275,6 +304,7 @@ def start_search(request):
 
     preferences = UserPreferences.objects.filter(user=request.user).first()
     countries = (preferences.target_countries if preferences else None) or ['United Kingdom']
+    city = (preferences.target_city if preferences else '') or ''
     min_salary, max_salary = get_effective_salary_range(request.user)
 
     # If the user never set a minimum, derive a sensible one from the CV's target
@@ -290,6 +320,9 @@ def start_search(request):
         user=request.user,
         cv=active_cv,
         countries=countries,
+        # Snapshot the city on the run, so changing preferences later doesn't
+        # rewrite what this search actually looked for.
+        city=city,
         min_salary=min_salary,
         max_salary=max_salary,
         status=SearchRun.STATUS_PENDING,
@@ -339,18 +372,27 @@ def clear_search_history(request):
 def search_results(request, run_id):
     """List all jobs found for a given search run, ordered by match score."""
     search_run = get_object_or_404(SearchRun, pk=run_id, user=request.user)
+    # Only jobs at or above the match threshold are shown. Everything found is
+    # still stored — this is a display filter, not a delete — but a job the
+    # candidate isn't competitive for is noise, not a result.
+    threshold = settings.MATCH_THRESHOLD
     jobs = (
         search_run.jobs
         .select_related('ats_report')
+        .filter(match_score__gte=threshold)
         .order_by('-match_score', 'title')
     )
+    total_found = search_run.jobs.count()
     return render(
         request,
         'jobs/search_results.html',
         {
             'search_run': search_run,
             'jobs': jobs,
+            'MATCH_THRESHOLD': threshold,
             'ATS_THRESHOLD': settings.ATS_THRESHOLD,
+            'total_found': total_found,
+            'hidden_count': total_found - len(jobs),
             'ats_rejected_count': sum(1 for j in jobs if j.ats_rejected),
         },
     )

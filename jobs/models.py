@@ -53,6 +53,12 @@ class UserPreferences(models.Model):
     target_countries = models.JSONField(
         default=list, blank=True, help_text='List of target country names.'
     )
+    target_city = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text='Optional city to narrow the search to. Blank searches the '
+                  'whole country.',
+    )
     salary_min = models.DecimalField(
         max_digits=12,
         decimal_places=2,
@@ -106,6 +112,9 @@ class SearchRun(models.Model):
         related_name='search_runs',
     )
     countries = models.JSONField(default=list, blank=True)
+    # Snapshot of the city this run searched, so a later preferences change
+    # doesn't rewrite the history of what was actually searched.
+    city = models.CharField(max_length=100, blank=True)
     min_salary = models.DecimalField(
         max_digits=12, decimal_places=2, null=True, blank=True
     )
