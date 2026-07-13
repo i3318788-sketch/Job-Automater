@@ -13,8 +13,9 @@ from django.conf import settings
 from django.core.files import File
 from django.core.mail import send_mail
 
-from .models import CV, Job, SearchRun
+from .models import ATSReport, CV, Job, SearchRun
 from .services.apify_service import ApifyConfigError, ApifySearchError, search_jobs
+from .services.ats_checker import ATSChecker, extract_job_requirements
 from .services.google_sheets import GoogleSheetsLogger
 from .services.keyword_extractor import (
     extract_search_keywords,
@@ -23,29 +24,109 @@ from .services.keyword_extractor import (
     missing_skills,
 )
 from .services.matching import (
-    compute_ats_score,
     compute_match_score,
     detect_sponsorship,
     salary_within_range,
 )
 from .services.pdf_generator import build_pdf_filename, generate_tailored_pdf
-from .services.tailoring import tailor_cv_for_job
+from .services.tailoring import tailor_cv_for_job_with_ats
 
 logger = logging.getLogger(__name__)
 
 
-def _generate_tailored_pdf_for_job(job, cv_text, candidate_name):
-    """Tailor the CV for a high-scoring job and attach a generated PDF.
+def _ats_check(cv_text, job):
+    """Full ATS report for the candidate's CV against this job.
 
+    Offline and deterministic, so it is cheap enough to run on every job. Returns
+    None if the check itself blows up — a broken checker must never reject a job.
+    """
+    try:
+        requirements = extract_job_requirements(job.description, job.title, job.location)
+        checker = ATSChecker(cv_text, job.description, requirements)
+        return checker.get_detailed_report()
+    except Exception:
+        logger.exception('ATS check failed for job %s', job.pk)
+        return None
+
+
+def _knocked_out(report):
+    """Would this CV be auto-rejected *for this job*?
+
+    Only the phase 2 knock-outs count here. Phase 1 (parsing/formatting) is a
+    property of the CV itself, identical for every job in the run — it is
+    reported once at upload time, and rejecting all 200 jobs over it would tell
+    the user nothing per-job. It still costs the CV 10% of its score.
+    """
+    return not report['phases']['phase2_knockout']['pass']
+
+
+def _check_duplicate_application(job, report):
+    """Phase 7: has this candidate already applied to this company with another CV?
+
+    An ATS compares the parsed text of incoming applications and merges duplicates
+    into one profile. We do the same by comparing the CV's content hash against
+    the CVs already submitted to the same company by the same user.
+    """
+    text_hash = report.get('text_hash')
+    if not text_hash or not job.company:
+        return
+
+    previous = (
+        ATSReport.objects
+        .filter(
+            job__search_run__user_id=job.search_run.user_id,
+            job__company__iexact=job.company,
+        )
+        .exclude(job_id=job.pk)
+        .order_by('created_at')
+    )
+    for other in previous:
+        other_hash = (other.report_data or {}).get('text_hash')
+        if not other_hash:
+            continue
+        report['duplicate_application'] = True
+        # Same company, *different* CV text is the case a recruiter actually sees
+        # flagged; an identical re-send is just the same application again.
+        report['duplicate_is_identical'] = other_hash == text_hash
+        report['duplicate_of_job_id'] = other.job_id
+        return
+
+
+def _save_ats_report(job, report):
+    """Persist the full report and mirror its headline figures onto the job."""
+    _check_duplicate_application(job, report)
+    job.ats_score = report['overall_score']
+    strict = getattr(settings, 'ATS_STRICT_MODE', False)
+    if _knocked_out(report) or (strict and not report['pass']):
+        job.ats_status = Job.ATS_REJECTED
+    elif report['pass']:
+        job.ats_status = Job.ATS_PASSED
+    else:
+        job.ats_status = Job.ATS_BELOW_THRESHOLD
+
+    ATSReport.objects.update_or_create(
+        job=job,
+        defaults={'overall_score': report['overall_score'], 'report_data': report},
+    )
+
+
+def _generate_tailored_pdf_for_job(job, cv_text, candidate_name):
+    """Tailor the CV for a high-scoring job, ATS-score it, and attach a PDF.
+
+    Tailoring runs in a loop against the ATS checker, aiming for ATS_TARGET_SCORE.
     Best-effort: on failure the job is still marked processed and a note is added
     to match_reason; the search itself is never aborted.
     """
     try:
-        tailored = tailor_cv_for_job(cv_text, job.description, job.title, job.company)
+        tailored, report, attempts = tailor_cv_for_job_with_ats(
+            cv_text, job.description, job.title, job.company, job.location,
+        )
         job.tailored_text = tailored
-
-        # Estimate how the tailored CV would fare in an ATS for this job.
-        job.ats_score = compute_ats_score(tailored, job.description)
+        _save_ats_report(job, report)
+        logger.info(
+            'Job %s tailored in %s attempt(s); ATS %s/100 (%s)',
+            job.pk, attempts, report['overall_score'], job.ats_status,
+        )
 
         filename = build_pdf_filename(candidate_name, job.title, job.company)
         tmp_path = os.path.join(tempfile.gettempdir(), filename)
@@ -153,6 +234,7 @@ def run_job_search(search_run_id):
     created = 0
     tailored = 0
     scored = 0
+    rejected = 0
     try:
         for index, raw in enumerate(raw_jobs, start=1):
             description = raw.get('description', '')
@@ -203,7 +285,21 @@ def run_job_search(search_run_id):
             )
             created += 1
 
-            if score >= match_threshold:
+            # Phase 2 knock-outs: if this CV would be auto-rejected for this job,
+            # there is no point spending an OpenAI call tailoring a CV that will
+            # never reach a human.
+            ats = _ats_check(cv_text, job)
+            if ats and _knocked_out(ats):
+                _save_ats_report(job, ats)
+                job.match_reason = (
+                    (job.match_reason or '')
+                    + ' (ATS Rejected: '
+                    + '; '.join(ats['knockout_reasons'][:2]) + ')'
+                ).strip()
+                rejected += 1
+                job.processed = True
+                job.save()
+            elif score >= match_threshold:
                 _generate_tailored_pdf_for_job(job, cv_text, candidate_name)
                 if job.tailored_pdf:
                     tailored += 1
@@ -220,9 +316,15 @@ def run_job_search(search_run_id):
     search_run.status = SearchRun.STATUS_COMPLETED
     search_run.progress = 100
     search_run.save(update_fields=['status', 'progress'])
-    logger.info('Search %s completed: %d jobs, %d tailored', search_run.pk, created, tailored)
+    logger.info(
+        'Search %s completed: %d jobs, %d tailored, %d ATS-rejected',
+        search_run.pk, created, tailored, rejected,
+    )
     _notify_user(search_run, created, tailored)
-    return {'status': 'COMPLETED', 'created': created, 'tailored': tailored}
+    return {
+        'status': 'COMPLETED', 'created': created, 'tailored': tailored,
+        'ats_rejected': rejected,
+    }
 
 
 def _fail(search_run, message):

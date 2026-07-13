@@ -633,6 +633,774 @@ class UkCvFormatTests(TestCase):
             self.assertIn(needle, text)
 
 
+ATS_JOB_DESCRIPTION = """Senior Backend Engineer — London, UK
+
+We are looking for a Senior Backend Engineer with 5+ years of experience building
+Python and Django services. You will design REST APIs, work with PostgreSQL and
+SQL, and deploy to AWS using Docker and Kubernetes.
+
+Requirements:
+- 5+ years experience in commercial software development
+- Bachelor's degree in Computer Science or similar
+- Strong Python and Django skills
+- Experience with AWS, Docker, Kubernetes and PostgreSQL
+- Excellent communication and leadership skills
+- Right to work in the UK (we do not offer visa sponsorship)
+"""
+
+# A strong CV: right skills, dates, quantified bullets, standard headings.
+ATS_GOOD_CV = """JOHN SMITH
+07123 456789 | john@example.com | London, UK
+
+PROFESSIONAL PROFILE
+Senior Backend Engineer with 7 years of experience building Python and Django
+services. Skilled in AWS, Docker, Kubernetes and PostgreSQL, with strong
+communication and leadership.
+
+KEY SKILLS
+- Python
+- Django
+- PostgreSQL
+- AWS
+- Docker
+- Kubernetes
+
+PROFESSIONAL EXPERIENCE
+Senior Backend Engineer | Acme Ltd | London, UK
+Jan 2021 - Present
+- Led a team of 5 engineers building Django REST APIs, cutting latency by 40%.
+- Migrated 30 services to Docker and Kubernetes on AWS, saving £250,000 a year.
+- Optimised PostgreSQL queries with SQL tuning, improving throughput by 3x.
+
+Backend Engineer | Beta Corp | Manchester, UK
+Feb 2019 - Dec 2020
+- Built Python microservices handling 2 million requests per day.
+
+EDUCATION
+BSc Computer Science | University of Manchester | Manchester, UK
+2015 - 2018
+- First Class Honours
+
+CERTIFICATIONS
+- AWS Certified Solutions Architect
+"""
+
+# A weak CV: no standard headings, no dates, no numbers, almost no keywords.
+ATS_BAD_CV = """Bob Jones
+
+My Journey
+I have done some work with computers over the years and enjoy solving problems.
+
+Stuff I Can Do
+Microsoft Word, answering the phone, being punctual.
+"""
+
+
+class ATSTextHelperTests(TestCase):
+    def test_stemming_unifies_word_forms(self):
+        from jobs.services.ats_checker import _stem
+        stems = {_stem(w) for w in ['manage', 'managing', 'managed', 'management']}
+        self.assertEqual(len(stems), 1, f'expected one stem, got {stems}')
+        # Short acronyms must survive untouched.
+        self.assertEqual(_stem('sql'), 'sql')
+        self.assertEqual(_stem('aws'), 'aws')
+
+    def test_synonyms_are_symmetric(self):
+        from jobs.services.ats_checker import _synonyms_for
+        self.assertIn('k8s', _synonyms_for('kubernetes'))
+        self.assertIn('kubernetes', _synonyms_for('k8s'))
+
+    def test_total_experience_merges_overlapping_roles(self):
+        from jobs.services.ats_checker import total_experience_years
+        # Two concurrent roles over the same 2 years must not count as 4.
+        text = 'Jan 2020 - Jan 2022\nJun 2020 - Jan 2022'
+        self.assertEqual(total_experience_years(text), 2.0)
+
+    def test_total_experience_sums_sequential_roles(self):
+        from jobs.services.ats_checker import total_experience_years
+        self.assertEqual(
+            total_experience_years('Jan 2018 - Jan 2020\nJan 2021 - Jan 2022'), 3.0
+        )
+
+    def test_no_dates_yields_zero(self):
+        from jobs.services.ats_checker import total_experience_years
+        self.assertEqual(total_experience_years('I have loads of experience'), 0.0)
+
+
+class ATSJobRequirementsTests(TestCase):
+    def test_extracts_requirements_from_description(self):
+        from jobs.services.ats_checker import extract_job_requirements
+        req = extract_job_requirements(ATS_JOB_DESCRIPTION, 'Senior Backend Engineer',
+                                       'London, UK')
+        self.assertEqual(req['required_years'], 5)
+        self.assertEqual(req['required_education'], "Bachelor's")
+        self.assertEqual(req['work_authorization'], 'Authorised to Work')
+        self.assertEqual(req['title'], 'Senior Backend Engineer')
+
+    def test_unstated_requirements_are_none(self):
+        from jobs.services.ats_checker import extract_job_requirements
+        req = extract_job_requirements('We need someone nice to join the team.')
+        self.assertIsNone(req['required_years'])
+        self.assertIsNone(req['required_education'])
+        self.assertEqual(req['required_certifications'], [])
+
+    def test_keywords_rank_hard_skills_above_soft(self):
+        from jobs.services.ats_checker import extract_jd_keywords
+        keywords = {k['term']: k for k in extract_jd_keywords(ATS_JOB_DESCRIPTION)}
+        self.assertIn('python', keywords)
+        self.assertEqual(keywords['python']['type'], 'hard')
+        self.assertGreater(
+            keywords['python']['weight'], keywords['communication']['weight']
+        )
+
+
+class ATSKnockoutTests(TestCase):
+    """Phase 2 must reject on genuine conflicts — and never on missing data."""
+
+    def _phase2(self, cv_text, job=ATS_JOB_DESCRIPTION, title='', location=''):
+        from jobs.services.ats_checker import ATSChecker, extract_job_requirements
+        checker = ATSChecker(cv_text, job,
+                             extract_job_requirements(job, title, location))
+        return checker.run_phase2()
+
+    def test_good_cv_passes_all_knockouts(self):
+        result = self._phase2(ATS_GOOD_CV, location='London, UK')
+        self.assertTrue(result['pass'], result['failed_filters'])
+
+    def test_insufficient_experience_is_a_knockout(self):
+        cv = ATS_GOOD_CV.replace('Jan 2021 - Present', 'Jan 2024 - Present') \
+                        .replace('Feb 2019 - Dec 2020', 'Feb 2023 - Dec 2023')
+        result = self._phase2(cv)
+        self.assertFalse(result['pass'])
+        self.assertIn('experience_years', result['failed_filters'])
+
+    def test_unparsable_dates_never_knock_out(self):
+        """A CV with no dates is a CV problem, not proof of being unqualified."""
+        result = self._phase2('John Smith\nEDUCATION\nBSc Computer Science\nPython')
+        self.assertTrue(result['experience_years']['pass'])
+        self.assertTrue(result['experience_years']['skipped'])
+        self.assertNotIn('experience_years', result['failed_filters'])
+
+    def test_missing_degree_is_a_knockout(self):
+        cv = ATS_GOOD_CV.replace('BSc Computer Science', 'Evening course in coding')
+        result = self._phase2(cv)
+        self.assertFalse(result['pass'])
+        self.assertIn('education', result['failed_filters'])
+
+    def test_missing_certification_is_a_knockout(self):
+        job = ATS_JOB_DESCRIPTION + '\nYou must hold a valid PMP certification.'
+        result = self._phase2(ATS_GOOD_CV, job=job, location='London, UK')
+        self.assertFalse(result['pass'])
+        self.assertIn('certifications', result['failed_filters'])
+        self.assertEqual(result['certifications']['missing'], ['pmp'])
+
+    def test_conflicting_location_is_a_knockout(self):
+        cv = ATS_GOOD_CV.replace('London, UK', 'Edinburgh, Scotland')
+        result = self._phase2(cv, location='London, UK')
+        self.assertFalse(result['pass'])
+        self.assertIn('location', result['failed_filters'])
+
+    def test_relocation_statement_rescues_a_location_mismatch(self):
+        cv = ATS_GOOD_CV.replace('London, UK', 'Edinburgh, Scotland') \
+             + '\nWilling to relocate.'
+        result = self._phase2(cv, location='London, UK')
+        self.assertTrue(result['location']['pass'])
+
+    def test_unknown_location_never_knocks_out(self):
+        """The common case: no readable address. Must not reject."""
+        cv = 'John Smith\nPython Django engineer\nJan 2015 - Present\nBSc Computer Science'
+        result = self._phase2(cv, location='London, UK')
+        self.assertTrue(result['location']['pass'])
+        self.assertTrue(result['location']['skipped'])
+
+    def test_sponsorship_conflict_is_a_knockout(self):
+        cv = ATS_GOOD_CV + '\nI require sponsorship to work in the UK.'
+        result = self._phase2(cv, location='London, UK')
+        self.assertFalse(result['pass'])
+        self.assertIn('work_authorization', result['failed_filters'])
+
+
+class ATSScoringTests(TestCase):
+    def _report(self, cv_text, **kwargs):
+        from jobs.services.ats_checker import check_cv_against_job
+        return check_cv_against_job(
+            cv_text, ATS_JOB_DESCRIPTION,
+            kwargs.get('title', 'Senior Backend Engineer'),
+            kwargs.get('location', 'London, UK'),
+        )
+
+    def test_strong_cv_scores_well_and_passes(self):
+        report = self._report(ATS_GOOD_CV)
+        self.assertGreaterEqual(report['overall_score'], 75)
+        self.assertFalse(report['rejected'])
+        self.assertTrue(report['pass'])
+
+    def test_weak_cv_scores_low(self):
+        report = self._report(ATS_BAD_CV)
+        self.assertLess(report['overall_score'], 50)
+        self.assertFalse(report['pass'])
+        self.assertTrue(report['recommendations'])
+
+    def test_weak_cv_is_rejected_for_missing_sections(self):
+        """Creative headings ('My Journey') mean an ATS cannot file the content."""
+        report = self._report(ATS_BAD_CV)
+        self.assertTrue(report['rejected'])
+        phase1 = report['phases']['phase1_parsing']
+        self.assertIn('Experience', phase1['missing_headers'])
+        self.assertIn('My Journey', phase1['creative_headers'])
+
+    def test_keyword_phase_finds_and_misses_the_right_skills(self):
+        cv = ATS_GOOD_CV.replace('- Kubernetes\n', '').replace(
+            'Docker and Kubernetes on AWS', 'AWS'
+        ).replace('Skilled in AWS, Docker, Kubernetes and PostgreSQL',
+                  'Skilled in AWS and PostgreSQL')
+        phase3 = self._report(cv)['phases']['phase3_keyword']
+        self.assertIn('python', phase3['hard_skills_found'])
+        self.assertIn('kubernetes', phase3['hard_skills_missing'])
+
+    def test_synonyms_count_as_a_match(self):
+        """'k8s' on the CV must satisfy the JD's 'kubernetes'."""
+        cv = ATS_GOOD_CV.replace('Kubernetes', 'k8s')
+        phase3 = self._report(cv)['phases']['phase3_keyword']
+        self.assertIn('kubernetes', phase3['hard_skills_found'])
+
+    def test_keyword_stuffing_is_penalised(self):
+        stuffed = ATS_GOOD_CV + '\n' + ('Python Django Kubernetes. ' * 30)
+        report = self._report(stuffed)
+        self.assertTrue(report['phases']['phase3_keyword']['keyword_stuffing'])
+
+    def test_quantification_rewards_numbers(self):
+        phase4 = self._report(ATS_GOOD_CV)['phases']['phase4_context']
+        # Every bullet in the good CV carries a figure.
+        self.assertGreaterEqual(phase4['quantification_score'], 75)
+
+    def test_skills_listed_but_never_evidenced_score_low_on_proximity(self):
+        cv = """JANE DOE
+London, UK
+
+PROFESSIONAL PROFILE
+An engineer.
+
+KEY SKILLS
+- Python
+- Django
+- Kubernetes
+- Docker
+- AWS
+- PostgreSQL
+
+PROFESSIONAL EXPERIENCE
+Engineer | Acme | London, UK
+Jan 2016 - Present
+- Did various tasks.
+
+EDUCATION
+BSc Computer Science | Leeds | 2012 - 2015
+"""
+        phase4 = self._report(cv)['phases']['phase4_context']
+        self.assertLess(phase4['proximity_score'], 40)
+
+    def test_chronology_detects_gaps_and_ordering(self):
+        from jobs.services.ats_checker import ATSChecker
+        cv = """JOHN SMITH
+
+PROFESSIONAL EXPERIENCE
+Junior Dev | Old Co | London
+Jan 2015 - Jan 2017
+
+Senior Dev | New Co | London
+Jan 2019 - Jan 2021
+
+EDUCATION
+BSc Computing | Leeds | 2012 - 2015
+"""
+        checker = ATSChecker(cv, ATS_JOB_DESCRIPTION)
+        phase5 = checker.check_chronology()
+        # Oldest role listed first -> not reverse-chronological.
+        self.assertFalse(phase5['reverse_chronological'])
+        # A 24-month hole between the two roles.
+        self.assertEqual(len(phase5['gaps']), 1)
+        self.assertEqual(phase5['gaps'][0]['months'], 24)
+
+    def test_education_parsing(self):
+        phase6 = self._report(ATS_GOOD_CV)['phases']['phase6_education']
+        self.assertEqual(phase6['degree_hierarchy'], "Bachelor's")
+        self.assertEqual(phase6['graduation_year'], 2018)
+        self.assertEqual(phase6['gpa'], 4.0)  # First Class Honours
+
+    def test_report_has_the_documented_shape(self):
+        report = self._report(ATS_GOOD_CV)
+        for key in ('overall_score', 'ats_score', 'pass', 'phases',
+                    'sectional_scores', 'recommendations', 'text_hash'):
+            self.assertIn(key, report)
+        for phase in ('phase1_parsing', 'phase2_knockout', 'phase3_keyword',
+                      'phase4_context', 'phase5_experience', 'phase6_education'):
+            self.assertIn(phase, report['phases'])
+        self.assertEqual(
+            set(report['sectional_scores']), {'skills', 'experience', 'education'}
+        )
+        self.assertTrue(0 <= report['overall_score'] <= 100)
+
+    def test_deduplication_hash_ignores_whitespace(self):
+        from jobs.services.ats_checker import ATSChecker
+        a = ATSChecker('Hello   World', '').text_hash()
+        b = ATSChecker('hello world', '').text_hash()
+        self.assertEqual(a, b)
+
+
+class ATSProximityAndFrequencyTests(TestCase):
+    """Phase 3 frequency and Phase 4 proximity, per the ATS methodology."""
+
+    def test_words_of_a_requirement_must_sit_together_in_one_bullet(self):
+        from jobs.services.ats_checker import _within_window
+        bullet = _tokens_of('- Owned financial forecasting for 12 regions.')
+        self.assertTrue(_within_window(bullet, ['financial', 'forecasting']))
+
+    def test_scattered_words_do_not_count_as_proximity(self):
+        from jobs.services.ats_checker import _within_window
+        scattered = _tokens_of(
+            'Financial services background with a long record of delivery, plus '
+            'planning, budgeting, reporting, analysis and long-range forecasting'
+        )
+        # Both words present, but far apart -> not used together.
+        self.assertFalse(_within_window(scattered, ['financial', 'forecasting']))
+
+    def test_proximity_scores_a_real_bullet_above_a_scattered_cv(self):
+        from jobs.services.ats_checker import ATSChecker
+        job = ('We need financial forecasting and financial forecasting skills. '
+               'Financial forecasting is core to this role.')
+        together = """JANE DOE
+
+PROFESSIONAL EXPERIENCE
+Analyst | Acme | London
+Jan 2018 - Present
+- Led financial forecasting across 12 regions, improving accuracy by 30%.
+
+EDUCATION
+BSc Finance | Leeds | 2014 - 2017
+"""
+        apart = """JANE DOE
+
+PROFESSIONAL EXPERIENCE
+Analyst | Acme | London
+Jan 2018 - Present
+- Worked in financial services for many clients across the region.
+- Handled forecasting duties as required by the wider team each quarter.
+
+EDUCATION
+BSc Finance | Leeds | 2014 - 2017
+"""
+        near = ATSChecker(together, job).run_phase4()['proximity_score']
+        far = ATSChecker(apart, job).run_phase4()['proximity_score']
+        self.assertGreater(near, far)
+
+    def test_expected_frequency_follows_the_jd(self):
+        from jobs.services.ats_checker import _expected_frequency
+        # "If the JD mentions SQL 5 times, your CV needs 2-3 occurrences."
+        self.assertIn(_expected_frequency(5), (2, 3))
+        self.assertEqual(_expected_frequency(1), 1)
+        self.assertEqual(_expected_frequency(20), 3)  # capped: more is stuffing
+
+    def test_underused_keyword_is_flagged(self):
+        from jobs.services.ats_checker import check_cv_against_job
+        job = 'SQL SQL SQL SQL SQL. We need SQL and Python.'
+        cv = """JOHN SMITH
+
+PROFESSIONAL PROFILE
+Engineer.
+
+KEY SKILLS
+- SQL
+- Python
+
+PROFESSIONAL EXPERIENCE
+Engineer | Acme | London
+Jan 2018 - Present
+- Built things with Python.
+
+EDUCATION
+BSc Computing | Leeds | 2014 - 2017
+"""
+        phase3 = check_cv_against_job(cv, job)['phases']['phase3_keyword']
+        underused = {u['term']: u for u in phase3['underused_keywords']}
+        self.assertIn('sql', underused)
+        self.assertEqual(underused['sql']['cv_count'], 1)
+        self.assertGreaterEqual(underused['sql']['expected'], 2)
+
+
+def _tokens_of(text):
+    from jobs.services.ats_checker import _tokens
+    return _tokens(text)
+
+
+class ATSGpaFilterTests(TestCase):
+    def _phase2(self, cv, job):
+        from jobs.services.ats_checker import ATSChecker, extract_job_requirements
+        return ATSChecker(cv, job, extract_job_requirements(job)).run_phase2()
+
+    def test_jd_minimum_gpa_is_extracted(self):
+        from jobs.services.ats_checker import extract_job_requirements
+        req = extract_job_requirements('Requires a minimum GPA of 3.5 and a degree.')
+        self.assertEqual(req['required_gpa'], 3.5)
+
+    def test_low_gpa_is_a_knockout(self):
+        cv = ATS_GOOD_CV.replace('First Class Honours', 'GPA 2.8')
+        result = self._phase2(cv, 'Minimum GPA 3.5 required. Bachelor degree.')
+        self.assertFalse(result['gpa']['pass'])
+        self.assertIn('gpa', result['failed_filters'])
+
+    def test_sufficient_gpa_passes(self):
+        cv = ATS_GOOD_CV.replace('First Class Honours', 'GPA 3.9')
+        result = self._phase2(cv, 'Minimum GPA 3.5 required. Bachelor degree.')
+        self.assertTrue(result['gpa']['pass'])
+
+    def test_uk_classification_maps_onto_the_gpa_scale(self):
+        # "First Class Honours" clears a 3.5 minimum; a 2:2 does not.
+        first = self._phase2(ATS_GOOD_CV, 'Minimum GPA 3.5. Bachelor degree.')
+        self.assertTrue(first['gpa']['pass'])
+        lower = self._phase2(
+            ATS_GOOD_CV.replace('First Class Honours', 'Lower Second Class (2:2)'),
+            'Minimum GPA 3.5. Bachelor degree.',
+        )
+        self.assertFalse(lower['gpa']['pass'])
+
+    def test_missing_gpa_never_knocks_out(self):
+        cv = ATS_GOOD_CV.replace('- First Class Honours\n', '')
+        result = self._phase2(cv, 'Minimum GPA 3.5 required. Bachelor degree.')
+        self.assertTrue(result['gpa']['pass'])
+        self.assertTrue(result['gpa']['unverifiable'])
+
+
+class ATSGarbledFontTests(TestCase):
+    def test_garbled_text_is_flagged_as_a_font_issue(self):
+        from jobs.services.ats_checker import ATSChecker
+        garbled = ATS_GOOD_CV.replace('Python', 'P�th�n').replace(
+            'Django', 'Dj�ng�'
+        )
+        checker = ATSChecker(garbled, ATS_JOB_DESCRIPTION)
+        # No file to inspect, so drive the text-level check directly.
+        self.assertGreater(checker._garbled_ratio(), 0.001)
+
+    def test_clean_text_is_not_flagged(self):
+        from jobs.services.ats_checker import ATSChecker
+        self.assertEqual(ATSChecker(ATS_GOOD_CV, '')._garbled_ratio(), 0.0)
+
+
+class ATSFileChecksTests(TestCase):
+    """Phase 1 checks that need the real file, not just its text."""
+
+    def _write_docx(self, build):
+        document = docx.Document()
+        build(document)
+        path = os.path.join(_TEST_MEDIA, f'ats_{id(build)}.docx')
+        document.save(path)
+        return path
+
+    def test_docx_with_tables_and_images_is_flagged(self):
+        from jobs.services.ats_checker import ATSChecker
+
+        def build(document):
+            document.add_paragraph('JOHN SMITH')
+            table = document.add_table(rows=2, cols=2)
+            table.cell(0, 0).text = 'Skills'
+            table.cell(0, 1).text = 'Python'
+
+        path = self._write_docx(build)
+        checker = ATSChecker(ATS_GOOD_CV, ATS_JOB_DESCRIPTION, file_path=path)
+        result = checker.check_prohibited_elements()
+        self.assertFalse(result['pass'])
+        self.assertTrue(any('table' in e for e in result['elements']))
+
+    def test_clean_docx_passes(self):
+        from jobs.services.ats_checker import ATSChecker
+
+        def build(document):
+            for line in ATS_GOOD_CV.splitlines():
+                document.add_paragraph(line)
+
+        path = self._write_docx(build)
+        checker = ATSChecker(ATS_GOOD_CV, ATS_JOB_DESCRIPTION, file_path=path)
+        self.assertTrue(checker.check_prohibited_elements()['pass'])
+        self.assertTrue(checker.check_layout()['pass'])
+
+    def test_image_based_cv_fails_phase1(self):
+        """A scanned CV yields almost no text — an ATS reads it as empty."""
+        from jobs.services.ats_checker import check_cv_format
+
+        def build(document):
+            document.add_paragraph('CV')  # a scan yields little/no real text
+
+        path = self._write_docx(build)
+        result = check_cv_format('CV', file_path=path)
+        self.assertFalse(result['pass'])
+        self.assertFalse(result['file_format_ok'])
+        self.assertIn('image-based', result['issue'])
+
+    def test_missing_headings_fail_phase1(self):
+        from jobs.services.ats_checker import check_cv_format
+        result = check_cv_format(ATS_BAD_CV)
+        self.assertFalse(result['pass'])
+        self.assertTrue(result['missing_headers'])
+
+    def test_text_only_check_skips_file_phases(self):
+        """Without a file path the text phases still run; file checks are skipped."""
+        from jobs.services.ats_checker import check_cv_format
+        result = check_cv_format(ATS_GOOD_CV)
+        self.assertTrue(result['pass'])
+        self.assertTrue(result['file_checks_skipped'])
+
+
+@override_settings(OPENAI_API_KEY='', MEDIA_ROOT=_TEST_MEDIA)
+class ATSTailoringLoopTests(TestCase):
+    def test_returns_report_without_openai(self):
+        from jobs.services.tailoring import tailor_cv_for_job_with_ats
+        text, report, attempts = tailor_cv_for_job_with_ats(
+            ATS_GOOD_CV, ATS_JOB_DESCRIPTION, 'Senior Backend Engineer', 'Acme',
+            'London, UK',
+        )
+        # No OpenAI -> the original CV is returned, scored honestly, no retries.
+        self.assertEqual(text, ATS_GOOD_CV)
+        self.assertEqual(attempts, 1)
+        self.assertGreaterEqual(report['overall_score'], 75)
+
+    @override_settings(OPENAI_API_KEY='sk-test', ATS_TARGET_SCORE=90,
+                       ATS_MAX_TAILOR_ATTEMPTS=3)
+    @mock.patch('jobs.services.tailoring._retry_with_feedback')
+    @mock.patch('jobs.services.tailoring.tailor_cv_for_job')
+    def test_retries_until_target_then_stops(self, mock_tailor, mock_retry):
+        from jobs.services.tailoring import tailor_cv_for_job_with_ats
+        # First draft is the weak CV; the retry produces the strong one.
+        mock_tailor.return_value = ATS_BAD_CV
+        mock_retry.return_value = ATS_GOOD_CV
+
+        text, report, attempts = tailor_cv_for_job_with_ats(
+            'original', ATS_JOB_DESCRIPTION, 'Senior Backend Engineer', 'Acme',
+            'London, UK',
+        )
+        self.assertEqual(text, ATS_GOOD_CV)
+        self.assertEqual(attempts, 2)  # stopped as soon as the target was cleared
+        self.assertGreaterEqual(report['overall_score'], 75)
+        mock_retry.assert_called_once()
+
+    @override_settings(OPENAI_API_KEY='sk-test', ATS_TARGET_SCORE=100,
+                       ATS_MAX_TAILOR_ATTEMPTS=2)
+    @mock.patch('jobs.services.tailoring._retry_with_feedback')
+    @mock.patch('jobs.services.tailoring.tailor_cv_for_job')
+    def test_unreachable_target_keeps_best_draft_and_reports_true_score(
+        self, mock_tailor, mock_retry
+    ):
+        from jobs.services.tailoring import tailor_cv_for_job_with_ats
+        mock_tailor.return_value = ATS_BAD_CV
+        mock_retry.return_value = ATS_GOOD_CV  # better, but still under 100
+
+        text, report, attempts = tailor_cv_for_job_with_ats(
+            'original', ATS_JOB_DESCRIPTION, 'Senior Backend Engineer', 'Acme',
+        )
+        # Keeps the best attempt and reports its real score, not a flattering one.
+        self.assertEqual(text, ATS_GOOD_CV)
+        self.assertEqual(attempts, 2)
+        self.assertLess(report['overall_score'], 100)
+
+
+@override_settings(MEDIA_ROOT=_TEST_MEDIA, OPENAI_API_KEY='')
+class ATSWorkflowIntegrationTests(TestCase):
+    def setUp(self):
+        from jobs.models import CV as CVModel
+        self.user = User.objects.create_user(username='ats', password='pw12345!')
+        self.cv = CVModel.objects.create(
+            user=self.user, name='John Smith',
+            original_file=SimpleUploadedFile('cv.docx', build_docx_bytes()),
+            parsed_text=ATS_GOOD_CV,
+            # Enough overlap with the job's skills to clear the stage-1 keyword
+            # pre-screen, so the job actually reaches scoring and tailoring.
+            parsed_data={
+                'skills': ['python', 'django', 'sql', 'postgresql', 'aws', 'docker',
+                           'kubernetes', 'rest', 'communication', 'leadership'],
+                'job_titles': ['Backend Engineer'],
+            },
+        )
+        self.run = SearchRun.objects.create(
+            user=self.user, cv=self.cv, countries=['United Kingdom'],
+            status=SearchRun.STATUS_PENDING,
+        )
+
+    def _raw_job(self, **overrides):
+        job = {
+            'title': 'Senior Backend Engineer', 'company': 'Acme',
+            'location': 'London, UK', 'salary': '£80,000',
+            'description': ATS_JOB_DESCRIPTION, 'applyLink': 'https://x/1',
+            'datePosted': '', 'employmentType': '', 'seniorityLevel': '',
+        }
+        job.update(overrides)
+        return job
+
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_ats_report_generated_for_tailored_job(self, mock_search, mock_score, _sheets):
+        from jobs.models import ATSReport
+        from jobs.tasks import run_job_search
+        mock_search.return_value = [self._raw_job()]
+        mock_score.return_value = {'score': 90, 'reason': 'Strong match'}
+
+        run_job_search(self.run.pk)
+
+        job = self.run.jobs.get()
+        self.assertIsNotNone(job.ats_score)
+        self.assertEqual(job.ats_status, Job.ATS_PASSED)
+        report = ATSReport.objects.get(job=job)
+        self.assertEqual(report.overall_score, job.ats_score)
+        self.assertIn('phase3_keyword', report.report_data['phases'])
+
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_knockout_marks_job_rejected_and_skips_tailoring(
+        self, mock_search, mock_score, _sheets
+    ):
+        from jobs.tasks import run_job_search
+        # This job demands a PMP the candidate does not hold -> hard knock-out.
+        mock_search.return_value = [self._raw_job(
+            description=ATS_JOB_DESCRIPTION + '\nA valid PMP certification is required.'
+        )]
+        mock_score.return_value = {'score': 95, 'reason': 'Strong match'}
+
+        run_job_search(self.run.pk)
+
+        job = self.run.jobs.get()
+        self.assertEqual(job.ats_status, Job.ATS_REJECTED)
+        self.assertTrue(job.ats_rejected)
+        # No tailored CV is produced for a job the candidate is auto-rejected from.
+        self.assertFalse(job.tailored_pdf)
+        self.assertIn('ATS Rejected', job.match_reason)
+
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_badly_formatted_cv_does_not_reject_every_job(
+        self, mock_search, mock_score, _sheets
+    ):
+        """Phase 1 is a CV-wide problem, not a per-job one.
+
+        A CV with no standard headings fails phase 1 for every job in the run.
+        Rejecting all of them would tell the user nothing per-job and would wipe
+        out their entire search, so only phase 2 knock-outs reject a job.
+        """
+        from jobs.tasks import run_job_search
+        self.cv.parsed_text = 'Python Django engineer, London UK. BSc Computer Science.'
+        self.cv.save()
+        mock_search.return_value = [self._raw_job()]
+        mock_score.return_value = {'score': 90, 'reason': 'Strong match'}
+
+        run_job_search(self.run.pk)
+
+        job = self.run.jobs.get()
+        self.assertNotEqual(job.ats_status, Job.ATS_REJECTED)
+        self.assertTrue(job.tailored_pdf)  # still tailored despite poor formatting
+
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_duplicate_application_to_same_company_is_flagged(
+        self, mock_search, mock_score, _sheets
+    ):
+        """Phase 7: two CVs sent to the same company are flagged, as an ATS would."""
+        from jobs.models import ATSReport
+        from jobs.tasks import run_job_search
+        # Two different roles at the same company, in one run.
+        mock_search.return_value = [
+            self._raw_job(title='Senior Backend Engineer'),
+            self._raw_job(title='Backend Engineer', applyLink='https://x/2'),
+        ]
+        mock_score.return_value = {'score': 90, 'reason': 'Strong match'}
+
+        run_job_search(self.run.pk)
+
+        reports = {r.job.title: r.report_data for r in ATSReport.objects.all()}
+        self.assertEqual(len(reports), 2)
+        # The second application to Acme is the one flagged as a duplicate.
+        flagged = [t for t, d in reports.items() if d.get('duplicate_application')]
+        self.assertEqual(len(flagged), 1)
+
+    @override_settings(ATS_STRICT_MODE=True, ATS_THRESHOLD=100)
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_strict_mode_rejects_below_threshold(self, mock_search, mock_score, _sheets):
+        from jobs.tasks import run_job_search
+        mock_search.return_value = [self._raw_job()]
+        mock_score.return_value = {'score': 90, 'reason': 'Strong match'}
+
+        run_job_search(self.run.pk)
+        job = self.run.jobs.get()
+        # Passes every hard filter and scores well, but an unreachable threshold
+        # plus strict mode turns "below threshold" into an outright rejection.
+        self.assertEqual(job.ats_status, Job.ATS_REJECTED)
+        self.assertGreater(job.ats_score, 75)
+
+    @override_settings(ATS_STRICT_MODE=False, ATS_THRESHOLD=100)
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_lenient_mode_only_flags_below_threshold(self, mock_search, mock_score, _s):
+        from jobs.tasks import run_job_search
+        mock_search.return_value = [self._raw_job()]
+        mock_score.return_value = {'score': 90, 'reason': 'Strong match'}
+
+        run_job_search(self.run.pk)
+        job = self.run.jobs.get()
+        # Same score, strict mode off -> flagged, not rejected, and still tailored.
+        self.assertEqual(job.ats_status, Job.ATS_BELOW_THRESHOLD)
+        self.assertTrue(job.tailored_pdf)
+
+
+@override_settings(MEDIA_ROOT=_TEST_MEDIA, OPENAI_API_KEY='')
+class ATSReportViewTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='viewer', password='pw12345!')
+        self.client.login(username='viewer', password='pw12345!')
+        self.run = SearchRun.objects.create(user=self.user)
+        self.job = Job.objects.create(
+            search_run=self.run, title='Backend Engineer', company='Acme',
+            location='London', application_link='https://x/1', ats_score=88,
+            ats_status=Job.ATS_PASSED,
+        )
+
+    def _make_report(self):
+        from jobs.models import ATSReport
+        from jobs.services.ats_checker import check_cv_against_job
+        data = check_cv_against_job(ATS_GOOD_CV, ATS_JOB_DESCRIPTION,
+                                    'Senior Backend Engineer', 'London, UK')
+        return ATSReport.objects.create(
+            job=self.job, overall_score=data['overall_score'], report_data=data,
+        )
+
+    def test_report_page_renders_all_phases(self):
+        self._make_report()
+        response = self.client.get(reverse('ats_report', args=[self.job.pk]))
+        self.assertEqual(response.status_code, 200)
+        for needle in ['Phase 1', 'Phase 2', 'Phase 3', 'ATS score']:
+            self.assertContains(response, needle)
+
+    def test_missing_report_redirects(self):
+        response = self.client.get(reverse('ats_report', args=[self.job.pk]))
+        self.assertRedirects(response, reverse('search_results', args=[self.run.pk]))
+
+    def test_report_scoped_to_owner(self):
+        other = User.objects.create_user(username='snoop', password='pw12345!')
+        run = SearchRun.objects.create(user=other)
+        job = Job.objects.create(search_run=run, title='X', company='Y',
+                                 location='Z', application_link='https://x/2')
+        response = self.client.get(reverse('ats_report', args=[job.pk]))
+        self.assertEqual(response.status_code, 404)
+
+    def test_results_page_shows_ats_column(self):
+        self._make_report()
+        response = self.client.get(reverse('search_results', args=[self.run.pk]))
+        self.assertContains(response, '88')
+        self.assertContains(response, reverse('ats_report', args=[self.job.pk]))
+
+
 @override_settings(MEDIA_ROOT=_TEST_MEDIA)
 class ExcelExportTests(TestCase):
     def setUp(self):

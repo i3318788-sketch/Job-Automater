@@ -142,6 +142,19 @@ class Job(models.Model):
         (NOT_SPONSORED, 'Not Sponsored'),
     ]
 
+    # ATS outcome. REJECTED means the CV failed a hard filter (parsing or a
+    # knock-out) and would never reach a human for this job, whatever its score.
+    ATS_NOT_CHECKED = 'NOT_CHECKED'
+    ATS_PASSED = 'PASSED'
+    ATS_BELOW_THRESHOLD = 'BELOW_THRESHOLD'
+    ATS_REJECTED = 'REJECTED'
+    ATS_STATUS_CHOICES = [
+        (ATS_NOT_CHECKED, 'Not checked'),
+        (ATS_PASSED, 'Passed'),
+        (ATS_BELOW_THRESHOLD, 'Below threshold'),
+        (ATS_REJECTED, 'ATS Rejected'),
+    ]
+
     search_run = models.ForeignKey(
         SearchRun, on_delete=models.CASCADE, related_name='jobs'
     )
@@ -165,6 +178,10 @@ class Job(models.Model):
     missing_skills = models.JSONField(default=list, blank=True)
     # Estimated ATS score (0-100) of the tailored CV against this job.
     ats_score = models.IntegerField(null=True, blank=True)
+    ats_status = models.CharField(
+        max_length=20, choices=ATS_STATUS_CHOICES, default=ATS_NOT_CHECKED,
+        help_text='Outcome of the ATS check (phases 1 & 2 are hard filters).',
+    )
     application_link = models.URLField(max_length=500)
     tailored_pdf = models.FileField(
         upload_to='tailored_cvs/', null=True, blank=True
@@ -174,3 +191,38 @@ class Job(models.Model):
 
     def __str__(self):
         return f'{self.title} @ {self.company}'
+
+    @property
+    def ats_rejected(self):
+        return self.ats_status == self.ATS_REJECTED
+
+
+class ATSReport(models.Model):
+    """The full ATS report behind a job's headline ATS score.
+
+    ``report_data`` holds the complete phase-by-phase dict produced by
+    ``ATSChecker.get_detailed_report`` — kept whole so the methodology can change
+    without a migration, and so the UI can surface any part of it later.
+    """
+
+    job = models.OneToOneField(
+        Job, on_delete=models.CASCADE, related_name='ats_report'
+    )
+    overall_score = models.IntegerField()
+    report_data = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'ATS report'
+        verbose_name_plural = 'ATS reports'
+
+    def __str__(self):
+        return f'ATS report for {self.job} ({self.overall_score})'
+
+    @property
+    def recommendations(self):
+        return (self.report_data or {}).get('recommendations', [])
+
+    @property
+    def rejection_reasons(self):
+        return (self.report_data or {}).get('rejection_reasons', [])

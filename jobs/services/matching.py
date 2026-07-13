@@ -23,14 +23,6 @@ SYSTEM_PROMPT = (
     'match). Do not include any text outside the JSON object.'
 )
 
-ATS_PROMPT = (
-    'You are an Applicant Tracking System (ATS) simulator. Estimate how well the '
-    'given CV would score in an ATS screening for the given job description, '
-    'considering keyword coverage, relevant job titles, skills, and formatting of '
-    'the content. Respond ONLY with a JSON object with exactly two keys: "score" '
-    '(integer 0-100) and "reason" (one short sentence).'
-)
-
 SPONSORSHIP_KEYWORDS = [
     'visa sponsorship',
     'sponsorship offered',
@@ -162,41 +154,6 @@ def compute_match_score(cv_text, job_description):
     except Exception as exc:  # pragma: no cover - network/dep dependent
         logger.exception('OpenAI match scoring failed')
         return {'score': 0, 'reason': f'Unable to compute: {exc}'}
-
-
-def compute_ats_score(tailored_cv_text, job_description):
-    """Estimate the ATS score (0-100) of a tailored CV against a job description.
-
-    Returns None when OpenAI isn't configured or the call fails, so callers can
-    distinguish "not scored" from a genuine low score.
-    """
-    if not _openai_configured():
-        return None
-    if not (tailored_cv_text and job_description):
-        return None
-    try:
-        from openai import OpenAI
-
-        client = OpenAI(api_key=settings.OPENAI_API_KEY)
-        response = client.chat.completions.create(
-            model=DEFAULT_MODEL,
-            messages=[
-                {'role': 'system', 'content': ATS_PROMPT},
-                {
-                    'role': 'user',
-                    'content': (
-                        f'TAILORED CV:\n{tailored_cv_text[:6000]}\n\n'
-                        f'JOB DESCRIPTION:\n{job_description[:4000]}'
-                    ),
-                },
-            ],
-            response_format={'type': 'json_object'},
-            temperature=0,
-        )
-        return _parse_match_response(response.choices[0].message.content)['score']
-    except Exception:  # pragma: no cover - network dependent
-        logger.exception('ATS scoring failed')
-        return None
 
 
 def _parse_match_response(content):

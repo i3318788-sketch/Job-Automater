@@ -64,6 +64,25 @@ OPENAI_MAX_SCORED_JOBS = env.int('OPENAI_MAX_SCORED_JOBS', default=50)
 KEYWORD_PRESCORE_THRESHOLD = env.int('KEYWORD_PRESCORE_THRESHOLD', default=60)
 
 # ---------------------------------------------------------------------------
+# ATS checker
+# ---------------------------------------------------------------------------
+# A tailored CV scoring below this is reported as "below threshold".
+ATS_THRESHOLD = env.int('ATS_THRESHOLD', default=75)
+
+# When True, a job whose tailored CV lands below ATS_THRESHOLD is rejected
+# outright rather than merely flagged. Jobs that fail a *hard* filter (phase 1
+# parsing or a phase 2 knock-out) are rejected regardless of this setting.
+ATS_STRICT_MODE = env.bool('ATS_STRICT_MODE', default=False)
+
+# Tailoring aims for this ATS score, re-running with targeted feedback when the
+# first attempt falls short.
+ATS_TARGET_SCORE = env.int('ATS_TARGET_SCORE', default=90)
+
+# How many extra tailoring passes to spend chasing ATS_TARGET_SCORE. Each pass
+# is one more OpenAI call per job, so keep this low.
+ATS_MAX_TAILOR_ATTEMPTS = env.int('ATS_MAX_TAILOR_ATTEMPTS', default=2)
+
+# ---------------------------------------------------------------------------
 # Applications
 # ---------------------------------------------------------------------------
 INSTALLED_APPS = [
