@@ -69,14 +69,35 @@
 <div class="card" style="border-left:4px solid #b7791f;">
     <h2>Worth a quick check <span class="badge badge-yellow">Reworded</span></h2>
     <p class="muted">
-        These phrases restate your real experience in the job advert's wording —
-        e.g. "cost optimisation" where your CV said "tuning warehouse costs". They
-        are grounded in what you actually did, but read them once and make sure
-        each is a fair description you would be happy to defend at interview.
+        Each phrase below restates your CV in the advert's wording. We can tell the
+        words are yours, but not that the <em>skill</em> is — "risk modelling" and
+        "ran risk reports, modelled churn" use the same words and mean different
+        things. Check each against the line it came from and delete any that
+        oversell you.
     </p>
-    <p>
-        {% for c in data.claims_needing_review %}<span class="badge badge-yellow">{{ c }}</span> {% endfor %}
-    </p>
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th>Claim on the tailored CV</th><th>The line in your CV it came from</th></tr></thead>
+            <tbody>
+                {% for claim in data.claim_evidence %}
+                    <tr>
+                        <td><span class="badge badge-yellow">{{ claim.term }}</span></td>
+                        <td class="muted">
+                            {% for l in claim.lines %}
+                                “{{ l.line|truncatechars:110 }}”{% if not forloop.last %}<br>{% endif %}
+                            {% empty %}
+                                <em>no matching line found — treat this as invented</em>
+                            {% endfor %}
+                        </td>
+                    </tr>
+                {% empty %}
+                    {% for c in data.claims_needing_review %}
+                        <tr><td><span class="badge badge-yellow">{{ c }}</span></td><td class="muted">—</td></tr>
+                    {% endfor %}
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
 </div>
 {% endif %}
 

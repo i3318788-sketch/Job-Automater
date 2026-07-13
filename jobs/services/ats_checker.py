@@ -2395,23 +2395,27 @@ def _classify_claims(original_cv_text, tailored_cv_text, job_description,
     def evidence_for(term):
         """How well the original CV supports this claim: full, partial or none.
 
-        The distinction matters. Claiming "Snowflake" on a CV that has never
-        touched it is a lie, and must block the draft. Writing "cost optimisation"
-        for a CV that says "spent a lot of time tuning warehouse costs" is the
-        rephrasing that tailoring exists to do — treating that as a fabrication
-        would make the honesty flag fire on almost every honest rewrite, and a
-        warning that always fires is a warning nobody reads.
+        Claiming "Snowflake" on a CV that never touched it is a lie, and blocks
+        the draft. Writing "cost optimisation" where the CV says "tuning warehouse
+        costs" is the rewording tailoring exists to do, and only needs a human
+        glance.
+
+        Crucially, a phrase held together by nothing but its scattered component
+        words is NEVER treated as fully evidenced. Word presence is strong
+        evidence *for* grounding a reword and weak evidence *against* a
+        fabrication, and the two are not symmetric: a CV containing "ran risk
+        reports ... and modelled churn" would otherwise silently license a claim
+        of "risk modelling". Proximity does not save this either — those two words
+        sit in the same bullet. No lexical rule can tell "did X" from "the words
+        of X appear near each other", so compositional matches are surfaced for
+        review rather than waved through.
         """
         if term.lower() in supported or checker._found_in(original, term):
-            return 'full'
+            return 'full'  # the phrase itself is on the CV, not just its parts
 
         words = [w for w in _tokens(term) if w not in STOPWORDS]
-        if len(words) > 1:
-            hits = sum(1 for w in words if _stem(w) in original_stems)
-            if hits == len(words):
-                return 'full'    # every word of the phrase is evidenced
-            if hits:
-                return 'partial'  # reworded, but grounded in something real
+        if len(words) > 1 and any(_stem(w) in original_stems for w in words):
+            return 'partial'
         return 'none'
 
     invented, review = [], []
@@ -2430,6 +2434,29 @@ def _classify_claims(original_cv_text, tailored_cv_text, job_description,
             review.append(term)
 
     return invented, review
+
+
+def claim_evidence(original_cv_text, term):
+    """The CV lines that ground a reworded claim, so a human can check it fast.
+
+    An amber warning with no receipt attached is one the user learns to click
+    past. Showing the source line turns "is 'cost optimisation' fair?" into a
+    two-second read of "spent a lot of time tuning warehouse costs".
+    """
+    words = [w for w in _tokens(term or '') if w not in STOPWORDS]
+    if not words:
+        return []
+    stems = {_stem(w) for w in words}
+
+    lines = []
+    for line in _sentences(original_cv_text or ''):
+        line_stems = {_stem(t) for t in _tokens(line)}
+        hit = stems & line_stems
+        if hit:
+            lines.append({'line': line.strip(), 'matched': sorted(hit)})
+    # Strongest evidence first: the line covering most of the phrase.
+    lines.sort(key=lambda item: -len(item['matched']))
+    return lines[:3]
 
 
 def unsupported_claims(original_cv_text, tailored_cv_text, job_description,

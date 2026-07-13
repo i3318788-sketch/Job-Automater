@@ -207,6 +207,46 @@ def keyword_match_score(cv_skills, job_skills):
     return int(round(overlap / len(job_set) * 100))
 
 
+def direct_overlap_score(cv_skills, job_text):
+    """Percentage of the CV's own skills that literally appear in the job advert.
+
+    Vocabulary-free, and that is the point. ``keyword_match_score`` can only see
+    skills in SKILL_VOCAB, so an advert built on Snowflake, dbt and Dagster looks
+    like an advert with *no* skills at all and scores a neutral 50 — ranking below
+    a mediocre job that happens to mention Python. That blindness would cut the
+    best match before a keyword contract is ever built for it.
+
+    The CV's skills come from the LLM profile, so they already include the rare
+    tools. Matching them straight against the advert's text needs no vocabulary.
+    """
+    if not (cv_skills and job_text):
+        return 0
+    lowered = str(job_text).lower()
+    hits = sum(1 for skill in cv_skills if _term_present(skill, lowered))
+    return int(round(hits / len(cv_skills) * 100))
+
+
+def _term_present(term, text_lower):
+    pattern = r'(?<!\w)' + re.escape(str(term).lower()) + r'(?!\w)'
+    return re.search(pattern, text_lower) is not None
+
+
+def prescore_job(cv_skills, job_skills, job_text):
+    """Stage-1 triage score. Biased towards recall, on purpose.
+
+    This decides which jobs are worth an OpenAI call, not whether they are a good
+    fit — that judgement comes later, with far better information. So it takes the
+    *best* of the two signals rather than blending them: a job needs only one
+    reason to look promising to survive triage, and the cost of wrongly keeping a
+    job is one API call, while the cost of wrongly cutting one is that the user
+    never sees the role at all.
+    """
+    return max(
+        keyword_match_score(cv_skills, job_skills),
+        direct_overlap_score(cv_skills, job_text),
+    )
+
+
 def missing_skills(cv_skills, job_skills):
     """Skills the job asks for that the CV does not mention."""
     cv_set = {str(s).lower() for s in (cv_skills or [])}

@@ -1561,6 +1561,145 @@ BSc Computing | Leeds | 2015 - 2018
         )
 
 
+class ClaimRouterAdversarialTests(TestCase):
+    """A fabricated multi-word skill must never be silently accepted.
+
+    Word presence is strong evidence FOR grounding a reword and weak evidence
+    AGAINST a fabrication; the two are not symmetric. A CV full of common words
+    can supply every component of a skill the candidate never had. Proximity does
+    not rescue this either — "ran risk reports ... and modelled churn" puts both
+    words of "risk modelling" in one bullet. No lexical rule separates "did X"
+    from "the words of X appear near each other", so compositional matches are
+    surfaced for review rather than waved through.
+    """
+
+    # Every word of each fabricated skill below appears somewhere in this CV, in
+    # an unrelated context. The candidate did none of them.
+    CV = """Priya Nair
+Data Engineer, Northwind Retail
+- Loaded data from source systems and checked quality of the feeds each morning.
+- Wrote tests for our ingestion scripts.
+- Ran risk reports for the finance team and modelled churn for marketing.
+- Managed access controls and reviewed security of the warehouse.
+- Presented analysis to stakeholders; owned the incident response rota.
+"""
+    FAKES = [
+        'data quality testing',
+        'risk modelling',
+        'security incident response',
+        'source control management',
+    ]
+
+    def _route(self, terms):
+        from jobs.services.ats_checker import (
+            claims_needing_review,
+            unsupported_claims,
+        )
+        contract = {'hard_skills': terms, 'must_have': [], 'acronyms': [],
+                    'soft_skills': []}
+        tailored = self.CV + '\n' + '\n'.join(f'- Led {t}.' for t in terms)
+        return (
+            unsupported_claims(self.CV, tailored, '', contract),
+            claims_needing_review(self.CV, tailored, '', contract),
+        )
+
+    def test_no_fabricated_multiword_skill_is_silently_accepted(self):
+        blocked, amber = self._route(self.FAKES)
+        for fake in self.FAKES:
+            self.assertIn(
+                fake, blocked + amber,
+                f'"{fake}" was silently accepted: every component word appears on '
+                f'the CV, but the candidate never did it.',
+            )
+
+    def test_distinctive_invented_tool_still_blocks(self):
+        blocked, amber = self._route(['snowflake', 'kubernetes'])
+        self.assertIn('snowflake', blocked)
+        self.assertIn('kubernetes', blocked)
+        self.assertNotIn('snowflake', amber)
+
+    def test_amber_claims_carry_the_line_that_grounds_them(self):
+        from jobs.services.ats_checker import claim_evidence
+        evidence = claim_evidence(self.CV, 'risk modelling')
+        self.assertTrue(evidence)
+        # The receipt is what makes the warning checkable rather than clickable-past.
+        self.assertIn('risk reports', evidence[0]['line'])
+        self.assertEqual(set(evidence[0]['matched']), {'risk', 'model'})
+
+    def test_genuine_reword_still_lands_in_amber_not_block(self):
+        """The behaviour we must not break while closing the leak."""
+        from jobs.services.ats_checker import (
+            claims_needing_review,
+            unsupported_claims,
+        )
+        original = 'Ran Snowflake and spent time tuning warehouse costs.'
+        tailored = original + ' Led cost optimisation on Snowflake.'
+        contract = {'hard_skills': ['cost optimisation'], 'must_have': [],
+                    'acronyms': [], 'soft_skills': []}
+        self.assertNotIn(
+            'cost optimisation',
+            unsupported_claims(original, tailored, '', contract),
+        )
+        self.assertIn(
+            'cost optimisation',
+            claims_needing_review(original, tailored, '', contract),
+        )
+
+
+class PrescoreRecallTests(TestCase):
+    """Stage-1 triage must not inherit the hardcoded vocabulary's blindness."""
+
+    CV_SKILLS = ['dbt', 'snowflake', 'dagster', 'fivetran', 'looker', 'sql', 'python']
+    RARE_STACK_JOB = ('Senior Analytics Engineer. You will use dbt, Snowflake, '
+                      'Dagster, Fivetran and Looker daily.')
+    GENERIC_JOB = ('Junior Developer. Some Python and SQL, plus Excel. '
+                   'Agile team, good communication.')
+
+    def test_perfect_rare_stack_match_outranks_a_mediocre_generic_job(self):
+        from jobs.services.keyword_extractor import (
+            extract_skills_from_text,
+            prescore_job,
+        )
+        rare = prescore_job(
+            self.CV_SKILLS, extract_skills_from_text(self.RARE_STACK_JOB),
+            self.RARE_STACK_JOB,
+        )
+        generic = prescore_job(
+            self.CV_SKILLS, extract_skills_from_text(self.GENERIC_JOB),
+            self.GENERIC_JOB,
+        )
+        # The old vocab-only score saw NO skills in the rare-stack advert and gave
+        # it a neutral 50, ranking it below vocab-rich jobs -- so the best match
+        # could be cut before a contract was ever built for it.
+        self.assertGreater(rare, generic)
+        self.assertGreaterEqual(rare, 70)
+
+    def test_direct_overlap_is_vocabulary_free(self):
+        from jobs.services.keyword_extractor import (
+            direct_overlap_score,
+            extract_skills_from_text,
+        )
+        # SKILL_VOCAB cannot see any of this advert's tools...
+        self.assertEqual(extract_skills_from_text(self.RARE_STACK_JOB), [])
+        # ...but matching the CV's own LLM-derived skills against it needs no vocab.
+        self.assertGreaterEqual(
+            direct_overlap_score(self.CV_SKILLS, self.RARE_STACK_JOB), 70
+        )
+
+    def test_prescore_takes_the_best_signal_not_the_average(self):
+        """Triage errs towards recall: one reason to look promising is enough."""
+        from jobs.services.keyword_extractor import prescore_job
+        # Vocab overlap is 0, direct overlap is high -> the job survives triage.
+        self.assertGreaterEqual(
+            prescore_job(self.CV_SKILLS, [], self.RARE_STACK_JOB), 70
+        )
+
+    def test_no_cv_skills_stays_neutral(self):
+        from jobs.services.keyword_extractor import prescore_job
+        # Nothing to match on -> neutral, so we never cut a job on no information.
+        self.assertEqual(prescore_job([], [], self.RARE_STACK_JOB), 50)
+
+
 class ATSFileChecksTests(TestCase):
     """Phase 1 checks that need the real file, not just its text."""
 

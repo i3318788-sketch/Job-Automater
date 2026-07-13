@@ -289,6 +289,7 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
     """
     from .ats_checker import (
         check_cv_against_job,
+        claim_evidence,
         claims_needing_review,
         fabricated_metrics,
         genuine_missing_terms,
@@ -323,9 +324,17 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
         report['unsupported_claims'] = unsupported_claims(
             cv_text, text, job_description, contract
         )
-        report['claims_needing_review'] = claims_needing_review(
-            cv_text, text, job_description, contract
-        )
+        review = claims_needing_review(cv_text, text, job_description, contract)
+        report['claims_needing_review'] = review
+        # Each amber claim ships with the CV line that grounds it. A warning with
+        # no receipt is one the user learns to click past; with the source line
+        # attached, checking "is this fair?" takes seconds.
+        # A list, not a dict: Django templates cannot index a dict by a variable
+        # key, and the template should iterate this directly.
+        report['claim_evidence'] = [
+            {'term': term, 'lines': claim_evidence(cv_text, term)}
+            for term in review
+        ]
         report['fabricated_metrics'] = fabricated_metrics(cv_text, text)
         report['honest'] = not (
             report['unsupported_claims'] or report['fabricated_metrics']

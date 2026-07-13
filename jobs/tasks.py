@@ -26,8 +26,8 @@ from .services.job_keywords import (
 from .services.keyword_extractor import (
     extract_search_keywords,
     extract_skills_from_text,
-    keyword_match_score,
     missing_skills,
+    prescore_job,
 )
 from .services.matching import (
     compute_match_score,
@@ -242,12 +242,15 @@ def run_job_search(search_run_id):
     # leave a perfect one unscored.
     prescores = {}
     for index, raw in enumerate(raw_jobs):
-        job_skills = extract_skills_from_text(
-            f"{raw.get('description', '')} {raw.get('title', '')}"
-        )
+        job_text = f"{raw.get('description', '')} {raw.get('title', '')}"
+        job_skills = extract_skills_from_text(job_text)
         prescores[index] = {
             'job_skills': job_skills,
-            'score': keyword_match_score(cv_skills, job_skills),
+            # Ranked on the best of two signals, one of which does not depend on
+            # the hardcoded vocabulary — otherwise a Snowflake/dbt advert looks
+            # skill-less, scores a neutral 50, and gets cut before the contract
+            # that would have loved it is ever built.
+            'score': prescore_job(cv_skills, job_skills, job_text),
             'can_prescore': bool(cv_skills) and bool(job_skills),
         }
 
