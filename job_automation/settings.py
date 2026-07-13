@@ -78,9 +78,11 @@ ATS_STRICT_MODE = env.bool('ATS_STRICT_MODE', default=False)
 # first attempt falls short.
 ATS_TARGET_SCORE = env.int('ATS_TARGET_SCORE', default=90)
 
-# How many extra tailoring passes to spend chasing ATS_TARGET_SCORE. Each pass
-# is one more OpenAI call per job, so keep this low.
-ATS_MAX_TAILOR_ATTEMPTS = env.int('ATS_MAX_TAILOR_ATTEMPTS', default=2)
+# How many tailoring passes to spend reaching ATS_TARGET_SCORE. Each pass is one
+# more OpenAI call per job, so keep this low. 3 is the practical minimum: the
+# first draft scores, and a second is usually needed to strip any skill or metric
+# the model invented while chasing the score.
+ATS_MAX_TAILOR_ATTEMPTS = env.int('ATS_MAX_TAILOR_ATTEMPTS', default=3)
 
 # ---------------------------------------------------------------------------
 # Applications

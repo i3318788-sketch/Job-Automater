@@ -44,6 +44,27 @@
     </div>
 </div>
 
+{% if data.unsupported_claims or data.fabricated_metrics %}
+<div class="card" style="border-left:4px solid #c0392b;">
+    <h2>⚠ Review before you send this <span class="badge badge-red">Unverified content</span></h2>
+    <p>
+        The tailored CV contains content that your original CV does not support.
+        <strong>Check every item below and remove anything you cannot evidence at
+        interview</strong> — an ATS may be fooled, but a hiring manager will not be.
+    </p>
+    {% if data.unsupported_claims %}
+        <p><strong>Skills with no support in your original CV:</strong>
+            {% for s in data.unsupported_claims %}<span class="badge badge-red">{{ s }}</span> {% endfor %}
+        </p>
+    {% endif %}
+    {% if data.fabricated_metrics %}
+        <p><strong>Figures that appear nowhere in your original CV:</strong>
+            {% for m in data.fabricated_metrics %}<span class="badge badge-red">{{ m }}</span> {% endfor %}
+        </p>
+    {% endif %}
+</div>
+{% endif %}
+
 {% if data.duplicate_application %}
 <div class="card">
     <h2>Duplicate application <span class="badge badge-yellow">Flagged</span></h2>

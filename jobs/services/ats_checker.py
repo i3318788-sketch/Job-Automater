@@ -254,6 +254,17 @@ try:  # pragma: no cover - depends on optional corpus
 except Exception:  # pragma: no cover
     _wordnet = None
 
+# The POS tagger (`python -m nltk.downloader averaged_perceptron_tagger`) is what
+# keeps the keyword list to things a CV can actually match — nouns, not the verbs
+# and adjectives of the advert's prose. Optional: without it, keyword extraction
+# falls back to plain n-grams.
+try:  # pragma: no cover - depends on optional corpus
+    from nltk import pos_tag as _pos_tag
+
+    _pos_tag(['test'])  # force the model load now, not mid-search
+except Exception:  # pragma: no cover
+    _pos_tag = None
+
 _SUFFIXES = (
     'ization', 'isation', 'ements', 'ement', 'ments', 'ment', 'ities', 'ility',
     'ively', 'ingly', 'edly', 'ness', 'ions', 'ion', 'ing', 'ies', 'ied', 'ers',
@@ -556,18 +567,145 @@ def extract_job_requirements(job_description, job_title='', job_location=''):
 # adjective.
 WEIGHT_HARD = 3.0
 WEIGHT_CERT = 3.0
-WEIGHT_GENERAL = 2.0
+WEIGHT_GENERAL = 1.5
 WEIGHT_SOFT = 1.0
 
+# Contextual placement: a keyword in the professional summary outranks the same
+# keyword in a role from 2011. Full marks require the keyword to be *covered* and
+# *well placed* — PLACEMENT_MAX is the denominator, so a placement bonus can
+# never paper over a keyword the CV is missing entirely.
+PLACEMENT_SUMMARY = 1.25
+PLACEMENT_RECENT = 1.15
+PLACEMENT_MAX = PLACEMENT_SUMMARY
 
-def extract_jd_keywords(job_description, limit=60):
+# Headings that introduce the parts of an advert stating what the job actually
+# needs. An ATS screens against requirements — not against the perks.
+REQUIREMENT_HEADINGS = re.compile(
+    r'^\s*[-*•\s]*(?:what\s+(?:we[\'’]?re\s+looking\s+for|you[\'’]?ll\s+(?:do|need|bring))|'
+    r'requirements?|responsibilities|qualifications?|skills?(?:\s+(?:and|&)\s+experience)?|'
+    r'experience|about\s+(?:the\s+)?(?:role|job)|the\s+role|your\s+role|key\s+duties|'
+    r'essential|desirable|must\s+have|nice\s+to\s+have|you\s+will|duties|'
+    r'technical\s+skills|competencies)\b.*$',
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Headings that introduce boilerplate: nothing here is a job requirement, and
+# mining it produces noise words like "offer", "holiday" and "diversity".
+BOILERPLATE_HEADINGS = re.compile(
+    r'^\s*[-*•\s]*(?:about\s+(?:us|the\s+company|our)|who\s+we\s+are|our\s+(?:story|mission|values|culture)|'
+    r'benefits?|perks?|what\s+we\s+offer|we\s+offer|compensation|salary|package|'
+    r'why\s+(?:join|work)|equal\s+opportunit|diversity|inclusion|how\s+to\s+apply|'
+    r'the\s+process|interview\s+process|next\s+steps)\b.*$',
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def requirement_text(job_description):
+    """The parts of an advert that actually state requirements.
+
+    A real job ad is mostly prose: company mission, culture, benefits, EEO
+    boilerplate. Mining keywords from all of it makes the checker demand words
+    like "offer", "holiday" and "collaborative" that no CV can or should match,
+    which drags every candidate's keyword score down for no reason.
+
+    Returns the requirement/responsibility sections, or the whole advert when it
+    has no recognisable headings (short ads are usually all requirements).
+    """
+    text = job_description or ''
+    lines = text.splitlines()
+
+    # Walk the ad, tracking whether the current heading is a requirements-bearing
+    # one, and keep only those blocks.
+    kept, keeping, saw_heading = [], False, False
+    for line in lines:
+        if BOILERPLATE_HEADINGS.match(line):
+            keeping, saw_heading = False, True
+            continue
+        if REQUIREMENT_HEADINGS.match(line):
+            keeping, saw_heading = True, True
+            continue
+        if keeping:
+            kept.append(line)
+
+    if not saw_heading or not any(l.strip() for l in kept):
+        # Unstructured or heading-less ad: fall back to the whole text, minus any
+        # line that is plainly a benefit or legal boilerplate.
+        return '\n'.join(
+            l for l in lines
+            if not re.search(
+                r'\b(?:holiday|pension|healthcare|dental|equal opportunit|diversity|'
+                r'cycle to work|season ticket|equity|bonus|perks?|we offer)\b',
+                l, re.IGNORECASE,
+            )
+        )
+    return '\n'.join(kept)
+
+
+def _noun_phrases(text):
+    """Noun phrases from ``text``, counted — the shape a real requirement takes.
+
+    Uses NLTK's POS tagger *in sentence context* (tagging a word in isolation is
+    unreliable: "offer" alone tags as a noun). Keeps adjective-noun and noun-noun
+    chunks like "backend services" or "relational databases", and drops the verbs
+    and adjectives that a frequency count would otherwise promote — "using",
+    "deploy", "maintain", "scalable" on its own.
+
+    Falls back to plain n-grams when the tagger corpus isn't installed.
+    """
+    counts = {}
+    if _pos_tag is None:
+        tokens = _tokens(text)
+        for size in (1, 2):
+            for i in range(len(tokens) - size + 1):
+                gram = tokens[i:i + size]
+                if any(t in STOPWORDS or len(t) < 3 or t.isdigit() for t in gram):
+                    continue
+                phrase = ' '.join(gram)
+                counts[phrase] = counts.get(phrase, 0) + 1
+        return counts
+
+    for sentence in _sentences(text):
+        tokens = _tokens(sentence)
+        if not tokens:
+            continue
+        try:
+            tagged = _pos_tag(tokens)
+        except Exception:  # pragma: no cover - tagger data issues
+            continue
+
+        chunk = []
+        for word, tag in tagged + [('', 'END')]:
+            # Build up JJ* NN+ chunks; anything else closes the current chunk.
+            if tag.startswith('NN') or (tag == 'JJ' and chunk == []):
+                if not (word in STOPWORDS or len(word) < 3 or word.isdigit()):
+                    chunk.append((word, tag))
+                    continue
+            if chunk:
+                # A chunk must end on a noun to be a noun phrase.
+                while chunk and not chunk[-1][1].startswith('NN'):
+                    chunk.pop()
+                if chunk:
+                    phrase = ' '.join(w for w, _ in chunk[-2:])  # head of the phrase
+                    counts[phrase] = counts.get(phrase, 0) + 1
+                    if len(chunk) > 1:
+                        head = chunk[-1][0]
+                        counts[head] = counts.get(head, 0) + 1
+                chunk = []
+    return counts
+
+
+def extract_jd_keywords(job_description, limit=40):
     """Return the ranked keywords an ATS would screen this CV against.
 
     Each item: {'term', 'type', 'weight', 'jd_count'}. Hard skills and required
-    certifications outrank generic phrases, which outrank soft skills.
+    certifications outrank noun-phrase requirements, which outrank soft skills.
+    Counts are taken over the whole advert, but the *set* of keywords is mined
+    only from its requirement sections.
     """
     text = job_description or ''
     lowered = text.lower()
+    requirements = requirement_text(text)
+    req_lower = requirements.lower()
     keywords = []
     seen = set()
 
@@ -583,6 +721,8 @@ def extract_jd_keywords(job_description, limit=60):
             'jd_count': _count_term(lowered, term),
         })
 
+    # Skills and certifications are screened for wherever they appear — a tool
+    # named in the intro paragraph is still a requirement.
     for skill in HARD_SKILL_VOCAB:
         if _contains_term(lowered, skill):
             add(skill, 'hard', WEIGHT_HARD)
@@ -590,22 +730,11 @@ def extract_jd_keywords(job_description, limit=60):
         if _contains_term(lowered, cert):
             add(cert, 'certification', WEIGHT_CERT)
     for soft in SOFT_SKILLS:
-        if _contains_term(lowered, soft):
+        if _contains_term(req_lower, soft):
             add(soft, 'soft', WEIGHT_SOFT)
 
-    # Remaining signal: the most frequent meaningful uni-/bi-grams, which is how
-    # an ATS picks up domain terms that aren't in any predefined vocabulary.
-    tokens = _tokens(text)
-    counts = {}
-    for size in (1, 2):
-        for i in range(len(tokens) - size + 1):
-            gram = tokens[i:i + size]
-            if any(t in STOPWORDS or len(t) < 3 or t.isdigit() for t in gram):
-                continue
-            phrase = ' '.join(gram)
-            counts[phrase] = counts.get(phrase, 0) + 1
-
-    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    # Everything else the job asks for, as noun phrases from the requirements.
+    ranked = sorted(_noun_phrases(requirements).items(), key=lambda kv: (-kv[1], kv[0]))
     for phrase, count in ranked:
         if len(keywords) >= limit:
             break
@@ -1368,7 +1497,9 @@ class ATSChecker:
         for keyword in self.keywords:
             term = keyword['term']
             weight = keyword['weight']
-            possible += weight
+            # Full marks = matched AND placed prominently, so a missing keyword
+            # always costs and cannot be masked by placement bonuses elsewhere.
+            possible += weight * PLACEMENT_MAX
 
             found = self._found_in(self.cv_lower, term)
             count = _count_term(self.cv_lower, term)
@@ -1381,9 +1512,9 @@ class ATSChecker:
                 # in a 2011 role.
                 multiplier = 1.0
                 if self._found_in(summary_text, term):
-                    multiplier = 1.25
+                    multiplier = PLACEMENT_SUMMARY
                 elif self._found_in(recent_text, term):
-                    multiplier = 1.15
+                    multiplier = PLACEMENT_RECENT
 
                 # Frequency sufficiency: a term the job leans on repeatedly needs
                 # to appear more than once here to read as a core skill rather
@@ -1736,6 +1867,99 @@ class ATSChecker:
         )
         return _clamp(total)
 
+    def _categories(self):
+        """The five weighted ATS categories, mapped from the seven phases.
+
+        The phases are how the checking is done; these categories are how a
+        recruiter's dashboard reports it. Weights sum to 1.0 and match the
+        phase weights, so the two views can never disagree on the total.
+        """
+        p1 = self.results['phase1_parsing']
+        p3 = self.results['phase3_keyword']
+        p4 = self.results['phase4_context']
+        p5 = self.results['phase5_experience']
+        p6 = self.results['phase6_education']
+
+        # Experience relevance blends title match, recency, quantified evidence
+        # (phase 4) with chronology and tenure (phase 5).
+        experience_score = _clamp(
+            p4['job_title_match'] * 0.3 + p4['quantification_score'] * 0.3
+            + p4['recency_score'] * 0.15 + p5['score'] * 0.25
+        )
+        # Section completeness is the headings half of phase 1.
+        sections_ok = 100 if not p1['missing_headers'] else _clamp(
+            100 - 34 * len(p1['missing_headers'])
+        )
+        if not p5['reverse_chronological']:
+            sections_ok = _clamp(sections_ok - 20)
+
+        categories = {
+            'keyword_matching': {
+                'score': p3['score'],
+                'weight': PHASE_WEIGHTS['phase3_keyword'],
+                'missing_keywords': p3['missing_keywords'],
+                'found_keywords': p3.get('matched_keywords', []),
+                'density_issues': [
+                    f'"{u["term"]}" appears {u["cv_count"]}x, the job mentions it '
+                    f'{u["jd_count"]}x (aim for {u["expected"]})'
+                    for u in p3.get('underused_keywords', [])
+                ],
+                'placement_issues': (
+                    ['Keywords are missing from the professional summary, where they '
+                     'carry the most weight']
+                    if not self._section_text('profile') else []
+                ),
+            },
+            'experience_relevance': {
+                'score': experience_score,
+                'weight': PHASE_WEIGHTS['phase4_context'] + PHASE_WEIGHTS['phase5_experience'],
+                'issues': self._experience_issues(p4, p5),
+            },
+            'formatting': {
+                'score': p1['score'],
+                'weight': PHASE_WEIGHTS['phase1_parsing'],
+                'issues': (
+                    p1['prohibited_elements'] + p1['font_issues']
+                    + ([f'Layout is {p1["layout"]}']
+                       if p1['layout'] not in ('single-column', 'unknown', None) else [])
+                ),
+            },
+            'education': {
+                'score': p6['score'],
+                'weight': PHASE_WEIGHTS['phase6_education'],
+                'issues': (
+                    [] if p6['degree_hierarchy']
+                    else ['No degree detected in the education section']
+                ),
+            },
+            'section_completeness': {
+                'score': sections_ok,
+                'weight': 0.0,  # folded into formatting/parsing; shown for visibility
+                'issues': (
+                    [f'Missing section: {h}' for h in p1['missing_headers']]
+                    + ([] if p5['reverse_chronological']
+                       else ['Roles are not in reverse-chronological order'])
+                ),
+            },
+        }
+        for value in categories.values():
+            value['weighted_score'] = round(value['score'] * value['weight'], 2)
+        return categories
+
+    def _experience_issues(self, p4, p5):
+        issues = []
+        if p4['job_title_match'] < 60:
+            issues.append('Job titles do not closely match the target role')
+        if p4['quantification_score'] < 40:
+            issues.append('Few quantified results (numbers, %, £) in the experience bullets')
+        if p4['recency_score'] < 50:
+            issues.append('The job\'s key skills appear mainly in older roles')
+        if p5['gaps']:
+            issues.append(f'{len(p5["gaps"])} employment gap(s) over 3 months')
+        if p5['job_hopping']:
+            issues.append('Several roles under a year (reads as job-hopping)')
+        return issues
+
     def _sectional_scores(self):
         """Skills / experience / education breakdown, as a recruiter would read it."""
         phase3 = self.results['phase3_keyword']
@@ -1789,7 +2013,9 @@ class ATSChecker:
             'parsing_failures': self._parsing_reasons(),
             'knockout_reasons': self._knockout_reasons(),
             'threshold': threshold,
+            'score_needed': getattr(settings, 'ATS_TARGET_SCORE', 90),
             'phases': self.results,
+            'categories': self._categories(),
             'sectional_scores': self._sectional_scores(),
             'recommendations': self._recommendations,
             'job_requirements': self.job_requirements,
@@ -1871,6 +2097,149 @@ def check_cv_against_job(cv_text, job_description, job_title='', job_location=''
     requirements = extract_job_requirements(job_description, job_title, job_location)
     checker = ATSChecker(cv_text, job_description, requirements, file_path=file_path)
     return checker.get_detailed_report()
+
+
+# A skill on the left is genuine evidence for the skill on the right: a CV that
+# says "PostgreSQL" plainly does SQL, so claiming SQL is not a fabrication.
+SKILL_IMPLIES = {
+    'postgresql': {'sql', 'relational databases'},
+    'mysql': {'sql', 'relational databases'},
+    'oracle': {'sql', 'relational databases'},
+    'sql': {'relational databases'},
+    'django': {'python'},
+    'flask': {'python'},
+    'fastapi': {'python'},
+    'react': {'javascript'},
+    'angular': {'javascript'},
+    'vue': {'javascript'},
+    'node.js': {'javascript'},
+    'kubernetes': {'containers', 'docker'},
+    'aws': {'cloud'},
+    'azure': {'cloud'},
+    'gcp': {'cloud'},
+    'jenkins': {'ci/cd'},
+    'github actions': {'ci/cd'},
+    'gitlab ci': {'ci/cd'},
+    'terraform': {'infrastructure as code'},
+    'pandas': {'python', 'data analysis'},
+    'pytorch': {'machine learning', 'deep learning'},
+    'tensorflow': {'machine learning', 'deep learning'},
+}
+
+# Achievement metrics: percentages, money, and magnitudes. These are the figures
+# that make a bullet persuasive, and therefore the ones a model is tempted to
+# invent. Plain small integers (a team of 3, 5 years) are not checked — those are
+# usually derivable from the CV and flagging them would be noise.
+_METRIC_RE = re.compile(
+    r'\d+(?:[.,]\d+)*\s*%'                                   # 30%, 12.5%
+    r'|[£$€]\s?\d{1,3}(?:,\d{3})+(?:\.\d+)?'                 # £250,000
+    r'|[£$€]\s?\d+(?:\.\d+)?\s*(?:k|m|bn|million|billion)?'  # £2m, $500
+    r'|\b\d+(?:\.\d+)?\s*(?:k|m|bn|million|billion)\b'       # 2 million, 40k
+    r'|\b\d{1,3}(?:,\d{3})+\b'                               # 10,000 (comma-grouped)
+    r'|\b\d{3,}\b',                                          # 10000
+    re.IGNORECASE,
+)
+
+
+def _parse_metric(raw):
+    """The numeric value of one matched metric, or None. "2 million" -> 2000000.0.
+
+    Both sides of the comparison must parse identically, so this is the single
+    place it happens — parsing the original and the rewrite with two copies of
+    this logic silently flags every magnitude as fabricated.
+    """
+    digits = re.sub(r'[^\d.]', '', raw.replace(',', ''))
+    if not digits or digits == '.':
+        return None
+    try:
+        value = float(digits)
+    except ValueError:
+        return None
+    if re.search(r'(?:k|thousand)\b', raw, re.I):
+        value *= 1_000
+    elif re.search(r'(?:m|million)\b', raw, re.I):
+        value *= 1_000_000
+    elif re.search(r'(?:bn|billion)\b', raw, re.I):
+        value *= 1_000_000_000
+    return value
+
+
+def _metric_values(text):
+    """The numeric value of every achievement metric in ``text``."""
+    values = set()
+    for raw in _METRIC_RE.findall(text or ''):
+        value = _parse_metric(raw)
+        if value is not None:
+            values.add(value)
+    return values
+
+
+def _is_year(value, raw):
+    return 1900 <= value <= 2100 and '%' not in raw and not re.search(r'[£$€]', raw)
+
+
+def fabricated_metrics(original_cv_text, tailored_cv_text):
+    """Achievement figures the tailored CV states that the original CV never did.
+
+    The quantification check rewards "increased throughput by 30%" over "improved
+    throughput" — which gives a model a direct incentive to invent the 30%. It
+    does. So every figure in the rewrite is verified against the source, and any
+    that was conjured up is reported.
+    """
+    if not (original_cv_text and tailored_cv_text):
+        return []
+
+    original_values = _metric_values(original_cv_text)
+    invented = []
+    for raw in _METRIC_RE.findall(tailored_cv_text):
+        value = _parse_metric(raw)
+        if value is None or _is_year(value, raw):
+            continue  # a year or a parse failure, not an achievement claim
+        if value not in original_values:
+            invented.append(raw.strip())
+    return sorted(set(invented))
+
+
+def unsupported_claims(original_cv_text, tailored_cv_text, job_description):
+    """Hard skills the tailored CV claims that the original CV gives no evidence for.
+
+    A model told to raise a keyword score will, sooner or later, add a skill the
+    candidate does not have — we saw it add "CI/CD" to a CV whose only relevant
+    line was "helped out with deployments". Instructions alone do not prevent
+    this, so the output is verified against the source instead of trusted.
+
+    Only hard skills and certifications are checked. Soft skills and role nouns
+    are rephrasings by nature ("worked in a team" -> "collaboration"), and
+    flagging those would be noise.
+    """
+    if not (original_cv_text and tailored_cv_text):
+        return []
+
+    original = original_cv_text.lower()
+    tailored = tailored_cv_text.lower()
+    checker = ATSChecker(original_cv_text, job_description or '')
+
+    # Everything the original CV entitles the candidate to claim: the skills it
+    # names, plus whatever those skills imply (PostgreSQL implies SQL).
+    supported = set()
+    for skill, implied in SKILL_IMPLIES.items():
+        if _contains_term(original, skill):
+            supported.update(implied)
+
+    claimed = []
+    for keyword in extract_jd_keywords(job_description or ''):
+        if keyword['type'] not in ('hard', 'certification'):
+            continue
+        term = keyword['term']
+        if term.lower() in supported:
+            continue
+        # Claimed in the rewrite, but nothing in the original CV supports it.
+        in_tailored = any(
+            _contains_term(tailored, form) for form in _synonyms_for(term)
+        )
+        if in_tailored and not checker._found_in(original, term):
+            claimed.append(term)
+    return claimed
 
 
 def check_cv_format(cv_text, file_path=None):

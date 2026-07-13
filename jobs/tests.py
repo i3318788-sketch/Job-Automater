@@ -1086,6 +1086,220 @@ class ATSGarbledFontTests(TestCase):
         self.assertEqual(ATSChecker(ATS_GOOD_CV, '')._garbled_ratio(), 0.0)
 
 
+class ATSKeywordExtractionQualityTests(TestCase):
+    """The keyword list must contain things a CV can actually match."""
+
+    REAL_AD = """Senior Backend Engineer - London
+
+About Us
+We are a fast-growing fintech. We are proud to be an equal opportunity employer.
+
+What We're Looking For
+- 5+ years of commercial software engineering experience
+- Strong Python skills and deep experience with Django
+- Experience with PostgreSQL and optimising SQL queries
+- Familiarity with Docker and Kubernetes
+
+Benefits
+- Competitive salary and equity
+- 25 days holiday plus bank holidays
+- Private healthcare, and we offer a learning budget
+"""
+
+    def test_boilerplate_sections_are_not_mined_for_keywords(self):
+        from jobs.services.ats_checker import extract_jd_keywords
+        terms = {k['term'] for k in extract_jd_keywords(self.REAL_AD)}
+        # Benefits and culture blurb must contribute no keywords: no CV can or
+        # should match "holiday", "equity" or "healthcare".
+        for noise in ('holiday', 'equity', 'healthcare', 'opportunity', 'salary'):
+            self.assertNotIn(noise, terms)
+
+    def test_real_skills_are_still_extracted(self):
+        from jobs.services.ats_checker import extract_jd_keywords
+        terms = {k['term'] for k in extract_jd_keywords(self.REAL_AD)}
+        for skill in ('python', 'django', 'postgresql', 'sql', 'docker', 'kubernetes'):
+            self.assertIn(skill, terms)
+
+    def test_verbs_and_adjectives_are_not_demanded_as_keywords(self):
+        from jobs.services.ats_checker import extract_jd_keywords
+        jd = ('You will design and build scalable services. You will build and '
+              'design and deploy and maintain systems using Python. Deploy often.')
+        terms = {k['term'] for k in extract_jd_keywords(jd)}
+        # "using", "deploy", "build", "design" are prose, not requirements.
+        for verb in ('using', 'build', 'design'):
+            self.assertNotIn(verb, terms)
+        self.assertIn('python', terms)
+
+    def test_placement_bonus_cannot_mask_a_missing_keyword(self):
+        """A CV missing a hard skill must never score 100 on keywords."""
+        from jobs.services.ats_checker import check_cv_against_job
+        cv = ATS_GOOD_CV.replace('Kubernetes', '').replace('- Kubernetes\n', '')
+        phase3 = check_cv_against_job(cv, ATS_JOB_DESCRIPTION)['phases']['phase3_keyword']
+        self.assertIn('kubernetes', phase3['hard_skills_missing'])
+        self.assertLess(phase3['score'], 100)
+
+
+ORIGINAL_CV_NO_NUMBERS = """John Smith
+07123 456789 | john@example.com | London, UK
+
+About Me
+A software developer who enjoys building things.
+
+Employment
+Software Developer, Acme Ltd, London
+January 2021 - Present
+- Worked on the back end and made database queries run faster.
+- Helped move applications onto the cloud using containers.
+
+Education
+BSc Computer Science, University of Manchester, 2015 - 2018
+
+Technical
+Python, Django, Postgres, Docker, Amazon Web Services
+"""
+
+
+class ATSFabricationGuardrailTests(TestCase):
+    """The tailored CV must never claim what the original cannot back up.
+
+    Prompt instructions do not reliably prevent this — a live run had the model
+    invent 'CI/CD', 'improving performance by 30%' and 'over 10,000 users' to
+    chase the keyword and quantification scores. So the output is verified
+    against the source rather than trusted.
+    """
+
+    JD = ('Backend Engineer. We need Python, Django, PostgreSQL, Docker, '
+          'Kubernetes and CI/CD experience. 3+ years.')
+
+    def test_invented_skill_is_detected(self):
+        from jobs.services.ats_checker import unsupported_claims
+        tailored = ORIGINAL_CV_NO_NUMBERS + '\nKEY SKILLS\n- CI/CD\n- Kubernetes\n'
+        claims = unsupported_claims(ORIGINAL_CV_NO_NUMBERS, tailored, self.JD)
+        self.assertIn('ci/cd', claims)
+        self.assertIn('kubernetes', claims)
+
+    def test_implied_skills_are_not_false_positives(self):
+        """'Postgres' on the original CV genuinely evidences a 'SQL' claim."""
+        from jobs.services.ats_checker import unsupported_claims
+        tailored = ORIGINAL_CV_NO_NUMBERS + '\n- Optimised SQL queries.\n'
+        claims = unsupported_claims(ORIGINAL_CV_NO_NUMBERS, tailored, self.JD)
+        self.assertNotIn('sql', claims)
+
+    def test_genuine_skills_are_not_flagged(self):
+        from jobs.services.ats_checker import unsupported_claims
+        tailored = ORIGINAL_CV_NO_NUMBERS + '\n- Built services in Python and Django.\n'
+        claims = unsupported_claims(ORIGINAL_CV_NO_NUMBERS, tailored, self.JD)
+        self.assertNotIn('python', claims)
+        self.assertNotIn('django', claims)
+
+    def test_invented_metrics_are_detected(self):
+        from jobs.services.ats_checker import fabricated_metrics
+        tailored = (ORIGINAL_CV_NO_NUMBERS
+                    + '\n- Improved performance by 30% for over 10,000 users.\n')
+        invented = fabricated_metrics(ORIGINAL_CV_NO_NUMBERS, tailored)
+        self.assertTrue(any('30' in m for m in invented))
+        self.assertTrue(any('10,000' in m or '10000' in m for m in invented))
+
+    def test_metrics_present_in_the_original_are_kept(self):
+        from jobs.services.ats_checker import fabricated_metrics
+        original = ORIGINAL_CV_NO_NUMBERS + '\n- Cut latency by 40%.\n'
+        tailored = original.replace('Cut latency by 40%', 'Reduced latency by 40%')
+        self.assertEqual(fabricated_metrics(original, tailored), [])
+
+    def test_identical_text_never_flags_anything(self):
+        """Regression: magnitudes ("2 million") were parsed differently on each
+        side of the comparison, so a CV was flagged for inventing its own numbers.
+        """
+        from jobs.services.ats_checker import fabricated_metrics, unsupported_claims
+        self.assertEqual(fabricated_metrics(ATS_GOOD_CV, ATS_GOOD_CV), [])
+        self.assertEqual(
+            unsupported_claims(ATS_GOOD_CV, ATS_GOOD_CV, ATS_JOB_DESCRIPTION), []
+        )
+
+    def test_magnitudes_and_currency_are_compared_by_value(self):
+        from jobs.services.ats_checker import fabricated_metrics
+        original = 'Handled 2 million requests and saved £250,000.'
+        # Same figures, reworded -> nothing invented.
+        self.assertEqual(
+            fabricated_metrics(original, 'Saved £250,000 while serving 2 million users.'),
+            [],
+        )
+        # A different figure -> invented.
+        self.assertTrue(fabricated_metrics(original, 'Handled 9 million requests.'))
+
+    def test_dates_are_not_mistaken_for_invented_metrics(self):
+        from jobs.services.ats_checker import fabricated_metrics
+        tailored = ORIGINAL_CV_NO_NUMBERS.replace(
+            'January 2021 - Present', 'Jan 2021 - Present'
+        )
+        self.assertEqual(fabricated_metrics(ORIGINAL_CV_NO_NUMBERS, tailored), [])
+
+    @override_settings(OPENAI_API_KEY='sk-test', ATS_TARGET_SCORE=90,
+                       ATS_MAX_TAILOR_ATTEMPTS=3)
+    @mock.patch('jobs.services.tailoring._retry_with_feedback')
+    @mock.patch('jobs.services.tailoring.tailor_cv_for_job')
+    def test_high_scoring_fabrication_loses_to_an_honest_lower_score(
+        self, mock_tailor, mock_retry
+    ):
+        """The whole point: a dishonest draft never wins, however well it scores."""
+        from jobs.services.tailoring import tailor_cv_for_job_with_ats
+
+        # Draft 1: stuffed with invented skills and metrics -> scores well.
+        dishonest = ATS_GOOD_CV + '\n- Delivered CI/CD pipelines, cutting costs 60%.\n'
+        # Draft 2: honest, and necessarily scores lower.
+        honest = ORIGINAL_CV_NO_NUMBERS
+        mock_tailor.return_value = dishonest
+        mock_retry.return_value = honest
+
+        text, report, _attempts = tailor_cv_for_job_with_ats(
+            ORIGINAL_CV_NO_NUMBERS, self.JD, 'Backend Engineer', 'Acme',
+        )
+        self.assertEqual(text, honest)
+        self.assertTrue(report['honest'])
+        self.assertFalse(report['unsupported_claims'])
+        self.assertFalse(report['fabricated_metrics'])
+
+    @override_settings(OPENAI_API_KEY='sk-test', ATS_MAX_TAILOR_ATTEMPTS=2)
+    @mock.patch('jobs.services.tailoring._retry_with_feedback')
+    @mock.patch('jobs.services.tailoring.tailor_cv_for_job')
+    def test_persistent_fabrication_is_reported_not_hidden(self, mock_tailor, mock_retry):
+        """If every draft lies, keep the best but flag it — never ship it silently."""
+        from jobs.services.tailoring import tailor_cv_for_job_with_ats
+        liar = ORIGINAL_CV_NO_NUMBERS + '\n- Ran CI/CD, improving speed by 55%.\n'
+        mock_tailor.return_value = liar
+        mock_retry.return_value = liar
+
+        _text, report, _a = tailor_cv_for_job_with_ats(
+            ORIGINAL_CV_NO_NUMBERS, self.JD, 'Backend Engineer', 'Acme',
+        )
+        self.assertFalse(report['honest'])
+        self.assertIn('ci/cd', report['unsupported_claims'])
+        self.assertTrue(report['fabricated_metrics'])
+
+
+class ATSCategoryBreakdownTests(TestCase):
+    def test_report_exposes_five_weighted_categories(self):
+        from jobs.services.ats_checker import check_cv_against_job
+        report = check_cv_against_job(ATS_GOOD_CV, ATS_JOB_DESCRIPTION,
+                                      'Senior Backend Engineer', 'London, UK')
+        categories = report['categories']
+        self.assertEqual(
+            set(categories),
+            {'keyword_matching', 'experience_relevance', 'formatting', 'education',
+             'section_completeness'},
+        )
+        for cat in categories.values():
+            self.assertIn('score', cat)
+            self.assertIn('weight', cat)
+            self.assertIn('weighted_score', cat)
+            self.assertTrue(0 <= cat['score'] <= 100)
+        # Keyword matching is the heaviest category, as in a real ATS.
+        self.assertEqual(
+            max(categories, key=lambda k: categories[k]['weight']), 'keyword_matching'
+        )
+        self.assertEqual(report['score_needed'], 90)
+
+
 class ATSFileChecksTests(TestCase):
     """Phase 1 checks that need the real file, not just its text."""
 
@@ -1169,17 +1383,19 @@ class ATSTailoringLoopTests(TestCase):
     @mock.patch('jobs.services.tailoring.tailor_cv_for_job')
     def test_retries_until_target_then_stops(self, mock_tailor, mock_retry):
         from jobs.services.tailoring import tailor_cv_for_job_with_ats
-        # First draft is the weak CV; the retry produces the strong one.
+        # The source CV is the strong one, so a draft built from it is honest.
+        # First draft is weak; the retry surfaces what was already there.
         mock_tailor.return_value = ATS_BAD_CV
         mock_retry.return_value = ATS_GOOD_CV
 
         text, report, attempts = tailor_cv_for_job_with_ats(
-            'original', ATS_JOB_DESCRIPTION, 'Senior Backend Engineer', 'Acme',
+            ATS_GOOD_CV, ATS_JOB_DESCRIPTION, 'Senior Backend Engineer', 'Acme',
             'London, UK',
         )
         self.assertEqual(text, ATS_GOOD_CV)
         self.assertEqual(attempts, 2)  # stopped as soon as the target was cleared
         self.assertGreaterEqual(report['overall_score'], 75)
+        self.assertTrue(report['honest'])
         mock_retry.assert_called_once()
 
     @override_settings(OPENAI_API_KEY='sk-test', ATS_TARGET_SCORE=100,
@@ -1194,7 +1410,7 @@ class ATSTailoringLoopTests(TestCase):
         mock_retry.return_value = ATS_GOOD_CV  # better, but still under 100
 
         text, report, attempts = tailor_cv_for_job_with_ats(
-            'original', ATS_JOB_DESCRIPTION, 'Senior Backend Engineer', 'Acme',
+            ATS_GOOD_CV, ATS_JOB_DESCRIPTION, 'Senior Backend Engineer', 'Acme',
         )
         # Keeps the best attempt and reports its real score, not a flattering one.
         self.assertEqual(text, ATS_GOOD_CV)

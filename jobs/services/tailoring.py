@@ -49,16 +49,49 @@ CERTIFICATIONS
 - One certification per line, starting with "- " (omit this section entirely if the \
 original CV lists none)
 
-IMPORTANT RULES:
+ATS RULES — these decide whether a human ever sees this CV:
+
+1. KEYWORDS (the largest single part of the score)
+- You are given the exact list of keywords the ATS screens for, with how many \
+times each should appear. Use every keyword the candidate genuinely has, at \
+roughly that frequency.
+- Use the advert's EXACT wording. If it says "project management", write "project \
+management" — not "managed projects". An ATS matches the phrase, not the meaning.
+- Put the most important keywords in the PROFESSIONAL PROFILE and in KEY SKILLS. \
+The same word carries far more weight there than buried in a role from 2015.
+- Also work each key skill into the PROFESSIONAL EXPERIENCE bullet that evidences \
+it. A skill listed but never evidenced scores poorly. The words of a multi-word \
+requirement ("financial forecasting") must appear TOGETHER in a single bullet.
+- Never repeat a keyword more than 3 times — stuffing is detected and penalised.
+
+2. EXPERIENCE & TITLES
+- Start every bullet with an action verb (Led, Managed, Developed, Increased, \
+Delivered, Optimised, Implemented).
+- Keep quantified results (numbers, %, £) prominent; they carry extra weight. Use \
+ONLY figures already present in the original CV.
+- Most recent role first, always.
+
+3. STRUCTURE
+- Single column, plain text. No tables, columns, graphics or symbols.
+- Contact details on line 2 — never in a header or footer.
+- Use the exact section headings given above, and no others.
+
+IMPORTANT RULES — THESE OVERRIDE THE ATS RULES ABOVE:
 - Do NOT invent any new roles, employers, dates, skills, achievements, metrics or \
 certifications. Do NOT fabricate numbers or percentages.
+- Only use a keyword if the ORIGINAL CV shows the candidate genuinely has that \
+skill or experience. If a requested keyword has no support in the original CV, \
+LEAVE IT OUT and accept the lower score. A CV that passes the ATS on skills the \
+candidate does not have just fails at interview instead — and it is the candidate \
+who pays for that.
+- Where the candidate's real job title is close to the target title, you may adopt \
+the target title's wording. If their actual title differs materially, keep the real \
+one — never claim a role they did not hold.
 - If the original CV has no contact details, omit the contact line rather than \
 inventing one.
 - You may rephrase, reorder and reword existing content to align with the job.
 - Keep the CV to 1-2 pages.
 - Use UK spelling (e.g. "organise" not "organize", "analysed" not "analyzed").
-- Use professional, confident language.
-- Tailor the profile and bullet points to the job description's keywords.
 - Do NOT include a photo, date of birth, nationality or marital status.
 
 Return only the CV text, with no commentary, preamble or markdown fences."""
@@ -97,11 +130,45 @@ def _openai_configured():
     return bool(getattr(settings, 'OPENAI_API_KEY', ''))
 
 
+def _keyword_brief(job_description):
+    """The exact keywords the ATS will screen for, with the density each needs.
+
+    Handing the model the checker's own target list is the single highest-leverage
+    part of this prompt: it removes the guesswork about which words matter, so the
+    rewrite optimises for what is actually measured instead of what reads well.
+    """
+    from .ats_checker import _expected_frequency, extract_jd_keywords
+
+    keywords = extract_jd_keywords(job_description)
+    if not keywords:
+        return ''
+
+    lines = []
+    for group, label in (('hard', 'ESSENTIAL SKILLS'),
+                         ('certification', 'CERTIFICATIONS'),
+                         ('general', 'ROLE TERMS'),
+                         ('soft', 'SOFT SKILLS')):
+        terms = [k for k in keywords if k['type'] == group]
+        if not terms:
+            continue
+        rendered = ', '.join(
+            f'"{k["term"]}" (x{_expected_frequency(k["jd_count"])})' for k in terms
+        )
+        lines.append(f'{label}: {rendered}')
+
+    return (
+        'ATS KEYWORDS TO INCLUDE — use the exact wording, at roughly the frequency '
+        'shown in brackets, but ONLY where the original CV shows the candidate '
+        'genuinely has that skill:\n' + '\n'.join(lines) + '\n\n'
+    )
+
+
 def _build_user_prompt(cv_text, job_description, job_title, company):
     # Truncate inputs to bound token usage/cost.
     return (
         f'TARGET JOB TITLE: {job_title}\n'
         f'TARGET COMPANY: {company}\n\n'
+        f'{_keyword_brief(job_description)}'
         f'JOB DESCRIPTION:\n{(job_description or "")[:4000]}\n\n'
         f'ORIGINAL CV:\n{cv_text[:4000]}\n\n'
         'Rewrite the CV to best match this job, following the rules strictly.'
@@ -157,7 +224,11 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
     best attempt is returned anyway — with its true (lower) score, not a
     flattering one.
     """
-    from .ats_checker import check_cv_against_job
+    from .ats_checker import (
+        check_cv_against_job,
+        fabricated_metrics,
+        unsupported_claims,
+    )
 
     if target_score is None:
         target_score = getattr(settings, 'ATS_TARGET_SCORE', 90)
@@ -165,12 +236,31 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
         max_attempts = getattr(settings, 'ATS_MAX_TAILOR_ATTEMPTS', 2)
     max_attempts = max(1, int(max_attempts))
 
-    def score(text):
-        return check_cv_against_job(text, job_description, job_title, job_location)
+    def assess(text):
+        """Score a draft, and check it invented neither skills nor metrics."""
+        report = check_cv_against_job(text, job_description, job_title, job_location)
+        report['unsupported_claims'] = unsupported_claims(
+            cv_text, text, job_description
+        )
+        report['fabricated_metrics'] = fabricated_metrics(cv_text, text)
+        report['honest'] = not (
+            report['unsupported_claims'] or report['fabricated_metrics']
+        )
+        return report
+
+    def better(candidate, incumbent):
+        """A draft that invented anything never wins, however well it scores.
+
+        Score is only the tiebreak once both drafts are honest — otherwise the
+        loop would happily converge on the best-scoring fabrication, which is the
+        exact failure the loop exists to prevent.
+        """
+        if candidate[1]['honest'] != incumbent[1]['honest']:
+            return candidate[1]['honest']
+        return candidate[1]['overall_score'] > incumbent[1]['overall_score']
 
     tailored = tailor_cv_for_job(cv_text, job_description, job_title, company)
-    report = score(tailored)
-    best = (tailored, report)
+    best = (tailored, assess(tailored))
     attempts = 1
 
     # Without OpenAI there is nothing to iterate on — the "tailored" CV is the
@@ -178,7 +268,10 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
     if not _openai_configured():
         return best[0], best[1], attempts
 
-    while attempts < max_attempts and best[1]['overall_score'] < target_score:
+    def done():
+        return best[1]['overall_score'] >= target_score and best[1]['honest']
+
+    while attempts < max_attempts and not done():
         attempts += 1
         try:
             tailored = _retry_with_feedback(
@@ -188,18 +281,32 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
             logger.exception('ATS-guided retailoring failed; keeping best draft.')
             break
 
-        report = score(tailored)
+        report = assess(tailored)
         logger.info(
-            'ATS retailor attempt %s for "%s": %s -> %s',
+            'ATS retailor attempt %s for "%s": %s -> %s (invented skills: %s; '
+            'invented metrics: %s)',
             attempts, job_title, best[1]['overall_score'], report['overall_score'],
+            report['unsupported_claims'] or 'none',
+            report['fabricated_metrics'] or 'none',
         )
-        if report['overall_score'] > best[1]['overall_score']:
+        if better((tailored, report), best):
             best = (tailored, report)
 
-    if best[1]['overall_score'] < target_score:
+    if not best[1]['honest']:
+        # Every draft invented something. Keep the best one, but say so loudly:
+        # this CV must not go out claiming things the candidate cannot back up.
+        logger.warning(
+            'Tailored CV for "%s" still contains unverifiable content — skills: %s; '
+            'metrics: %s. Flagged for human review.',
+            job_title,
+            ', '.join(best[1]['unsupported_claims']) or 'none',
+            ', '.join(best[1]['fabricated_metrics']) or 'none',
+        )
+    elif best[1]['overall_score'] < target_score:
         logger.info(
             'Tailored CV for "%s" reached %s/100 after %s attempt(s), short of the '
-            '%s target.', job_title, best[1]['overall_score'], attempts, target_score,
+            '%s target — the candidate does not evidence the remaining keywords.',
+            job_title, best[1]['overall_score'], attempts, target_score,
         )
     return best[0], best[1], attempts
 
@@ -218,6 +325,36 @@ def _retry_with_feedback(cv_text, job_description, job_title, company,
         findings='\n'.join(f'- {f}' for f in findings[:8]),
         missing=', '.join(missing[:12]) or '(none)',
     )
+
+    invented_skills = report.get('unsupported_claims') or []
+    invented_metrics = report.get('fabricated_metrics') or []
+    if invented_skills or invented_metrics:
+        # Non-negotiable, and stated first: the previous draft made things up.
+        # Fixing that outranks the score, and the model is told so explicitly.
+        problems = []
+        if invented_skills:
+            problems.append(
+                'SKILLS the original CV contains no evidence for: '
+                + ', '.join(invented_skills)
+            )
+        if invented_metrics:
+            problems.append(
+                'NUMBERS that appear nowhere in the original CV: '
+                + ', '.join(invented_metrics)
+            )
+        feedback = (
+            'STOP. Your previous draft invented content the candidate cannot back '
+            'up:\n- ' + '\n- '.join(problems)
+            + '\n\nRemove every one of them — from the profile, the skills list and '
+            'the experience bullets. Do not substitute a synonym, and do not replace '
+            'an invented number with a different invented number: state the '
+            'achievement without a figure instead ("Optimised query performance", '
+            'not "Optimised query performance by 30%").\n\nIt is correct and expected '
+            'for the ATS score to fall as a result. A lower score is far better than '
+            'a CV that lies about what the candidate has done — the candidate is the '
+            'one who has to sit the interview.\n\n'
+            + feedback
+        )
 
     client = OpenAI(api_key=settings.OPENAI_API_KEY)
     response = client.chat.completions.create(

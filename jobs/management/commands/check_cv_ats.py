@@ -259,10 +259,16 @@ class Command(BaseCommand):
                           f'graduated: {p6["graduation_year"] or "-"}')
 
         # Phase 7
-        self._rule('PHASE 7  - SECTIONAL SCORES')
-        for section, value in report['sectional_scores'].items():
-            bar = '#' * (value // 5)
-            self.stdout.write(f'  {section.title():<12} {value:>3}/100  {bar}')
+        self._rule('CATEGORY BREAKDOWN')
+        for name, cat in report['categories'].items():
+            label = name.replace('_', ' ').title()
+            weight = f'{cat["weight"]:.0%}' if cat['weight'] else '   -'
+            bar = '#' * (cat['score'] // 5)
+            self.stdout.write(
+                f'  {label:<22} {cat["score"]:>3}/100  (weight {weight:>4})  {bar}'
+            )
+            for issue in cat.get('issues', [])[:3] + cat.get('density_issues', [])[:3]:
+                self.stdout.write(f'      - {issue}')
 
         self._print_recommendations(report['recommendations'])
         self.stdout.write('')
