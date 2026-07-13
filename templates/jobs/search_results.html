@@ -1,4 +1,5 @@
 {% extends 'base.html' %}
+{% load tz %}
 {% block title %}Search #{{ search_run.id }} results · Job Automation{% endblock %}
 
 {% block content %}
@@ -6,9 +7,10 @@
     <h1>Search #{{ search_run.id }} results</h1>
     <p class="muted">
         <strong>Status:</strong> {{ search_run.get_status_display }} &middot;
-        <strong>Run:</strong> {{ search_run.created_at|date:"d M Y, H:i" }} &middot;
+        <strong>Run:</strong> {{ search_run.created_at|localtime|date:"d M Y, h:i A" }} &middot;
         <strong>Profile:</strong> {% if search_run.cv %}{{ search_run.cv.display_name }}{% else %}—{% endif %} &middot;
-        <strong>Countries:</strong> {{ search_run.countries|join:", "|default:"—" }}
+        <strong>Location:</strong>
+        {% if search_run.city %}{{ search_run.city }}, {% endif %}{{ search_run.countries|join:", "|default:"—" }}
     </p>
     {% if search_run.error_message %}
         <p class="badge badge-red">{{ search_run.error_message }}</p>
@@ -22,14 +24,20 @@
 </div>
 
 <div class="card">
-    <h2>Matched jobs ({{ jobs|length }})</h2>
-    <p class="muted">
-        Showing jobs scoring <strong>{{ MATCH_THRESHOLD }} or above</strong>.
-        {% if hidden_count %}
-            {{ hidden_count }} of the {{ total_found }} jobs found scored below that and
-            are hidden — they are still stored, just not worth your time.
-        {% endif %}
-    </p>
+    <h2>Jobs found ({{ total_found }})</h2>
+
+    <div class="job-tabs" role="tablist">
+        <button type="button" class="job-tab active" role="tab" data-filter="all">
+            All Jobs <span class="badge badge-blue">{{ total_found }}</span>
+        </button>
+        <button type="button" class="job-tab" role="tab" data-filter="above">
+            Above {{ MATCH_THRESHOLD }}% <span class="badge badge-green">{{ above_count }}</span>
+        </button>
+        <button type="button" class="job-tab" role="tab" data-filter="below">
+            Below {{ MATCH_THRESHOLD }}% <span class="badge badge-red">{{ below_count }}</span>
+        </button>
+    </div>
+
     {% if ats_rejected_count %}
         <p class="muted">
             <span class="badge badge-red">{{ ats_rejected_count }} ATS Rejected</span>
@@ -38,7 +46,10 @@
         </p>
     {% endif %}
     {% if jobs %}
-        <div class="table-scroll">
+        <p class="muted" id="tab-empty" style="display:none;">
+            No jobs in this tab.
+        </p>
+        <div class="table-scroll" id="jobs-table">
             <table>
                 <thead>
                     <tr>
@@ -49,7 +60,7 @@
                 </thead>
                 <tbody>
                     {% for job in jobs %}
-                        <tr>
+                        <tr class="job-row" data-score="{{ job.match_score|default:0 }}">
                             <td>
                                 {% if job.match_score >= 75 %}<span class="badge badge-lg badge-green">{{ job.match_score }}</span>
                                 {% elif job.match_score >= 50 %}<span class="badge badge-lg badge-yellow">{{ job.match_score }}</span>
@@ -87,14 +98,50 @@
                 </tbody>
             </table>
         </div>
-    {% elif total_found %}
-        <p class="muted">
-            {{ total_found }} job{{ total_found|pluralize }} found, but none scored
-            {{ MATCH_THRESHOLD }} or above. Try widening your city or salary range,
-            or check that your CV is up to date.
-        </p>
     {% else %}
         <p class="muted">No jobs were found for this search.</p>
     {% endif %}
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+    // Client-side tab filtering: every job is already in the DOM, so switching
+    // tabs is instant and needs no round trip.
+    var threshold = {{ MATCH_THRESHOLD }};
+    var tabs = document.querySelectorAll('.job-tab');
+    var rows = document.querySelectorAll('.job-row');
+    var empty = document.getElementById('tab-empty');
+    var table = document.getElementById('jobs-table');
+    if (!tabs.length || !rows.length) { return; }
+
+    function apply(filter) {
+        var shown = 0;
+        rows.forEach(function (row) {
+            var score = parseInt(row.dataset.score, 10) || 0;
+            var show = filter === 'all'
+                || (filter === 'above' && score >= threshold)
+                || (filter === 'below' && score < threshold);
+            row.style.display = show ? '' : 'none';
+            if (show) { shown++; }
+        });
+        if (empty) { empty.style.display = shown ? 'none' : ''; }
+        if (table) { table.style.display = shown ? '' : 'none'; }
+    }
+
+    tabs.forEach(function (tab) {
+        tab.addEventListener('click', function () {
+            tabs.forEach(function (t) {
+                t.classList.remove('active');
+                t.setAttribute('aria-selected', 'false');
+            });
+            tab.classList.add('active');
+            tab.setAttribute('aria-selected', 'true');
+            apply(tab.dataset.filter);
+        });
+    });
+    apply('all');
+})();
+</script>
 {% endblock %}

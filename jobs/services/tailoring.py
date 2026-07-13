@@ -77,6 +77,20 @@ ONLY figures already present in the original CV.
 - Use the exact section headings given above, and no others.
 
 IMPORTANT RULES — THESE OVERRIDE THE ATS RULES ABOVE:
+
+THE FACTUAL RECORD IS FIXED. These are matters of fact, not presentation, and you \
+must copy them across EXACTLY as they appear in the original CV:
+- Education: every degree, qualification, subject, grade/classification, \
+university/institution name and year. Do not upgrade a 2:2 to a 2:1, do not change \
+the subject to match the job, do not swap the institution, do not add a degree the \
+candidate does not hold, and do not remove one.
+- Employment: every employer name, job title, and start/end date. Do not invent a \
+role, do not move a date to close a gap, do not silently drop a real role, and do \
+not re-title a role into something the candidate never held.
+- If the job asks for a qualification or experience the candidate does not have, \
+LEAVE THE GAP. A CV that scores 70 honestly is worth more than one that scores 95 \
+by lying — the second one fails at interview, and the candidate pays for it.
+
 - Do NOT invent any new roles, employers, dates, skills, achievements, metrics or \
 certifications. Do NOT fabricate numbers or percentages.
 - Only use a keyword if the ORIGINAL CV shows the candidate genuinely has that \
@@ -288,6 +302,7 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
     flattering one.
     """
     from .ats_checker import (
+        altered_facts,
         check_cv_against_job,
         claim_evidence,
         claims_needing_review,
@@ -336,8 +351,13 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
             for term in review
         ]
         report['fabricated_metrics'] = fabricated_metrics(cv_text, text)
+        # Degrees, grades, institutions and dates are facts, not presentation.
+        # Any change to them — in either direction — invalidates the draft.
+        report['altered_facts'] = altered_facts(cv_text, text)
         report['honest'] = not (
-            report['unsupported_claims'] or report['fabricated_metrics']
+            report['unsupported_claims']
+            or report['fabricated_metrics']
+            or report['altered_facts']
         )
         return report
 
@@ -398,6 +418,19 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
         if better((tailored, report), best):
             best = (tailored, report)
 
+    if best[1].get('altered_facts'):
+        # Nothing is worth shipping a CV that misstates a degree or an employer.
+        # Fall back to the original: it scores worse and it is true.
+        logger.error(
+            'Every tailored draft for "%s" altered the factual record (%s). '
+            'Falling back to the untailored CV.',
+            job_title, '; '.join(best[1]['altered_facts']),
+        )
+        original_report = assess(cv_text)
+        original_report['fell_back_to_original'] = True
+        original_report['altered_facts_rejected'] = best[1]['altered_facts']
+        return cv_text, original_report, attempts
+
     if not best[1]['honest']:
         # Every draft invented something. Keep the best one, but say so loudly:
         # this CV must not go out claiming things the candidate cannot back up.
@@ -441,10 +474,17 @@ def _retry_with_feedback(cv_text, job_description, job_title, company,
 
     invented_skills = report.get('unsupported_claims') or []
     invented_metrics = report.get('fabricated_metrics') or []
-    if invented_skills or invented_metrics:
+    changed_facts = report.get('altered_facts') or []
+    if invented_skills or invented_metrics or changed_facts:
         # Non-negotiable, and stated first: the previous draft made things up.
         # Fixing that outranks the score, and the model is told so explicitly.
         problems = []
+        if changed_facts:
+            problems.append(
+                'The FACTUAL RECORD was changed. Restore the education and '
+                'employment history to exactly what the original CV says — '
+                + '; '.join(changed_facts)
+            )
         if invented_skills:
             problems.append(
                 'SKILLS the original CV contains no evidence for: '

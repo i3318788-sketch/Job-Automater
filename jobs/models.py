@@ -129,6 +129,10 @@ class SearchRun(models.Model):
     )
     # Percentage of jobs processed (0-100), updated as the async task runs.
     progress = models.PositiveIntegerField(default=0)
+    # When the worker actually picked the run up. created_at is when it was
+    # queued, which can be much earlier — extrapolating an ETA from that would
+    # inflate the estimate by however long the job sat in the queue.
+    started_at = models.DateTimeField(null=True, blank=True)
     # Populated with the error detail when status is FAILED.
     error_message = models.TextField(blank=True)
 
@@ -137,6 +141,27 @@ class SearchRun(models.Model):
 
     def __str__(self):
         return f'SearchRun #{self.pk} for {self.user.username} ({self.status})'
+
+    def eta_seconds(self):
+        """Estimated seconds remaining, or None when there is nothing to go on.
+
+        Extrapolates from the work actually done so far: elapsed / fraction-done
+        gives the projected total, minus elapsed. Returns None below ~5% progress,
+        where the sample is far too small to extrapolate from and the estimate
+        would swing wildly — better to show "estimating…" than a confident lie.
+        """
+        if self.status != self.STATUS_RUNNING or not self.started_at:
+            return None
+        if self.progress < 5 or self.progress >= 100:
+            return None
+
+        from django.utils import timezone
+
+        elapsed = (timezone.now() - self.started_at).total_seconds()
+        if elapsed <= 0:
+            return None
+        projected_total = elapsed / (self.progress / 100.0)
+        return max(0, int(round(projected_total - elapsed)))
 
 
 class Job(models.Model):

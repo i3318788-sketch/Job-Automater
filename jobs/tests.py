@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 import json
 import io
 import os
@@ -215,6 +216,30 @@ def _make_cv_for(user, name='Test Profile'):
         original_file=SimpleUploadedFile('cv.docx', build_docx_bytes()),
         parsed_text='Python Django engineer',
     )
+
+
+def fake_score(score=85, reason='Strong match', by_description=None):
+    """Stand-in for tasks._score_job, which scores one job against the real CV.
+
+    ``by_description`` maps a substring of the job description to a score, so a
+    test can give each job a distinct score and prove the results are not mixed
+    up across worker threads.
+    """
+    def _score(job_data, cv_text, use_openai):
+        value, why = score, reason
+        if by_description:
+            for needle, mapped in by_description.items():
+                if needle in (job_data.get('description') or ''):
+                    value, why = mapped
+                    break
+        return {
+            'position': job_data['position'],
+            'contract': None,
+            'coverage': {},
+            'score': value,
+            'reason': why,
+        }
+    return _score
 
 
 TWO_RAW_JOBS = [
@@ -437,12 +462,12 @@ class RunJobSearchTests(TestCase):
         )
 
     @mock.patch('jobs.tasks.GoogleSheetsLogger')
-    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks._score_job')
     @mock.patch('jobs.tasks.search_jobs')
     def test_workflow_creates_jobs_and_completes(self, mock_search, mock_score, mock_sheet):
         from jobs.tasks import run_job_search
         mock_search.return_value = TWO_RAW_JOBS
-        mock_score.return_value = {'score': 85, 'reason': 'Strong match'}
+        mock_score.side_effect = fake_score(85, 'Strong match')
 
         result = run_job_search(self.run.pk)
         self.run.refresh_from_db()
@@ -456,10 +481,15 @@ class RunJobSearchTests(TestCase):
         self.assertEqual(jobs['Backend Engineer'].sponsorship_flag, 'SPONSORED')
         self.assertTrue(jobs['Backend Engineer'].tailored_pdf)
         self.assertTrue(jobs['Backend Engineer'].processed)
-        self.assertEqual(jobs['Junior Dev'].match_score, 0)
-        self.assertEqual(jobs['Junior Dev'].match_reason, 'Salary below minimum')
+
+        # Every job is scored, including one outside the salary range: its skills
+        # match is a real fact about the CV, and reporting it as 0 would be a lie
+        # about the fit. It is simply not pursued, and the reason says why.
+        self.assertEqual(jobs['Junior Dev'].match_score, 85)
+        self.assertIn('Salary below minimum', jobs['Junior Dev'].match_reason)
         self.assertFalse(jobs['Junior Dev'].tailored_pdf)
-        self.assertEqual(mock_score.call_count, 1)
+
+        self.assertEqual(mock_score.call_count, 2)  # every job scored, not just one
         # Every job is logged to the candidate's Google Sheets tab.
         self.assertEqual(mock_sheet.return_value.log_job.call_count, 2)
 
@@ -478,11 +508,20 @@ class RunJobSearchTests(TestCase):
 
     @override_settings(OPENAI_MAX_SCORED_JOBS=1)
     @mock.patch('jobs.tasks.GoogleSheetsLogger')
-    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks._score_job')
     @mock.patch('jobs.tasks.search_jobs')
-    def test_scoring_cap_respected(self, mock_search, mock_score, mock_sheet):
+    def test_cap_limits_precision_not_whether_a_job_is_scored(
+        self, mock_search, mock_score, mock_sheet
+    ):
+        """The cost cap must never leave a job with a placeholder score.
+
+        It used to: everything past OPENAI_MAX_SCORED_JOBS was stored with a
+        hardcoded 0 and "Not scored", which made the scores meaningless and buried
+        good jobs. The cap now decides only HOW a job is scored — model-extracted
+        contract for the best-ranked, deterministic contract for the rest — not
+        WHETHER it is scored.
+        """
         from jobs.tasks import run_job_search
-        # Two salary-qualifying jobs, but cap allows scoring only one.
         mock_search.return_value = [
             {'title': 'A', 'company': 'X', 'location': 'London', 'salary': '£60,000',
              'description': 'Role A', 'applyLink': '', 'datePosted': '',
@@ -491,12 +530,21 @@ class RunJobSearchTests(TestCase):
              'description': 'Role B', 'applyLink': '', 'datePosted': '',
              'employmentType': '', 'seniorityLevel': ''},
         ]
-        mock_score.return_value = {'score': 50, 'reason': 'ok'}
+        mock_score.side_effect = fake_score(50, 'ok')
 
         run_job_search(self.run.pk)
-        self.assertEqual(mock_score.call_count, 1)  # capped at 1
-        reasons = [j.match_reason for j in self.run.jobs.all()]
-        self.assertIn('Not scored (scoring limit reached)', reasons)
+
+        # Both jobs scored...
+        self.assertEqual(mock_score.call_count, 2)
+        jobs = list(self.run.jobs.all())
+        self.assertEqual(len(jobs), 2)
+        for job in jobs:
+            self.assertEqual(job.match_score, 50)
+            self.assertNotIn('Not scored', job.match_reason)
+
+        # ...but only one of them with a model-extracted contract.
+        precise = [call.args[2] for call in mock_score.call_args_list]
+        self.assertEqual(sorted(precise), [False, True])
 
 
 @override_settings(MEDIA_ROOT=_TEST_MEDIA, CELERY_TASK_ALWAYS_EAGER=True, OPENAI_API_KEY='')
@@ -509,12 +557,12 @@ class CeleryTaskTests(TestCase):
         )
 
     @mock.patch('jobs.tasks.GoogleSheetsLogger')
-    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks._score_job')
     @mock.patch('jobs.tasks.search_jobs')
     def test_task_runs_workflow(self, mock_search, mock_score, mock_sheet):
         from jobs.tasks import process_job_search
         mock_search.return_value = [TWO_RAW_JOBS[0]]
-        mock_score.return_value = {'score': 80, 'reason': 'ok'}
+        mock_score.side_effect = fake_score(80, 'ok')
 
         # Call the task function directly (equivalent to eager execution).
         result = process_job_search.run(self.run.pk)
@@ -1458,6 +1506,28 @@ BSc Computing | Leeds | 2015 - 2018
         self.assertEqual(set(terms[:2]), {'dbt', 'snowflake'})  # must-haves lead
         self.assertIn('dagster', terms)
 
+    def test_absent_categories_do_not_award_free_marks(self):
+        """A category with nothing to measure must not score 100.
+
+        It used to: an empty must_have (25% weight) and no acronyms (10%) handed
+        out 35 free points, which floored an unrelated job at ~45/100 against any
+        well-formatted CV. The weight of an inapplicable category is now
+        redistributed across the ones that actually apply.
+        """
+        from jobs.services.ats_checker import score_cv_against_contract
+        unrelated = {
+            'job_title': 'pastry chef',
+            'title_variants': [],
+            'hard_skills': ['baking', 'patisserie', 'cake decoration'],
+            'acronyms': [],       # nothing to measure
+            'soft_skills': [],
+            'must_have': [],      # nothing to measure
+        }
+        result = score_cv_against_contract(ATS_GOOD_CV, unrelated)
+        self.assertLess(result['score'], 25, 'unrelated job scored too high')
+        self.assertIsNone(result['breakdown']['must_have'])
+        self.assertIsNone(result['breakdown']['acronyms'])
+
     def test_scoring_never_raises_on_junk(self):
         from jobs.services.ats_checker import score_cv_against_contract
         self.assertEqual(score_cv_against_contract('', MODERN_CONTRACT)['score'], 0)
@@ -1851,13 +1921,13 @@ class ATSWorkflowIntegrationTests(TestCase):
         return job
 
     @mock.patch('jobs.tasks.GoogleSheetsLogger')
-    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks._score_job')
     @mock.patch('jobs.tasks.search_jobs')
     def test_ats_report_generated_for_tailored_job(self, mock_search, mock_score, _sheets):
         from jobs.models import ATSReport
         from jobs.tasks import run_job_search
         mock_search.return_value = [self._raw_job()]
-        mock_score.return_value = {'score': 90, 'reason': 'Strong match'}
+        mock_score.side_effect = fake_score(90, 'Strong match')
 
         run_job_search(self.run.pk)
 
@@ -1869,7 +1939,7 @@ class ATSWorkflowIntegrationTests(TestCase):
         self.assertIn('phase3_keyword', report.report_data['phases'])
 
     @mock.patch('jobs.tasks.GoogleSheetsLogger')
-    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks._score_job')
     @mock.patch('jobs.tasks.search_jobs')
     def test_knockout_marks_job_rejected_and_skips_tailoring(
         self, mock_search, mock_score, _sheets
@@ -1879,7 +1949,7 @@ class ATSWorkflowIntegrationTests(TestCase):
         mock_search.return_value = [self._raw_job(
             description=ATS_JOB_DESCRIPTION + '\nA valid PMP certification is required.'
         )]
-        mock_score.return_value = {'score': 95, 'reason': 'Strong match'}
+        mock_score.side_effect = fake_score(95, 'Strong match')
 
         run_job_search(self.run.pk)
 
@@ -1891,7 +1961,7 @@ class ATSWorkflowIntegrationTests(TestCase):
         self.assertIn('ATS Rejected', job.match_reason)
 
     @mock.patch('jobs.tasks.GoogleSheetsLogger')
-    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks._score_job')
     @mock.patch('jobs.tasks.search_jobs')
     def test_badly_formatted_cv_does_not_reject_every_job(
         self, mock_search, mock_score, _sheets
@@ -1906,7 +1976,7 @@ class ATSWorkflowIntegrationTests(TestCase):
         self.cv.parsed_text = 'Python Django engineer, London UK. BSc Computer Science.'
         self.cv.save()
         mock_search.return_value = [self._raw_job()]
-        mock_score.return_value = {'score': 90, 'reason': 'Strong match'}
+        mock_score.side_effect = fake_score(90, 'Strong match')
 
         run_job_search(self.run.pk)
 
@@ -1915,7 +1985,7 @@ class ATSWorkflowIntegrationTests(TestCase):
         self.assertTrue(job.tailored_pdf)  # still tailored despite poor formatting
 
     @mock.patch('jobs.tasks.GoogleSheetsLogger')
-    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks._score_job')
     @mock.patch('jobs.tasks.search_jobs')
     def test_duplicate_application_to_same_company_is_flagged(
         self, mock_search, mock_score, _sheets
@@ -1928,7 +1998,7 @@ class ATSWorkflowIntegrationTests(TestCase):
             self._raw_job(title='Senior Backend Engineer'),
             self._raw_job(title='Backend Engineer', applyLink='https://x/2'),
         ]
-        mock_score.return_value = {'score': 90, 'reason': 'Strong match'}
+        mock_score.side_effect = fake_score(90, 'Strong match')
 
         run_job_search(self.run.pk)
 
@@ -1940,12 +2010,12 @@ class ATSWorkflowIntegrationTests(TestCase):
 
     @override_settings(ATS_STRICT_MODE=True, ATS_THRESHOLD=100)
     @mock.patch('jobs.tasks.GoogleSheetsLogger')
-    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks._score_job')
     @mock.patch('jobs.tasks.search_jobs')
     def test_strict_mode_rejects_below_threshold(self, mock_search, mock_score, _sheets):
         from jobs.tasks import run_job_search
         mock_search.return_value = [self._raw_job()]
-        mock_score.return_value = {'score': 90, 'reason': 'Strong match'}
+        mock_score.side_effect = fake_score(90, 'Strong match')
 
         run_job_search(self.run.pk)
         job = self.run.jobs.get()
@@ -1956,12 +2026,12 @@ class ATSWorkflowIntegrationTests(TestCase):
 
     @override_settings(ATS_STRICT_MODE=False, ATS_THRESHOLD=100)
     @mock.patch('jobs.tasks.GoogleSheetsLogger')
-    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks._score_job')
     @mock.patch('jobs.tasks.search_jobs')
     def test_lenient_mode_only_flags_below_threshold(self, mock_search, mock_score, _s):
         from jobs.tasks import run_job_search
         mock_search.return_value = [self._raw_job()]
-        mock_score.return_value = {'score': 90, 'reason': 'Strong match'}
+        mock_score.side_effect = fake_score(90, 'Strong match')
 
         run_job_search(self.run.pk)
         job = self.run.jobs.get()
@@ -2129,11 +2199,23 @@ class MatchThresholdDisplayTests(TestCase):
             location='Leeds', match_score=40, application_link='https://x/2',
         )
 
-    def test_results_page_hides_sub_threshold_jobs(self):
+    def test_results_page_shows_every_job_across_three_tabs(self):
+        """The results page shows ALL jobs; the tabs filter, they don't hide."""
         response = self.client.get(reverse('search_results', args=[self.run.pk]))
         self.assertContains(response, 'Strong Match')
-        self.assertNotContains(response, 'Weak Match')
-        self.assertEqual(response.context['hidden_count'], 1)
+        self.assertContains(response, 'Weak Match')
+        self.assertEqual(response.context['total_found'], 2)
+        self.assertEqual(response.context['above_count'], 1)
+        self.assertEqual(response.context['below_count'], 1)
+
+    def test_every_row_carries_the_score_the_tabs_filter_on(self):
+        response = self.client.get(reverse('search_results', args=[self.run.pk]))
+        content = response.content.decode()
+        # The tabs filter client-side on data-score, so it must be on every row.
+        self.assertIn('data-score="88"', content)
+        self.assertIn('data-score="40"', content)
+        for tab in ('data-filter="all"', 'data-filter="above"', 'data-filter="below"'):
+            self.assertIn(tab, content)
 
     def test_weak_jobs_are_still_stored_not_deleted(self):
         self.assertEqual(Job.objects.filter(search_run=self.run).count(), 2)
@@ -2161,12 +2243,12 @@ class SearchProgressPhaseTests(TestCase):
         )
 
     @mock.patch('jobs.tasks.GoogleSheetsLogger')
-    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks._score_job')
     @mock.patch('jobs.tasks.search_jobs')
     def test_progress_moves_through_the_phases(self, mock_search, mock_score, _sheets):
         from jobs.tasks import run_job_search
         mock_search.return_value = TWO_RAW_JOBS
-        mock_score.return_value = {'score': 85, 'reason': 'Strong match'}
+        mock_score.side_effect = fake_score(85, 'Strong match')
 
         seen = []
         original = SearchRun.save
@@ -2188,27 +2270,261 @@ class SearchProgressPhaseTests(TestCase):
         self.assertEqual(seen[-1], 100)
 
     @mock.patch('jobs.tasks.GoogleSheetsLogger')
-    @mock.patch('jobs.tasks.compute_match_score')
+    @mock.patch('jobs.tasks._score_job')
     @mock.patch('jobs.tasks.search_jobs')
     def test_parallel_scoring_preserves_per_job_results(self, mock_search, mock_score, _s):
         """Concurrency must not shuffle which score belongs to which job."""
         from jobs.tasks import run_job_search
 
         mock_search.return_value = TWO_RAW_JOBS
-
-        def score_by_description(cv_text, description):
-            # Distinct score per job, so a mix-up would be visible.
-            return ({'score': 90, 'reason': 'backend'} if 'Django' in description
-                    else {'score': 80, 'reason': 'entry'})
-
-        mock_score.side_effect = score_by_description
+        # Distinct score per job, so a mix-up across threads would be visible.
+        mock_score.side_effect = fake_score(by_description={
+            'Django': (90, 'backend'),
+            'Entry role': (62, 'entry'),
+        })
         run_job_search(self.run.pk)
 
         jobs = {j.title: j for j in self.run.jobs.all()}
         self.assertEqual(jobs['Backend Engineer'].match_score, 90)
         self.assertEqual(jobs['Backend Engineer'].match_reason, 'backend')
-        # The second job is below the salary minimum, so it is never scored.
-        self.assertEqual(jobs['Junior Dev'].match_reason, 'Salary below minimum')
+        # Scored on its merits even though its salary rules it out; the reason
+        # carries the salary note in front of the real explanation.
+        self.assertEqual(jobs['Junior Dev'].match_score, 62)
+        self.assertIn('Salary below minimum', jobs['Junior Dev'].match_reason)
+        self.assertIn('entry', jobs['Junior Dev'].match_reason)
+
+
+@override_settings(MEDIA_ROOT=_TEST_MEDIA, OPENAI_API_KEY='')
+class ScoreVarianceTests(TestCase):
+    """Scores must be real and per-job, not a constant."""
+
+    def setUp(self):
+        from jobs.models import CV as CVModel
+        self.user = User.objects.create_user(username='var', password='pw12345!')
+        self.cv = CVModel.objects.create(
+            user=self.user, name='Priya',
+            original_file=SimpleUploadedFile('cv.docx', build_docx_bytes()),
+            parsed_text=ATS_GOOD_CV,
+            parsed_data={'skills': ['python', 'django', 'aws', 'docker'],
+                         'job_titles': ['Backend Engineer']},
+        )
+        self.run = SearchRun.objects.create(
+            user=self.user, cv=self.cv, countries=['United Kingdom'],
+            status=SearchRun.STATUS_PENDING,
+        )
+
+    def _raw(self, title, description):
+        return {
+            'title': title, 'company': 'Acme', 'location': 'London',
+            'salary': '£70,000', 'description': description,
+            'applyLink': 'https://x/1', 'datePosted': '',
+            'employmentType': '', 'seniorityLevel': '',
+        }
+
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_scores_vary_with_the_job_description(self, mock_search, _sheets):
+        """Real scoring, no mocking of the scorer: different JDs, different scores."""
+        from jobs.tasks import run_job_search
+        mock_search.return_value = [
+            # Close to the CV (Python/Django/AWS/Docker/PostgreSQL).
+            self._raw('Backend Engineer', ATS_JOB_DESCRIPTION),
+            # Nothing to do with it.
+            self._raw('Pastry Chef', 'We need a pastry chef. Baking, patisserie, '
+                                     'cake decoration and food hygiene essential.'),
+            # Partial overlap.
+            self._raw('Data Analyst', 'Python and SQL required. Tableau, Excel, '
+                                      'statistics and data analysis.'),
+        ]
+
+        run_job_search(self.run.pk)
+
+        scores = {j.title: j.match_score for j in self.run.jobs.all()}
+        # Every job has a real score — none is a placeholder 0.
+        self.assertEqual(len(scores), 3)
+        self.assertTrue(all(s is not None for s in scores.values()))
+        # And they genuinely differ: the aligned job beats the unrelated one.
+        self.assertGreater(scores['Backend Engineer'], scores['Pastry Chef'])
+        self.assertGreater(len(set(scores.values())), 1, f'constant scores: {scores}')
+
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_score_measures_the_original_cv_not_the_tailored_one(
+        self, mock_search, _sheets
+    ):
+        """match_score answers "does this candidate already fit?"
+
+        It must be computed against the ORIGINAL CV. The tailored CV's coverage is
+        a different question, and it lives in ats_score.
+        """
+        from jobs.services.ats_checker import score_cv_against_contract
+        from jobs.services.job_keywords import extract_job_keywords
+        from jobs.tasks import run_job_search
+
+        mock_search.return_value = [self._raw('Backend Engineer', ATS_JOB_DESCRIPTION)]
+        run_job_search(self.run.pk)
+
+        job = self.run.jobs.get()
+        expected = score_cv_against_contract(
+            self.cv.parsed_text,
+            extract_job_keywords(ATS_JOB_DESCRIPTION, 'Backend Engineer'),
+        )['score']
+        self.assertEqual(job.match_score, expected)
+
+
+class FactIntegrityTests(TestCase):
+    """Education and employment are facts. Tailoring may not touch them."""
+
+    ORIGINAL = """JANE DOE
+PROFESSIONAL EXPERIENCE
+Analyst | Beta Corp | Leeds
+Jan 2019 - Dec 2021
+
+EDUCATION
+BSc Mathematics | University of Leeds | 2015 - 2018
+Lower Second Class (2:2)
+"""
+
+    def test_upgraded_grade_is_caught(self):
+        from jobs.services.ats_checker import altered_facts
+        tailored = self.ORIGINAL.replace('Lower Second Class (2:2)',
+                                         'Upper Second Class (2:1)')
+        problems = altered_facts(self.ORIGINAL, tailored)
+        self.assertTrue(problems)
+        self.assertTrue(any('2:1' in p and 'invented' in p for p in problems))
+        self.assertTrue(any('2:2' in p and 'removed' in p for p in problems))
+
+    def test_invented_degree_is_caught(self):
+        from jobs.services.ats_checker import altered_facts
+        tailored = self.ORIGINAL + '\nMSc Data Science | Imperial College | 2019\n'
+        problems = altered_facts(self.ORIGINAL, tailored)
+        self.assertTrue(any("Master's" in p for p in problems))
+
+    def test_swapped_university_is_caught(self):
+        from jobs.services.ats_checker import altered_facts
+        tailored = self.ORIGINAL.replace('University of Leeds',
+                                         'University of Cambridge')
+        problems = altered_facts(self.ORIGINAL, tailored)
+        self.assertTrue(any('cambridge' in p.lower() for p in problems))
+        self.assertTrue(any('leeds' in p.lower() and 'removed' in p for p in problems))
+
+    def test_moved_date_is_caught(self):
+        from jobs.services.ats_checker import altered_facts
+        tailored = self.ORIGINAL.replace('Jan 2019', 'Jan 2017')  # closing a gap
+        problems = altered_facts(self.ORIGINAL, tailored)
+        self.assertTrue(any('2017' in p for p in problems))
+
+    def test_deleted_role_is_caught(self):
+        """Dropping a real role is a misrepresentation by omission."""
+        from jobs.services.ats_checker import altered_facts
+        tailored = self.ORIGINAL.replace('Jan 2019 - Dec 2021', '')
+        problems = altered_facts(self.ORIGINAL, tailored)
+        self.assertTrue(any('removed' in p for p in problems))
+
+    def test_honest_rewording_is_not_flagged(self):
+        from jobs.services.ats_checker import altered_facts
+        tailored = self.ORIGINAL.replace(
+            'Analyst | Beta Corp | Leeds', 'Data Analyst | Beta Corp | Leeds',
+        ) + '\nKEY SKILLS\n- Python\n'
+        # Titles may be re-emphasised; the factual record is untouched.
+        self.assertEqual(altered_facts(self.ORIGINAL, tailored), [])
+
+    @override_settings(OPENAI_API_KEY='sk-test', ATS_MAX_TAILOR_ATTEMPTS=2)
+    @mock.patch('jobs.services.tailoring._retry_with_feedback')
+    @mock.patch('jobs.services.tailoring.tailor_cv_for_job')
+    def test_a_draft_that_alters_facts_never_ships(self, mock_tailor, mock_retry):
+        """If every draft misstates the record, fall back to the untailored CV.
+
+        A CV that lies about a degree is worse than one that scores badly.
+        """
+        from jobs.services.tailoring import tailor_cv_for_job_with_ats
+        liar = self.ORIGINAL.replace('Lower Second Class (2:2)', 'First Class')
+        mock_tailor.return_value = liar
+        mock_retry.return_value = liar
+
+        text, report, _attempts = tailor_cv_for_job_with_ats(
+            self.ORIGINAL, 'Python role', 'Analyst', 'Acme',
+        )
+        self.assertEqual(text, self.ORIGINAL)  # fell back to the truth
+        self.assertTrue(report['fell_back_to_original'])
+        self.assertTrue(report['altered_facts_rejected'])
+
+
+@override_settings(MEDIA_ROOT=_TEST_MEDIA)
+class EtaAndTimestampTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='eta', password='pw12345!')
+        self.client.login(username='eta', password='pw12345!')
+
+    def _run(self, **kwargs):
+        return SearchRun.objects.create(user=self.user, **kwargs)
+
+    def test_eta_extrapolates_from_work_done(self):
+        from django.utils import timezone
+        run = self._run(
+            status=SearchRun.STATUS_RUNNING, progress=25,
+            started_at=timezone.now() - timedelta(seconds=60),
+        )
+        # 60s bought 25% -> ~240s total -> ~180s remaining.
+        eta = run.eta_seconds()
+        self.assertIsNotNone(eta)
+        self.assertAlmostEqual(eta, 180, delta=10)
+
+    def test_no_eta_before_there_is_anything_to_extrapolate_from(self):
+        from django.utils import timezone
+        run = self._run(
+            status=SearchRun.STATUS_RUNNING, progress=2,
+            started_at=timezone.now() - timedelta(seconds=5),
+        )
+        # Too early to guess: a confident wrong number is worse than "estimating".
+        self.assertIsNone(run.eta_seconds())
+
+    def test_no_eta_when_not_running(self):
+        from django.utils import timezone
+        run = self._run(status=SearchRun.STATUS_COMPLETED, progress=100,
+                        started_at=timezone.now())
+        self.assertIsNone(run.eta_seconds())
+
+    def test_status_endpoint_exposes_live_progress_phase_and_eta(self):
+        from django.utils import timezone
+        run = self._run(
+            status=SearchRun.STATUS_RUNNING, progress=40, total_jobs=10,
+            started_at=timezone.now() - timedelta(seconds=40),
+        )
+        data = self.client.get(reverse('search_status', args=[run.pk])).json()
+        self.assertEqual(data['progress'], 40)
+        self.assertEqual(data['phase'], 'Scoring against your CV')
+        self.assertIsNotNone(data['eta_seconds'])
+        self.assertIn('minute', data['eta_display'])
+
+    def test_eta_display_says_estimating_when_unknown(self):
+        run = self._run(status=SearchRun.STATUS_RUNNING, progress=1)
+        data = self.client.get(reverse('search_status', args=[run.pk])).json()
+        self.assertIsNone(data['eta_seconds'])
+        self.assertEqual(data['eta_display'], 'Estimating…')
+
+    def test_search_run_timestamp_renders_in_local_time_12_hour(self):
+        """The list showed UTC in 24-hour format, so BST times were an hour out."""
+        import zoneinfo
+        from django.utils import timezone
+
+        # The Search Runs table only renders once the user has a CV profile.
+        cv = _make_cv_for(self.user)
+        # 15:45 UTC on a summer's day = 4:45 PM in London (BST).
+        when = datetime(2026, 7, 12, 15, 45, tzinfo=zoneinfo.ZoneInfo('UTC'))
+        run = self._run(status=SearchRun.STATUS_COMPLETED, cv=cv)
+        SearchRun.objects.filter(pk=run.pk).update(created_at=when)
+
+        with override_settings(TIME_ZONE='Europe/London'):
+            timezone.activate('Europe/London')
+            try:
+                response = self.client.get(reverse('dashboard'))
+            finally:
+                timezone.deactivate()
+
+        content = response.content.decode()
+        self.assertIn('12 Jul 2026, 04:45 PM', content)
+        self.assertNotIn('15:45', content)  # not raw UTC, not 24-hour
 
 
 class ProfilePageTests(TestCase):

@@ -13,10 +13,15 @@ from celery import shared_task
 from django.conf import settings
 from django.core.files import File
 from django.core.mail import send_mail
+from django.utils import timezone
 
 from .models import ATSReport, CV, Job, SearchRun
 from .services.apify_service import ApifyConfigError, ApifySearchError, search_jobs
-from .services.ats_checker import ATSChecker, extract_job_requirements
+from .services.ats_checker import (
+    ATSChecker,
+    extract_job_requirements,
+    score_cv_against_contract,
+)
 from .services.google_sheets import GoogleSheetsLogger
 from .services.job_keywords import (
     all_contract_terms,
@@ -30,11 +35,7 @@ from .services.keyword_extractor import (
     missing_skills,
     prescore_job,
 )
-from .services.matching import (
-    compute_match_score,
-    detect_sponsorship,
-    salary_within_range,
-)
+from .services.matching import detect_sponsorship, salary_within_range
 from .services.pdf_generator import build_pdf_filename, generate_tailored_pdf
 from .services.tailoring import tailor_cv_for_job_with_ats
 
@@ -129,7 +130,9 @@ def _build_tailored_cv(job_data, cv_text, candidate_name):
     """
     payload = {'job_id': job_data['id'], 'error': None}
     try:
-        contract = extract_job_keywords(job_data['description'], job_data['title'])
+        contract = job_data.get('contract') or extract_job_keywords(
+            job_data['description'], job_data['title'],
+        )
         tailored, report, attempts = tailor_cv_for_job_with_ats(
             cv_text, job_data['description'], job_data['title'], job_data['company'],
             job_data['location'], contract=contract,
@@ -261,13 +264,55 @@ def _tailor_workers():
     return max(1, min(8, getattr(settings, 'SEARCH_TAILORING_WORKERS', 4)))
 
 
-def _score_job(cv_text, description):
-    """One OpenAI match call. Runs on a worker thread: no DB, no model instances."""
+def _match_reason(coverage, contract):
+    """A one-line explanation of a match score, from the coverage that produced it."""
+    hard = contract.get('hard_skills') or []
+    if not hard:
+        return 'No screenable skills could be mined from this job description.'
+
+    found = len(coverage.get('found_hard') or [])
+    missing = coverage.get('missing_hard') or []
+    must_missing = coverage.get('missing_must') or []
+
+    parts = [f'Covers {found}/{len(hard)} of the skills this job asks for']
+    if must_missing:
+        parts.append('missing must-haves: ' + ', '.join(must_missing[:4]))
+    elif missing:
+        parts.append('missing: ' + ', '.join(missing[:4]))
+    if coverage.get('title_ok'):
+        parts.append('job title matches')
+    return '. '.join(parts) + '.'
+
+
+def _score_job(job_data, cv_text, use_openai):
+    """Score ONE job against the candidate's real CV. Runs on a worker thread.
+
+    The score is the CV's coverage of this job's own keyword contract, so it is
+    genuinely per-job and varies with the advert. It is measured against the
+    ORIGINAL CV, never the tailored one: the question this answers is "how well
+    does this candidate already fit this job", which is what decides whether the
+    job is worth pursuing at all. (The tailored CV's coverage is a different
+    number, stored separately as ats_score.)
+
+    Touches no DB and no model instance, so it is safe to run concurrently.
+    """
+    result = {'position': job_data['position'], 'contract': None,
+              'score': 0, 'reason': 'Unable to compute'}
     try:
-        return compute_match_score(cv_text, description)
+        contract = extract_job_keywords(
+            job_data['description'], job_data['title'], use_openai=use_openai,
+        )
+        coverage = score_cv_against_contract(cv_text, contract)
+        result.update({
+            'contract': contract,
+            'coverage': coverage,
+            'score': coverage['score'],
+            'reason': _match_reason(coverage, contract),
+        })
     except Exception as exc:  # pragma: no cover - defensive
-        logger.exception('Match scoring failed')
-        return {'score': 0, 'reason': f'Unable to compute: {exc}'}
+        logger.exception('Match scoring failed for job at %s', job_data['position'])
+        result['reason'] = f'Unable to compute: {exc}'
+    return result
 
 
 def run_job_search(search_run_id):
@@ -280,7 +325,12 @@ def run_job_search(search_run_id):
     search_run.status = SearchRun.STATUS_RUNNING
     search_run.progress = 0
     search_run.error_message = ''
-    search_run.save(update_fields=['status', 'progress', 'error_message'])
+    # Stamped when the worker picks the run up, not when it was queued — the ETA
+    # is extrapolated from this, and queue time is not work time.
+    search_run.started_at = timezone.now()
+    search_run.save(
+        update_fields=['status', 'progress', 'error_message', 'started_at'],
+    )
 
     # Prefer the CV the search was started for; fall back to the newest one.
     cv = search_run.cv or CV.objects.filter(user=search_run.user).order_by('-id').first()
@@ -340,6 +390,11 @@ def run_job_search(search_run_id):
             'can_prescore': bool(cv_skills) and bool(job_skills),
         }
 
+    # Every job gets a real, per-job score. The pre-rank no longer decides WHETHER
+    # a job is scored — only how precisely: the best-ranked jobs get a
+    # model-extracted keyword contract, the long tail gets the deterministic one.
+    # Previously everything past the cap was stored with a hardcoded 0, which made
+    # the scores meaningless and hid good jobs at the bottom of the list.
     eligible = [
         index for index, data in prescores.items()
         if salary_within_range(
@@ -348,11 +403,11 @@ def run_job_search(search_run_id):
         and not (data['can_prescore'] and data['score'] < prescore_threshold)
     ]
     eligible.sort(key=lambda i: prescores[i]['score'], reverse=True)
-    # Only these get an OpenAI match call; the rest are stored unscored.
-    to_score = set(eligible[:max_scored])
+    precise = set(eligible[:max_scored])
     logger.info(
-        'Search %s: %d jobs fetched, %d passed stage 1, %d will be OpenAI-scored',
-        search_run.pk, len(raw_jobs), len(eligible), len(to_score),
+        'Search %s: %d jobs fetched, %d passed stage 1, %d get a model-extracted '
+        'contract (the rest are scored from the deterministic one)',
+        search_run.pk, len(raw_jobs), len(eligible), len(precise),
     )
 
     total = len(raw_jobs) or 1
@@ -370,34 +425,42 @@ def run_job_search(search_run_id):
         # ------------------------------------------------------------------
         # Phase: scoring (15 -> 75%)
         # ------------------------------------------------------------------
-        # The OpenAI match calls are network-bound and independent, so they run
-        # concurrently. The workers touch no database and no model instances —
-        # they take plain strings and return plain dicts — so there is no shared
-        # connection or cursor to worry about. Every Job row is created below, on
-        # the main thread.
+        # Every job is scored against its OWN keyword contract, so the score
+        # genuinely varies with the advert instead of being a constant. The work
+        # is network-bound and independent, so it runs concurrently: the workers
+        # touch no database and no model instances — plain dicts in, plain dicts
+        # out — so there is no shared connection or cursor. Every Job row is
+        # created below, on the main thread.
         scores = {}
-        if to_score:
-            done = 0
-            with ThreadPoolExecutor(max_workers=_score_workers()) as pool:
-                futures = {
-                    pool.submit(
-                        _score_job, cv_text, raw_jobs[i].get('description', ''),
-                    ): i
-                    for i in to_score
-                }
-                for future in as_completed(futures):
-                    position = futures[future]
-                    scores[position] = future.result()
-                    done += 1
-                    # Progress is advanced here, on the main thread, as each
-                    # future lands — never from inside a worker.
-                    _phase_progress(
-                        search_run, (PHASE_SCORING[0], 65), done, len(to_score),
-                    )
+        done = 0
+        with ThreadPoolExecutor(max_workers=_score_workers()) as pool:
+            futures = [
+                pool.submit(
+                    _score_job,
+                    {
+                        'position': i,
+                        'title': raw.get('title', ''),
+                        'description': raw.get('description', ''),
+                    },
+                    cv_text,
+                    i in precise,
+                )
+                for i, raw in enumerate(raw_jobs)
+            ]
+            for future in as_completed(futures):
+                result = future.result()
+                scores[result['position']] = result
+                done += 1
+                # Progress is advanced here, on the main thread, as each future
+                # lands — never from inside a worker.
+                _phase_progress(
+                    search_run, (PHASE_SCORING[0], 65), done, len(raw_jobs),
+                )
         scored = len(scores)
 
         # Create the Job rows (main thread, so DB access stays single-threaded).
         jobs_to_tailor = []
+        contracts = {}
         for position, raw in enumerate(raw_jobs):
             description = raw.get('description', '')
             sponsorship = detect_sponsorship(f"{description} {raw.get('title', '')}")
@@ -405,23 +468,28 @@ def run_job_search(search_run_id):
                 raw.get('salary', ''), min_salary, max_salary,
             )
 
-            stage1 = prescores[position]
-            job_skills = stage1['job_skills']
-            gaps = missing_skills(cv_skills, job_skills)
-            prescore = stage1['score']
+            result = scores.get(position) or {}
+            contract = result.get('contract')
+            coverage = result.get('coverage') or {}
 
+            # The score is the real one either way. A job outside the salary range
+            # keeps its true skills match — it just isn't pursued, and the reason
+            # says so. Reporting it as 0 would be a lie about the fit.
+            score = result.get('score', 0)
+            reason = result.get('reason', 'Unable to compute')
             if not within:
-                score, reason = 0, range_reason  # below min or above max
-            elif position in scores:
-                score = scores[position]['score']
-                reason = scores[position]['reason']
-            elif stage1['can_prescore'] and prescore < prescore_threshold:
-                # Too little skill overlap to be worth an OpenAI call.
-                score = prescore
-                reason = f'Pre-screened: {prescore}% keyword overlap (below threshold)'
+                reason = f'{range_reason}. {reason}'
+
+            # The contract sees the whole advert, not just the 115-word vocabulary,
+            # so it is the better record of what the job wants and what the CV
+            # lacks. Fall back to the vocabulary view only if there is no contract.
+            if contract and (contract.get('hard_skills') or contract.get('acronyms')):
+                contracts[position] = contract
+                job_skills = sorted(all_contract_terms(contract))
+                gaps = list(coverage.get('missing_hard') or [])
             else:
-                # Qualified, but outranked by better matches within the cost cap.
-                score, reason = 0, 'Not scored (scoring limit reached)'
+                job_skills = prescores[position]['job_skills']
+                gaps = missing_skills(cv_skills, job_skills)
 
             job = Job.objects.create(
                 job_skills=job_skills,
@@ -456,8 +524,11 @@ def run_job_search(search_run_id):
                 rejected += 1
                 job.processed = True
                 job.save()
-            elif score >= match_threshold:
-                jobs_to_tailor.append(job)
+            elif within and score >= match_threshold:
+                # `within` matters: a job can now score well on skills and still be
+                # outside the salary range, and there is no point tailoring a CV
+                # for a job the candidate has ruled out on pay.
+                jobs_to_tailor.append((job, contracts.get(position)))
 
             _phase_progress(
                 search_run, (65, PHASE_SCORING[1]), position + 1, len(raw_jobs),
@@ -473,13 +544,16 @@ def run_job_search(search_run_id):
         # tailoring — the concurrency is across jobs, not within one.
         _set_progress(search_run, PHASE_TAILORING[0])
         if jobs_to_tailor:
-            by_id = {job.pk: job for job in jobs_to_tailor}
+            by_id = {job.pk: job for job, _c in jobs_to_tailor}
             job_data = [
                 {
                     'id': job.pk, 'title': job.title, 'company': job.company,
                     'location': job.location, 'description': job.description,
+                    # Reuse the contract already built during scoring rather than
+                    # paying for a second extraction of the same advert.
+                    'contract': contract,
                 }
-                for job in jobs_to_tailor
+                for job, contract in jobs_to_tailor
             ]
             done = 0
             with ThreadPoolExecutor(max_workers=_tailor_workers()) as pool:

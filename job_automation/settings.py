@@ -172,7 +172,11 @@ AUTH_PASSWORD_VALIDATORS = [
 # Internationalization
 # ---------------------------------------------------------------------------
 LANGUAGE_CODE = 'en-us'
-TIME_ZONE = 'UTC'
+# Timestamps are stored in UTC (USE_TZ=True) and rendered in this zone. Defaults
+# to UK time because that is where the searches and salaries are; override in
+# .env if your users are elsewhere. Getting this wrong is what made the Search
+# Runs list show times an hour off during British Summer Time.
+TIME_ZONE = env('TIME_ZONE', default='Europe/London')
 USE_I18N = True
 USE_TZ = True
 

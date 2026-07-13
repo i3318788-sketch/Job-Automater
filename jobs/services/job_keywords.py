@@ -136,16 +136,22 @@ def _empty_contract(job_title=''):
     }
 
 
-def extract_job_keywords(job_description, job_title=''):
+def extract_job_keywords(job_description, job_title='', use_openai=True):
     """Return the keyword contract for a job. One OpenAI call. Never raises.
 
+    ``use_openai=False`` forces the deterministic path. That is how the search
+    stays affordable across a couple of hundred jobs: the best-ranked jobs get a
+    model-extracted contract, the long tail gets the vocabulary one. Both are
+    real, per-job contracts — the difference is precision, not the presence of a
+    score.
+
     Falls back to vocabulary matching when OpenAI is unavailable, so the pipeline
-    degrades to its old behaviour rather than breaking.
+    degrades rather than breaking.
     """
     if not (job_description or '').strip():
         return _empty_contract(job_title)
 
-    if _openai_configured():
+    if use_openai and _openai_configured():
         try:
             return _extract_via_openai(job_description, job_title)
         except Exception:  # pragma: no cover - network dependent

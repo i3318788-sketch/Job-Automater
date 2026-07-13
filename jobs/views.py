@@ -346,16 +346,50 @@ def search_status(request, run_id):
     """Return the SearchRun status + progress as JSON (used by dashboard polling)."""
     search_run = get_object_or_404(SearchRun, pk=run_id, user=request.user)
     processed = search_run.jobs.count()
+    eta = search_run.eta_seconds()
     return JsonResponse({
         'id': search_run.pk,
         'status': search_run.status,
         'status_display': search_run.get_status_display(),
         'progress': search_run.progress,
+        'phase': _progress_phase(search_run),
+        'eta_seconds': eta,
+        'eta_display': _format_eta(eta),
         'error_message': search_run.error_message,
         'job_count': processed,
         'processed': processed,
         'total': search_run.total_jobs,
     })
+
+
+def _progress_phase(search_run):
+    """Which phase the bar is in, so the UI can say what is happening, not just %."""
+    if search_run.status != SearchRun.STATUS_RUNNING:
+        return ''
+    progress = search_run.progress
+    if progress < 15:
+        return 'Fetching jobs'
+    if progress < 75:
+        return 'Scoring against your CV'
+    if progress < 95:
+        return 'Tailoring CVs'
+    return 'Finalising'
+
+
+def _format_eta(seconds):
+    """Human ETA. Deliberately coarse: a to-the-second estimate implies a
+    precision this extrapolation does not have."""
+    if seconds is None:
+        return 'Estimating…'
+    if seconds < 60:
+        return 'less than a minute'
+    minutes = int(round(seconds / 60.0))
+    if minutes == 1:
+        return 'about 1 minute'
+    if minutes < 60:
+        return f'about {minutes} minutes'
+    hours, minutes = divmod(minutes, 60)
+    return f'about {hours}h {minutes}m'
 
 
 @login_required
@@ -372,17 +406,19 @@ def clear_search_history(request):
 def search_results(request, run_id):
     """List all jobs found for a given search run, ordered by match score."""
     search_run = get_object_or_404(SearchRun, pk=run_id, user=request.user)
-    # Only jobs at or above the match threshold are shown. Everything found is
-    # still stored — this is a display filter, not a delete — but a job the
-    # candidate isn't competitive for is noise, not a result.
     threshold = settings.MATCH_THRESHOLD
-    jobs = (
+
+    # Every job is shown here; the three tabs filter client-side, so switching
+    # between them is instant and no job is hidden from the user. (The Excel
+    # export stays limited to >= threshold — that is a "what should I act on"
+    # artefact, whereas this page is "what did the search find".)
+    jobs = list(
         search_run.jobs
         .select_related('ats_report')
-        .filter(match_score__gte=threshold)
         .order_by('-match_score', 'title')
     )
-    total_found = search_run.jobs.count()
+    above = [j for j in jobs if (j.match_score or 0) >= threshold]
+
     return render(
         request,
         'jobs/search_results.html',
@@ -391,8 +427,9 @@ def search_results(request, run_id):
             'jobs': jobs,
             'MATCH_THRESHOLD': threshold,
             'ATS_THRESHOLD': settings.ATS_THRESHOLD,
-            'total_found': total_found,
-            'hidden_count': total_found - len(jobs),
+            'total_found': len(jobs),
+            'above_count': len(above),
+            'below_count': len(jobs) - len(above),
             'ats_rejected_count': sum(1 for j in jobs if j.ats_rejected),
         },
     )

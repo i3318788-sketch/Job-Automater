@@ -197,6 +197,23 @@
         th, td { text-align: left; padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border); }
         th { font-weight: 600; color: var(--muted); }
 
+        /* ---------- Result tabs ---------- */
+        .job-tabs {
+            display: flex; gap: 0.4rem; flex-wrap: wrap;
+            margin: 0.5rem 0 1rem; border-bottom: 1px solid var(--border);
+        }
+        .job-tab {
+            background: none; border: 1px solid transparent; border-bottom: none;
+            color: var(--muted); font-weight: 600; font-size: 0.88rem;
+            padding: 0.5rem 0.9rem; border-radius: 8px 8px 0 0; cursor: pointer;
+            display: flex; align-items: center; gap: 0.4rem; margin-bottom: -1px;
+        }
+        .job-tab:hover { background: var(--bg); color: var(--text); }
+        .job-tab.active {
+            color: var(--primary); background: var(--card);
+            border-color: var(--border); border-bottom-color: var(--card);
+        }
+
         /* Scrollable table with a header that stays put.
            Both axes scroll: tall result sets scroll vertically, wide ones
            horizontally. The sticky header needs an opaque background of its own —

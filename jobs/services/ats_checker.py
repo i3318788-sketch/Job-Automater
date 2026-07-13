@@ -2286,18 +2286,30 @@ def score_cv_against_contract(cv_text, contract):
         sections = _section_coverage(cv_text)
 
         def pct(found, total):
-            return 100.0 if not total else len(found) / len(total) * 100.0
+            return len(found) / len(total) * 100.0 if total else None
 
+        # A category with nothing to measure scores None, not 100. Awarding full
+        # marks for an absent requirement was handing out a free 35 points to
+        # every job that stated no must-haves and used no acronyms — enough to
+        # score a pastry-chef advert 45/100 against a backend engineer's CV. The
+        # weight of an inapplicable category is redistributed across the ones that
+        # do apply, so the score always reflects what the job actually asked for.
         breakdown = {
-            'hard_skills': round(pct(found_hard, hard), 1),
-            'must_have': round(pct(found_must, must), 1),
-            'title': float(title_score),
-            'acronyms': round(pct(found_acronyms, acronyms), 1),
+            'hard_skills': pct(found_hard, hard),
+            'must_have': pct(found_must, must),
+            'title': float(title_score) if titles else None,
+            'acronyms': pct(found_acronyms, acronyms),
             'sections': float(sections),
         }
+        applicable = {
+            key: value for key, value in breakdown.items() if value is not None
+        }
+        total_weight = sum(CONTRACT_WEIGHTS[k] for k in applicable)
         score = _clamp(
-            sum(breakdown[k] * w for k, w in CONTRACT_WEIGHTS.items())
-        )
+            sum(applicable[k] * CONTRACT_WEIGHTS[k] for k in applicable) / total_weight
+        ) if total_weight else 0
+        breakdown = {k: (round(v, 1) if v is not None else None)
+                     for k, v in breakdown.items()}
 
         return {
             'score': score,
@@ -2350,6 +2362,79 @@ def genuine_missing_terms(ats_result, limit=15):
             seen.add(term)
             out.append(term)
     return out[:limit]
+
+
+_INSTITUTION_RE = re.compile(
+    r'\b(?:university of [a-z][a-z\s]{2,30}|[a-z][a-z\s]{2,30} university|'
+    r'[a-z][a-z\s]{2,30} college|[a-z][a-z\s]{2,30} institute)\b',
+    re.IGNORECASE,
+)
+_YEAR_RE = re.compile(r'\b(19|20)\d{2}\b')
+
+
+def _fact_set(text):
+    """The factual record of a CV: degrees, grades, institutions and years.
+
+    These are matters of fact, not presentation. Tailoring may reword anything it
+    likes about *skills*, but a degree, a university, an employer or a date is
+    either true or it is not — and the prompt telling the model so is not enough.
+    We saw it invent skills and metrics despite explicit instructions; there is no
+    reason to expect education to be different, and the consequences are worse.
+    """
+    lowered = (text or '').lower()
+
+    degrees = set()
+    for _level, label, keywords in DEGREE_LEVELS:
+        for keyword in keywords:
+            if _contains_term(lowered, keyword):
+                degrees.add(label)
+                break
+
+    grades = {
+        phrase for phrase in UK_CLASSIFICATIONS
+        if _contains_term(lowered, phrase)
+    }
+    institutions = {
+        re.sub(r'\s+', ' ', m.group(0).strip().lower())
+        for m in _INSTITUTION_RE.finditer(text or '')
+    }
+    years = {m.group(0) for m in _YEAR_RE.finditer(text or '')}
+
+    return {
+        'degrees': degrees,
+        'grades': grades,
+        'institutions': institutions,
+        'years': years,
+    }
+
+
+def altered_facts(original_cv_text, tailored_cv_text):
+    """Education/employment facts the rewrite changed. Empty when the record is intact.
+
+    Reports both directions, because both are lies:
+      - ADDED   a degree, grade, institution or date that the original never had.
+      - REMOVED one the original did have (a dropped role or qualification is a
+                misrepresentation by omission, and it contradicts the real history
+                the candidate will be asked about).
+    """
+    if not (original_cv_text and tailored_cv_text):
+        return []
+
+    before = _fact_set(original_cv_text)
+    after = _fact_set(tailored_cv_text)
+
+    problems = []
+    for key, label in (
+        ('degrees', 'degree'),
+        ('grades', 'grade/classification'),
+        ('institutions', 'institution'),
+        ('years', 'date'),
+    ):
+        for added in sorted(after[key] - before[key]):
+            problems.append(f'invented {label}: "{added}"')
+        for removed in sorted(before[key] - after[key]):
+            problems.append(f'removed {label}: "{removed}"')
+    return problems
 
 
 def _classify_claims(original_cv_text, tailored_cv_text, job_description,
