@@ -255,7 +255,13 @@
                 });
         });
     }
-    if (activeRows().length > 0) { setInterval(poll, 5000); }
+    // Poll straight away, then every 2s. Waiting a full interval before the first
+    // request left the bar frozen on its server-rendered value (usually 0%) for
+    // seconds after page load, which reads exactly like a bar that does not work.
+    if (activeRows().length > 0) {
+        poll();
+        setInterval(poll, 2000);
+    }
 })();
 </script>
 {% endblock %}

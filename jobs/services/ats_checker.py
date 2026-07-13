@@ -2115,14 +2115,58 @@ def _fact_set(text):
     }
 
 
+def employment_entries(text):
+    """The (job title, employer) pairs a CV states, from its "Title | Company" lines.
+
+    Only the structured role lines are read. A CV that names no employers in that
+    form simply yields nothing, and the guard below falls back to being a no-op for
+    it rather than guessing — a wrong guess here would either wave through a
+    fabricated employer or reject an honest rewrite, and both are worse than
+    checking less.
+    """
+    entries = set()
+    for line in (text or '').splitlines():
+        line = line.strip().lstrip('-•*– ').strip()
+        if '|' not in line:
+            continue
+        parts = [p.strip() for p in line.split('|')]
+        if len(parts) < 2:
+            continue
+        title, employer = parts[0], parts[1]
+        # A contact line ("phone | email | location") is not a role.
+        if re.search(r'[@]|\+?\d[\d\s()-]{7,}|www\.|\.com', line):
+            continue
+        # Nor is an education line ("BSc Maths | University of Leeds | 2018"), which
+        # uses the same pipe format. Degrees and institutions are already guarded
+        # above; counting them here would just mislabel them as employers.
+        lowered_title = title.lower()
+        if any(
+            _contains_term(lowered_title, kw)
+            for _level, _label, keywords in DEGREE_LEVELS for kw in keywords
+        ):
+            continue
+        if not (title and employer) or len(title) > 60 or len(employer) > 60:
+            continue
+        entries.add((lowered_title, employer.lower()))
+    return entries
+
+
 def altered_facts(original_cv_text, tailored_cv_text):
     """Education/employment facts the rewrite changed. Empty when the record is intact.
 
     Reports both directions, because both are lies:
-      - ADDED   a degree, grade, institution or date that the original never had.
+      - ADDED   a degree, grade, institution, date, employer or job title that the
+                original never had.
       - REMOVED one the original did have (a dropped role or qualification is a
                 misrepresentation by omission, and it contradicts the real history
                 the candidate will be asked about).
+
+    Employers and job titles are checked by containment against the original's raw
+    text, not by matching structure to structure: the original CV is whatever the
+    candidate uploaded, while the tailored one always comes back in our "Title |
+    Company | Location" format, so a structural diff would flag every honest
+    rewrite. Asking "does this employer name appear anywhere in the original?" is
+    the question that actually matters.
     """
     if not (original_cv_text and tailored_cv_text):
         return []
@@ -2141,6 +2185,33 @@ def altered_facts(original_cv_text, tailored_cv_text):
             problems.append(f'invented {label}: "{added}"')
         for removed in sorted(before[key] - after[key]):
             problems.append(f'removed {label}: "{removed}"')
+
+    # Employers and job titles: every one the rewrite states must be traceable to
+    # the original. Re-titling a role into something the candidate never held is
+    # the most plausible-looking lie a tailoring model can tell, and the one a
+    # recruiter is most likely to check.
+    #
+    # Whitespace is flattened first. An uploaded CV is extracted from a PDF, where
+    # "Senior Backend Engineer" may well arrive split across a line break — and
+    # flagging that as an invented title would reject an honest rewrite and cost
+    # the candidate their tailored CV for no reason.
+    original_flat = re.sub(r'\s+', ' ', original_cv_text.lower())
+    tailored_flat = re.sub(r'\s+', ' ', tailored_cv_text.lower())
+
+    for title, employer in sorted(employment_entries(tailored_cv_text)):
+        if not _contains_term(original_flat, employer):
+            problems.append(f'invented employer: "{employer}"')
+        if not _contains_term(original_flat, title):
+            problems.append(f'invented job title: "{title}"')
+
+    # And every role the original stated must survive. Dropping a real job to make
+    # the CV look tidier is a misrepresentation by omission.
+    for title, employer in sorted(employment_entries(original_cv_text)):
+        if not _contains_term(tailored_flat, employer):
+            problems.append(f'removed employer: "{employer}"')
+        if not _contains_term(tailored_flat, title):
+            problems.append(f'removed job title: "{title}"')
+
     return problems
 
 

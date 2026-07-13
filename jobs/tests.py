@@ -6,10 +6,12 @@ import tempfile
 from unittest import mock
 
 import docx
+from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from django.urls import reverse
+from django.utils.timezone import now as django_now
 
 from .models import CV, Job, SearchRun, UserPreferences
 from .services.matching import (
@@ -1293,19 +1295,31 @@ class ATSFabricationGuardrailTests(TestCase):
     @override_settings(OPENAI_API_KEY='sk-test', ATS_MAX_TAILOR_ATTEMPTS=2)
     @mock.patch('jobs.services.tailoring._retry_with_feedback')
     @mock.patch('jobs.services.tailoring.tailor_cv_for_job')
-    def test_persistent_fabrication_is_reported_not_hidden(self, mock_tailor, mock_retry):
-        """If every draft lies, keep the best but flag it — never ship it silently."""
+    def test_persistent_fabrication_is_rejected_not_shipped(self, mock_tailor, mock_retry):
+        """If every draft lies, ship the TRUTH — not the best-scoring lie.
+
+        This test used to assert the opposite: that the fabrication was kept and
+        merely flagged. That was the bug. Flagging a lie still sends the lie to
+        the employer; the candidate is the one who pays for it at interview.
+        """
         from jobs.services.tailoring import tailor_cv_for_job_with_ats
         liar = ORIGINAL_CV_NO_NUMBERS + '\n- Ran CI/CD, improving speed by 55%.\n'
         mock_tailor.return_value = liar
         mock_retry.return_value = liar
 
-        _text, report, _a = tailor_cv_for_job_with_ats(
+        text, report, _a = tailor_cv_for_job_with_ats(
             ORIGINAL_CV_NO_NUMBERS, self.JD, 'Backend Engineer', 'Acme',
         )
-        self.assertFalse(report['honest'])
-        self.assertIn('ci/cd', report['unsupported_claims'])
-        self.assertTrue(report['fabricated_metrics'])
+        # The untailored (true) CV is what ships.
+        self.assertEqual(text, ORIGINAL_CV_NO_NUMBERS)
+        self.assertTrue(report['fell_back_to_original'])
+        # And the rejected fabrication is recorded, so the user can see why.
+        rejected = ' '.join(report['fabrication_rejected'])
+        self.assertIn('ci/cd', rejected)
+        self.assertIn('55%', rejected)
+        # What ships is honest, and carries the original's real score.
+        self.assertTrue(report['honest'])
+        self.assertEqual(report['unsupported_claims'], [])
 
 
 class ATSCategoryBreakdownTests(TestCase):
@@ -1328,7 +1342,9 @@ class ATSCategoryBreakdownTests(TestCase):
         self.assertEqual(
             max(categories, key=lambda k: categories[k]['weight']), 'keyword_matching'
         )
-        self.assertEqual(report['score_needed'], 90)
+        # The tailoring target, read from settings (80) — not a hardcoded number.
+        self.assertEqual(report['score_needed'], settings.ATS_TARGET_SCORE)
+        self.assertEqual(report['score_needed'], 80)
 
 
 # A modern-stack advert: almost none of these tools are in the 115-word vocab.
@@ -2565,6 +2581,11 @@ class SalaryPreferenceTests(TestCase):
         self.assertNotIn('Above your salary preference', job.match_reason)
 
 
+def altered_facts_for(original, tailored):
+    from jobs.services.ats_checker import altered_facts
+    return altered_facts(original, tailored)
+
+
 class FactIntegrityTests(TestCase):
     """Education and employment are facts. Tailoring may not touch them."""
 
@@ -2615,12 +2636,95 @@ Lower Second Class (2:2)
         self.assertTrue(any('removed' in p for p in problems))
 
     def test_honest_rewording_is_not_flagged(self):
+        """Wording, emphasis and ordering are free. Only the facts are fixed."""
+        from jobs.services.ats_checker import altered_facts
+        tailored = self.ORIGINAL + (
+            '\nKEY SKILLS\n- Python\n- Data Analysis\n'
+            '\nPROFESSIONAL PROFILE\nAnalyst with Python and data analysis '
+            'experience, seeking a Data Analyst role.\n'
+        )
+        # Every employer, title, date, degree and grade is untouched; the rewrite
+        # only adds surfacing and re-emphasis. Nothing to flag.
+        self.assertEqual(altered_facts(self.ORIGINAL, tailored), [])
+
+    def test_retitled_role_is_caught(self):
+        """"Analyst" -> "Senior Data Analyst" is a lie a recruiter will check.
+
+        The most plausible-looking fabrication a tailoring model can make, and
+        previously the one thing the guard let through — the prompt forbade it,
+        but nothing verified it.
+        """
         from jobs.services.ats_checker import altered_facts
         tailored = self.ORIGINAL.replace(
-            'Analyst | Beta Corp | Leeds', 'Data Analyst | Beta Corp | Leeds',
-        ) + '\nKEY SKILLS\n- Python\n'
-        # Titles may be re-emphasised; the factual record is untouched.
-        self.assertEqual(altered_facts(self.ORIGINAL, tailored), [])
+            'Analyst | Beta Corp | Leeds', 'Senior Data Analyst | Beta Corp | Leeds',
+        )
+        problems = altered_facts(self.ORIGINAL, tailored)
+        self.assertTrue(
+            any('job title' in p and 'invented' in p for p in problems), problems
+        )
+
+    def test_invented_employer_is_caught(self):
+        from jobs.services.ats_checker import altered_facts
+        tailored = self.ORIGINAL + (
+            '\nEngineer | Google | London\nJan 2022 - Dec 2023\n'
+        )
+        problems = altered_facts(self.ORIGINAL, tailored)
+        self.assertTrue(
+            any('employer' in p and 'google' in p.lower() for p in problems), problems
+        )
+
+    def test_dropped_employer_is_caught(self):
+        """A real role deleted to tidy the CV is a misrepresentation by omission."""
+        from jobs.services.ats_checker import altered_facts
+        two_roles = self.ORIGINAL + (
+            '\nJunior Analyst | Gamma Ltd | Leeds\nJan 2017 - Dec 2018\n'
+        )
+        # The rewrite silently drops the older role.
+        problems = altered_facts(two_roles, self.ORIGINAL)
+        self.assertTrue(
+            any('gamma' in p.lower() and 'removed' in p for p in problems), problems
+        )
+
+    def test_education_lines_are_not_mistaken_for_employers(self):
+        """"BSc Maths | University of Leeds" uses the same pipe format as a role."""
+        from jobs.services.ats_checker import employment_entries
+        employers = {e for _t, e in employment_entries(self.ORIGINAL)}
+        self.assertIn('beta corp', employers)
+        self.assertNotIn('university of leeds', employers)
+
+    @override_settings(OPENAI_API_KEY='sk-test', ATS_MAX_TAILOR_ATTEMPTS=2,
+                       ATS_TARGET_SCORE=80)
+    @mock.patch('jobs.services.tailoring._retry_with_feedback')
+    @mock.patch('jobs.services.tailoring.tailor_cv_for_job')
+    def test_honest_ceiling_below_target_is_kept_and_flagged(
+        self, mock_tailor, mock_retry
+    ):
+        """Below 80 with no fabrication = the candidate's true ceiling for this job.
+
+        The score is kept as-is and flagged. It is never topped up by claiming a
+        skill the CV cannot evidence.
+        """
+        from jobs.services.tailoring import tailor_cv_for_job_with_ats
+        # An honest draft: same facts, no invented skills, but a weak match for a
+        # job wanting Kubernetes/Terraform the candidate has never touched.
+        honest = self.ORIGINAL + '\nKEY SKILLS\n- Python\n'
+        mock_tailor.return_value = honest
+        mock_retry.return_value = honest
+
+        text, report, _attempts = tailor_cv_for_job_with_ats(
+            self.ORIGINAL,
+            'We need Kubernetes, Terraform, Go and Kafka experience.',
+            'Platform Engineer', 'Acme',
+        )
+
+        self.assertEqual(altered_facts_for(self.ORIGINAL, text), [])
+        self.assertLess(report['overall_score'], 80)
+        self.assertTrue(report['below_target_honestly'])
+        self.assertEqual(report['honest_ceiling'], report['overall_score'])
+        self.assertIn('highest honest score', report['ceiling_reason'])
+        # Nothing was fabricated to close the gap.
+        self.assertEqual(report['unsupported_claims'], [])
+        self.assertTrue(report['honest'])
 
     @override_settings(OPENAI_API_KEY='sk-test', ATS_MAX_TAILOR_ATTEMPTS=2)
     @mock.patch('jobs.services.tailoring._retry_with_feedback')
@@ -2641,6 +2745,43 @@ Lower Second Class (2:2)
         self.assertEqual(text, self.ORIGINAL)  # fell back to the truth
         self.assertTrue(report['fell_back_to_original'])
         self.assertTrue(report['altered_facts_rejected'])
+
+    @override_settings(OPENAI_API_KEY='sk-test', ATS_MAX_TAILOR_ATTEMPTS=2,
+                       ATS_TARGET_SCORE=80)
+    @mock.patch('jobs.services.tailoring._retry_with_feedback')
+    @mock.patch('jobs.services.tailoring.tailor_cv_for_job')
+    def test_a_fabricated_high_score_never_ships(self, mock_tailor, mock_retry):
+        """A CV that invents skills must not ship, however well it scores.
+
+        The loop used to keep the best-scoring dishonest draft and only log a
+        warning. Driving it for real, a backend engineer's CV tailored to a
+        Salesforce architect role came back claiming six Salesforce skills the
+        candidate had never touched — and scored a perfect 100. It shipped. A
+        document that wins the ATS screen and collapses at interview is worse than
+        a low score, so there is now no path that returns a fabrication.
+        """
+        from jobs.services.tailoring import tailor_cv_for_job_with_ats
+        # An honest CV, plus skills that appear nowhere in the original.
+        liar = self.ORIGINAL + (
+            '\nKEY SKILLS\n- Salesforce Apex\n- Kubernetes\n- Terraform\n'
+        )
+        mock_tailor.return_value = liar
+        mock_retry.return_value = liar
+
+        text, report, _attempts = tailor_cv_for_job_with_ats(
+            self.ORIGINAL,
+            'We need Salesforce Apex, Kubernetes and Terraform.',
+            'Platform Engineer', 'Acme',
+        )
+
+        self.assertEqual(text, self.ORIGINAL)  # the truth shipped, not the lie
+        self.assertTrue(report['fell_back_to_original'])
+        self.assertTrue(report['fabrication_rejected'])
+        # The reported score is the ORIGINAL CV's real one, not the fabrication's.
+        self.assertTrue(report['honest'])
+        self.assertEqual(report['unsupported_claims'], [])
+        self.assertTrue(report['below_target_honestly'])
+        self.assertLess(report['overall_score'], 80)
 
 
 @override_settings(MEDIA_ROOT=_TEST_MEDIA)
@@ -2718,6 +2859,82 @@ class EtaAndTimestampTests(TestCase):
         content = response.content.decode()
         self.assertIn('12 Jul 2026, 04:45 PM', content)
         self.assertNotIn('15:45', content)  # not raw UTC, not 24-hour
+
+    def test_timestamp_follows_the_configured_timezone(self):
+        """TIME_ZONE is what makes the clock right, and it is read from .env.
+
+        The template was always correct; leaving TIME_ZONE unset (so it fell back
+        to Europe/London) is what made the Search Runs clock read hours out for a
+        user elsewhere. Same instant, two zones, two correct renderings.
+        """
+        import zoneinfo
+        from django.utils import timezone
+
+        cv = _make_cv_for(self.user)
+        # 15:45 UTC = 4:45 PM London = 8:45 PM Karachi (UTC+5).
+        when = datetime(2026, 7, 12, 15, 45, tzinfo=zoneinfo.ZoneInfo('UTC'))
+        run = self._run(status=SearchRun.STATUS_COMPLETED, cv=cv)
+        SearchRun.objects.filter(pk=run.pk).update(created_at=when)
+
+        with override_settings(TIME_ZONE='Asia/Karachi'):
+            timezone.activate('Asia/Karachi')
+            try:
+                content = self.client.get(reverse('dashboard')).content.decode()
+            finally:
+                timezone.deactivate()
+
+        self.assertIn('12 Jul 2026, 08:45 PM', content)
+        self.assertNotIn('04:45 PM', content)
+
+
+@override_settings(MEDIA_ROOT=_TEST_MEDIA)
+class ProgressPollingWiringTests(TestCase):
+    """The bar not moving is almost always a broken link in the chain.
+
+    Endpoint URL, JSON field names and the JS selectors have to agree. Nothing
+    else in the suite fails if one of them drifts — the page just quietly stops
+    updating — so the contract between them is pinned here.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='poll', password='pw12345!')
+        self.client.login(username='poll', password='pw12345!')
+        self.cv = _make_cv_for(self.user)
+        self.run = SearchRun.objects.create(
+            user=self.user, cv=self.cv, status=SearchRun.STATUS_RUNNING,
+            progress=42, total_jobs=10,
+            started_at=django_now() - timedelta(seconds=60),
+        )
+
+    def test_dashboard_renders_every_hook_the_polling_js_queries(self):
+        content = self.client.get(reverse('dashboard')).content.decode()
+        status_url = reverse('search_status', args=[self.run.pk])
+
+        # The JS reads the URL off the row, then writes into these three nodes.
+        self.assertIn(f'data-status-url="{status_url}"', content)
+        self.assertIn(f'data-run-id="{self.run.pk}"', content)
+        for selector in ('run-status', 'progress-bar', 'progress-text',
+                         'progress-eta'):
+            self.assertIn(selector, content)
+        # The bar must be painted with the live value, not a hardcoded zero.
+        self.assertIn('width:42%', content)
+
+    def test_status_endpoint_returns_every_field_the_js_reads(self):
+        data = self.client.get(
+            reverse('search_status', args=[self.run.pk])
+        ).json()
+        for field in ('status', 'status_display', 'progress', 'phase',
+                      'eta_seconds', 'eta_display', 'processed', 'total'):
+            self.assertIn(field, data, f'JS reads data.{field}; endpoint omits it')
+        self.assertEqual(data['progress'], 42)
+
+    def test_bar_is_only_rendered_while_there_is_something_to_show(self):
+        self.run.status = SearchRun.STATUS_COMPLETED
+        self.run.save(update_fields=['status'])
+        content = self.client.get(reverse('dashboard')).content.decode()
+        # The bar's markup is gone (the class name still appears in the polling
+        # script, which is why this looks for the element, not the string).
+        self.assertNotIn('<div class="progress">', content)
 
 
 class ProfilePageTests(TestCase):

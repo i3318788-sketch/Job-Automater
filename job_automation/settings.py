@@ -75,8 +75,11 @@ SALARY_HARD_FILTER = env.bool('SALARY_HARD_FILTER', default=False)
 ATS_THRESHOLD = env.int('ATS_THRESHOLD', default=75)
 
 # Tailoring aims for this ATS score, re-running with targeted feedback when the
-# first attempt falls short.
-ATS_TARGET_SCORE = env.int('ATS_TARGET_SCORE', default=90)
+# first attempt falls short. 80 is a target, never a promise: when the candidate
+# genuinely lacks the skills the advert asks for, the honest ceiling is lower and
+# the true score is kept and flagged. Fabricating to hit the number is the one
+# thing the tailoring loop will not do.
+ATS_TARGET_SCORE = env.int('ATS_TARGET_SCORE', default=80)
 
 # How many tailoring passes to spend reaching ATS_TARGET_SCORE. Each pass is one
 # more OpenAI call per job, so keep this low. 3 is the practical minimum: the

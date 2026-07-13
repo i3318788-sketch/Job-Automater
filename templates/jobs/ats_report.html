@@ -43,6 +43,21 @@
     </div>
 </div>
 
+{% if data.below_target_honestly %}
+<div class="card" style="border-left:4px solid #b7791f;">
+    <h2>This is your honest ceiling for this job
+        <span class="badge badge-yellow">{{ data.honest_ceiling }}/100</span>
+    </h2>
+    <p class="muted">
+        {{ data.ceiling_reason }}
+        The tailored CV already uses the advert's exact wording for every skill your
+        experience genuinely evidences. Pushing the score higher would mean claiming
+        something you cannot back up at interview, so we stopped here and kept the
+        true number.
+    </p>
+</div>
+{% endif %}
+
 {% if data.unsupported_claims or data.fabricated_metrics %}
 <div class="card" style="border-left:4px solid #c0392b;">
     <h2>⚠ Review before you send this <span class="badge badge-red">Unverified content</span></h2>

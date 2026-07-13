@@ -32,10 +32,14 @@ KEY SKILLS
 8-12 skills, one per line, each starting with "- ". Short phrases only (2-4 words).
 
 PROFESSIONAL EXPERIENCE
-For each role (maximum 3-4 most recent roles):
+For EVERY role in the original CV — never drop one, however old or however \
+irrelevant it looks to this job — most recent first:
 Job Title | Company Name | Location
 Month Year - Month Year
 - 3-5 achievement-focused bullet points, each starting with "- "
+- Give the most space to the roles most relevant to this job; an older or less \
+relevant role may be a single line, but it must still be there with its real title, \
+employer and dates.
 - Start each bullet with a strong action verb (Led, Managed, Developed, Increased, \
 Optimised)
 - Include quantifiable results ONLY where they already exist in the original CV
@@ -98,9 +102,11 @@ skill or experience. If a requested keyword has no support in the original CV, \
 LEAVE IT OUT and accept the lower score. A CV that passes the ATS on skills the \
 candidate does not have just fails at interview instead — and it is the candidate \
 who pays for that.
-- Where the candidate's real job title is close to the target title, you may adopt \
-the target title's wording. If their actual title differs materially, keep the real \
-one — never claim a role they did not hold.
+- Job titles are FACTS, not wording. Copy every job title across exactly as the \
+original CV states it. Do not re-title a role to match the advert, not even \
+slightly — "Developer" does not become "Senior Software Engineer". If you want the \
+target title's wording on the CV, put it in the PROFESSIONAL PROFILE as what the \
+candidate is looking for, never in the role line.
 - If the original CV has no contact details, omit the contact line rather than \
 inventing one.
 - You may rephrase, reorder and reword existing content to align with the job.
@@ -418,34 +424,64 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
         if better((tailored, report), best):
             best = (tailored, report)
 
-    if best[1].get('altered_facts'):
-        # Nothing is worth shipping a CV that misstates a degree or an employer.
-        # Fall back to the original: it scores worse and it is true.
+    if not best[1]['honest']:
+        # Every draft made something up, so there is no honest draft to ship. Fall
+        # back to the original CV, which is true, and report ITS real score.
+        #
+        # This used to keep the best-scoring dishonest draft and merely log a
+        # warning. That is the worst possible outcome: asked to tailor a backend
+        # engineer's CV for a Salesforce architect role, the model invented six
+        # Salesforce skills, scored a perfect 100, and the CV shipped — a document
+        # that wins the ATS screen and then collapses at interview, with the
+        # candidate paying for it. A warning in a log file nobody reads is not a
+        # safeguard. The score a fabrication earns is not a score.
+        reasons = (
+            [f'altered fact: {f}' for f in best[1].get('altered_facts') or []]
+            + [f'invented skill: {s}' for s in best[1].get('unsupported_claims') or []]
+            + [f'invented figure: {m}' for m in best[1].get('fabricated_metrics') or []]
+        )
         logger.error(
-            'Every tailored draft for "%s" altered the factual record (%s). '
-            'Falling back to the untailored CV.',
-            job_title, '; '.join(best[1]['altered_facts']),
+            'Every tailored draft for "%s" contained content the CV cannot support '
+            '(%s). Falling back to the untailored CV and keeping its true score.',
+            job_title, '; '.join(reasons),
         )
         original_report = assess(cv_text)
         original_report['fell_back_to_original'] = True
-        original_report['altered_facts_rejected'] = best[1]['altered_facts']
+        original_report['fabrication_rejected'] = reasons
+        if best[1].get('altered_facts'):
+            original_report['altered_facts_rejected'] = best[1]['altered_facts']
+        # The original's honest score IS the ceiling for this job: the candidate
+        # does not have what this advert asks for, and no rewrite can change that.
+        original_report['below_target_honestly'] = True
+        original_report['honest_ceiling'] = original_report['overall_score']
+        original_report['ceiling_reason'] = (
+            'Your experience does not cover what this job asks for. Every rewrite '
+            'that reached a higher score did so by claiming skills your CV does not '
+            'evidence, so we kept your real CV and its true score instead.'
+        )
         return cv_text, original_report, attempts
 
-    if not best[1]['honest']:
-        # Every draft invented something. Keep the best one, but say so loudly:
-        # this CV must not go out claiming things the candidate cannot back up.
-        logger.warning(
-            'Tailored CV for "%s" still contains unverifiable content — skills: %s; '
-            'metrics: %s. Flagged for human review.',
-            job_title,
-            ', '.join(best[1]['unsupported_claims']) or 'none',
-            ', '.join(best[1]['fabricated_metrics']) or 'none',
+    if best[1]['overall_score'] < target_score:
+        # The honest ceiling for this job. Recorded on the report rather than only
+        # logged, so the UI can say "this is as high as your real experience goes
+        # for this advert" instead of silently showing a number below target and
+        # leaving the candidate to wonder whether the tailoring simply failed.
+        best[1]['below_target_honestly'] = True
+        best[1]['honest_ceiling'] = best[1]['overall_score']
+        missing = genuine_missing_terms(best[1].get('contract_coverage') or {}, limit=8)
+        best[1]['ceiling_reason'] = (
+            'This is the highest honest score for this job: the CV covers every '
+            'keyword your experience genuinely evidences'
+            + ('. Still missing, and not claimed: ' + ', '.join(missing)
+               if missing else '')
+            + '.'
         )
-    elif best[1]['overall_score'] < target_score:
         logger.info(
             'Tailored CV for "%s" reached %s/100 after %s attempt(s), short of the '
-            '%s target — the candidate does not evidence the remaining keywords.',
+            '%s target — the candidate does not evidence the remaining keywords '
+            '(%s). Keeping the true score.',
             job_title, best[1]['overall_score'], attempts, target_score,
+            ', '.join(missing) or 'none identified',
         )
     return best[0], best[1], attempts
 
