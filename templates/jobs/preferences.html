@@ -12,6 +12,15 @@
         {{ form.target_countries }}
         <p class="helptext">{{ form.target_countries.help_text }}</p>
 
+        {% if form.target_city.errors %}<ul class="errorlist">{{ form.target_city.errors }}</ul>{% endif %}
+        <label for="{{ form.target_city.id_for_label }}">City</label>
+        <select id="city-select" style="width:100%;">
+            <option value="">Any city (search the whole country)</option>
+        </select>
+        <datalist id="city-options"></datalist>
+        <div id="city-free-text" style="display:none; margin-top:0.5rem;">{{ form.target_city }}</div>
+        <p class="helptext" id="city-help">{{ form.target_city.help_text }}</p>
+
         <label>Salary range</label>
         <div style="display:flex; gap:1rem; flex-wrap:wrap; align-items:flex-end;">
             <div style="flex:1; min-width:180px;">
@@ -46,6 +55,7 @@
 {% endblock %}
 
 {% block scripts %}
+{{ city_map|json_script:"city-map" }}
 <script>
 (function () {
     // Live-update every currency symbol shown next to the salary inputs.
@@ -58,6 +68,75 @@
             symbolEls.forEach(function (el) { el.textContent = s; });
         });
     }
+})();
+
+(function () {
+    // City dropdown, driven entirely from a JSON blob rendered server-side —
+    // no external API, so it can't fail or lag at request time.
+    var cityMap = JSON.parse(document.getElementById('city-map').textContent);
+    var countries = document.getElementById('{{ form.target_countries.id_for_label }}');
+    var citySelect = document.getElementById('city-select');
+    var cityInput = document.querySelector('#city-free-text input');
+    var datalist = document.getElementById('city-options');
+    var help = document.getElementById('city-help');
+    if (!(countries && citySelect && cityInput)) { return; }
+
+    function selectedCountries() {
+        return Array.prototype.filter.call(countries.options, function (o) {
+            return o.selected;
+        }).map(function (o) { return o.value; });
+    }
+
+    function citiesFor(names) {
+        var seen = {}, out = [];
+        names.forEach(function (name) {
+            (cityMap[name] || []).forEach(function (city) {
+                if (!seen[city]) { seen[city] = true; out.push(city); }
+            });
+        });
+        return out.sort();
+    }
+
+    function render() {
+        var names = selectedCountries();
+        var cities = citiesFor(names);
+        var current = cityInput.value;
+
+        citySelect.innerHTML = '';
+        datalist.innerHTML = '';
+        citySelect.appendChild(new Option('Any city (search the whole country)', ''));
+        cities.forEach(function (city) {
+            citySelect.appendChild(new Option(city, city));
+            datalist.appendChild(new Option(city));
+        });
+
+        // Keep a previously saved city selected if it still belongs to a chosen
+        // country; otherwise clear it, so we never search "Berlin" in the UK.
+        if (current && cities.indexOf(current) !== -1) {
+            citySelect.value = current;
+        } else {
+            citySelect.value = '';
+            cityInput.value = '';
+        }
+
+        var hasCities = cities.length > 0;
+        citySelect.disabled = !hasCities;
+        if (!names.length) {
+            help.textContent = 'Select a country first to choose a city.';
+        } else if (!hasCities) {
+            help.textContent = 'No city list for the selected country — the whole country will be searched.';
+        } else {
+            help.textContent = 'Optional. Leave as "Any city" to search the whole country.';
+        }
+    }
+
+    // The <select> is the visible control; the real form field is the hidden
+    // text input it writes through to.
+    citySelect.addEventListener('change', function () {
+        cityInput.value = citySelect.value;
+    });
+    countries.addEventListener('change', render);
+    render();
 })();
 </script>
 {% endblock %}

@@ -8,6 +8,7 @@ urlpatterns = [
     path('cv/create/', views.create_profile, name='create_profile'),
     path('cv/<int:cv_id>/delete/', views.delete_cv, name='delete_cv'),
     path('preferences/', views.edit_preferences, name='edit_preferences'),
+    path('profile/', views.profile, name='profile'),
     path('search/start/', views.start_search, name='start_search'),
     path('search/clear/', views.clear_search_history, name='clear_search_history'),
     path('search/<int:run_id>/', views.search_results, name='search_results'),

@@ -22,7 +22,14 @@
 </div>
 
 <div class="card">
-    <h2>Jobs ({{ jobs|length }})</h2>
+    <h2>Matched jobs ({{ jobs|length }})</h2>
+    <p class="muted">
+        Showing jobs scoring <strong>{{ MATCH_THRESHOLD }} or above</strong>.
+        {% if hidden_count %}
+            {{ hidden_count }} of the {{ total_found }} jobs found scored below that and
+            are hidden — they are still stored, just not worth your time.
+        {% endif %}
+    </p>
     {% if ats_rejected_count %}
         <p class="muted">
             <span class="badge badge-red">{{ ats_rejected_count }} ATS Rejected</span>
@@ -31,7 +38,7 @@
         </p>
     {% endif %}
     {% if jobs %}
-        <div class="table-wrap">
+        <div class="table-scroll">
             <table>
                 <thead>
                     <tr>
@@ -80,6 +87,12 @@
                 </tbody>
             </table>
         </div>
+    {% elif total_found %}
+        <p class="muted">
+            {{ total_found }} job{{ total_found|pluralize }} found, but none scored
+            {{ MATCH_THRESHOLD }} or above. Try widening your city or salary range,
+            or check that your CV is up to date.
+        </p>
     {% else %}
         <p class="muted">No jobs were found for this search.</p>
     {% endif %}
