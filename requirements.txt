@@ -3,6 +3,12 @@ django-environ
 PyPDF2
 python-docx
 openpyxl
+# Layout-aware PDF inspection for the ATS checker (columns, images, tables, fonts).
+pdfplumber
+# NLP for the ATS checker: PorterStemmer works out of the box. WordNet synonyms
+# additionally need `python -m nltk.downloader wordnet`; without that corpus the
+# checker falls back to its curated technical synonym map.
+nltk
 requests
 google-api-python-client
 google-auth

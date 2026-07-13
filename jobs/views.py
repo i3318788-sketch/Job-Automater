@@ -11,6 +11,7 @@ from django.views.decorators.http import require_POST
 
 from .forms import CVUploadForm, ProfileForm, UserPreferencesForm
 from .models import CV, Job, SearchRun, UserPreferences
+from .services.ats_checker import check_cv_format
 from .services.excel_export import build_workbook
 from .services.keyword_extractor import (
     extract_cv_profile,
@@ -161,18 +162,83 @@ def upload_cv(request):
                     'experience': [],
                     'education': [],
                 }
-                cv.save()
+                cv.save()  # save first, so the file is on disk for the ATS check
+
+                # Phase 1 is a property of the CV file itself, not of any one job,
+                # so it runs once here rather than per job during a search.
+                ats_format = _check_cv_ats_format(cv, parsed_text)
+                cv.parsed_data['ats_format'] = ats_format
+                cv.save(update_fields=['parsed_data'])
+
                 request.session[SESSION_ACTIVE_CV] = cv.pk
                 messages.success(
                     request,
                     'CV uploaded and parsed. Search keywords: '
                     + (', '.join(profile_data['job_titles'][:5]) or 'default'),
                 )
+                _report_ats_format(request, ats_format)
                 return redirect('dashboard')
     else:
         form = CVUploadForm(instance=active_cv)
 
     return render(request, 'jobs/upload_cv.html', {'form': form, 'active_cv': active_cv})
+
+
+def _check_cv_ats_format(cv, parsed_text):
+    """Phase 1 ATS check on the uploaded file. Never blocks the upload."""
+    try:
+        path = cv.original_file.path if cv.original_file else None
+    except (NotImplementedError, ValueError):
+        path = None  # non-filesystem storage backend
+    try:
+        return check_cv_format(parsed_text, file_path=path)
+    except Exception:
+        logger.exception('ATS format check failed for CV %s', cv.pk)
+        return {}
+
+
+def _report_ats_format(request, ats_format):
+    """Surface Phase 1 findings to the user as a message."""
+    if not ats_format:
+        return
+    if ats_format.get('pass'):
+        messages.success(request, 'ATS format check passed — this CV is machine-readable.')
+        return
+
+    problems = []
+    if not ats_format.get('file_format_ok'):
+        problems.append('the file is not machine-readable')
+    if ats_format.get('prohibited_elements'):
+        problems.append('it contains ' + ', '.join(ats_format['prohibited_elements']))
+    if ats_format.get('layout') not in ('single-column', 'unknown', None):
+        problems.append(f'the layout is {ats_format["layout"]}')
+    if ats_format.get('missing_headers'):
+        problems.append(
+            'these sections are missing: ' + ', '.join(ats_format['missing_headers'])
+        )
+    messages.warning(
+        request,
+        'ATS format warning — an ATS may struggle with this CV because '
+        + '; '.join(problems)
+        + '. See the recommendations on your dashboard.',
+    )
+
+
+@login_required
+def ats_report(request, job_id):
+    """Full phase-by-phase ATS report for one job's tailored CV."""
+    job = get_object_or_404(Job, pk=job_id, search_run__user=request.user)
+    report = getattr(job, 'ats_report', None)
+    if report is None:
+        messages.info(request, 'No ATS report was generated for this job.')
+        return redirect('search_results', run_id=job.search_run_id)
+
+    return render(request, 'jobs/ats_report.html', {
+        'job': job,
+        'report': report,
+        'data': report.report_data or {},
+        'ATS_THRESHOLD': settings.ATS_THRESHOLD,
+    })
 
 
 @login_required
@@ -273,11 +339,20 @@ def clear_search_history(request):
 def search_results(request, run_id):
     """List all jobs found for a given search run, ordered by match score."""
     search_run = get_object_or_404(SearchRun, pk=run_id, user=request.user)
-    jobs = search_run.jobs.all().order_by('-match_score', 'title')
+    jobs = (
+        search_run.jobs
+        .select_related('ats_report')
+        .order_by('-match_score', 'title')
+    )
     return render(
         request,
         'jobs/search_results.html',
-        {'search_run': search_run, 'jobs': jobs},
+        {
+            'search_run': search_run,
+            'jobs': jobs,
+            'ATS_THRESHOLD': settings.ATS_THRESHOLD,
+            'ats_rejected_count': sum(1 for j in jobs if j.ats_rejected),
+        },
     )
 
 

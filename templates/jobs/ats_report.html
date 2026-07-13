@@ -1,0 +1,305 @@
+{% extends 'base.html' %}
+{% block title %}ATS report · {{ job.title }}{% endblock %}
+
+{% block content %}
+{% with phases=data.phases %}
+<div class="card">
+    <h1>ATS report</h1>
+    <p class="muted">
+        <strong>{{ job.title }}</strong> @ {{ job.company|default:"—" }} &middot;
+        {{ job.location|default:"—" }}
+    </p>
+
+    <div class="stats-grid" style="margin-top:1rem;">
+        <div class="stat-card">
+            <div class="stat-label">ATS score</div>
+            <div class="stat-value">
+                {% if data.overall_score >= ATS_THRESHOLD %}<span class="badge badge-lg badge-green">{{ data.overall_score }}</span>
+                {% elif data.overall_score >= 60 %}<span class="badge badge-lg badge-yellow">{{ data.overall_score }}</span>
+                {% else %}<span class="badge badge-lg badge-red">{{ data.overall_score }}</span>{% endif %}
+            </div>
+            <div class="stat-label">threshold {{ data.threshold|default:ATS_THRESHOLD }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Status</div>
+            <div class="stat-value-sm">
+                {% if job.ats_status == 'REJECTED' %}<span class="badge badge-red">ATS Rejected</span>
+                {% elif job.ats_status == 'PASSED' %}<span class="badge badge-green">Passed</span>
+                {% else %}<span class="badge badge-yellow">Below threshold</span>{% endif %}
+            </div>
+        </div>
+        {% for section, value in data.sectional_scores.items %}
+            <div class="stat-card">
+                <div class="stat-label">{{ section|title }}</div>
+                <div class="stat-value">{{ value }}</div>
+            </div>
+        {% endfor %}
+    </div>
+
+    <div style="display:flex; gap:0.6rem; margin-top:1rem;">
+        <a class="btn btn-secondary" href="{% url 'search_results' job.search_run_id %}">← Back to results</a>
+        {% if job.tailored_pdf %}
+            <a class="btn" href="{{ job.tailored_pdf.url }}" target="_blank" rel="noopener">⬇ Tailored CV</a>
+        {% endif %}
+    </div>
+</div>
+
+{% if data.unsupported_claims or data.fabricated_metrics %}
+<div class="card" style="border-left:4px solid #c0392b;">
+    <h2>⚠ Review before you send this <span class="badge badge-red">Unverified content</span></h2>
+    <p>
+        The tailored CV contains content that your original CV does not support.
+        <strong>Check every item below and remove anything you cannot evidence at
+        interview</strong> — an ATS may be fooled, but a hiring manager will not be.
+    </p>
+    {% if data.unsupported_claims %}
+        <p><strong>Skills with no support in your original CV:</strong>
+            {% for s in data.unsupported_claims %}<span class="badge badge-red">{{ s }}</span> {% endfor %}
+        </p>
+    {% endif %}
+    {% if data.fabricated_metrics %}
+        <p><strong>Figures that appear nowhere in your original CV:</strong>
+            {% for m in data.fabricated_metrics %}<span class="badge badge-red">{{ m }}</span> {% endfor %}
+        </p>
+    {% endif %}
+</div>
+{% endif %}
+
+{% if data.claims_needing_review %}
+<div class="card" style="border-left:4px solid #b7791f;">
+    <h2>Worth a quick check <span class="badge badge-yellow">Reworded</span></h2>
+    <p class="muted">
+        Each phrase below restates your CV in the advert's wording. We can tell the
+        words are yours, but not that the <em>skill</em> is — "risk modelling" and
+        "ran risk reports, modelled churn" use the same words and mean different
+        things. Check each against the line it came from and delete any that
+        oversell you.
+    </p>
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th>Claim on the tailored CV</th><th>The line in your CV it came from</th></tr></thead>
+            <tbody>
+                {% for claim in data.claim_evidence %}
+                    <tr>
+                        <td><span class="badge badge-yellow">{{ claim.term }}</span></td>
+                        <td class="muted">
+                            {% for l in claim.lines %}
+                                “{{ l.line|truncatechars:110 }}”{% if not forloop.last %}<br>{% endif %}
+                            {% empty %}
+                                <em>no matching line found — treat this as invented</em>
+                            {% endfor %}
+                        </td>
+                    </tr>
+                {% empty %}
+                    {% for c in data.claims_needing_review %}
+                        <tr><td><span class="badge badge-yellow">{{ c }}</span></td><td class="muted">—</td></tr>
+                    {% endfor %}
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endif %}
+
+{% if data.duplicate_application %}
+<div class="card">
+    <h2>Duplicate application <span class="badge badge-yellow">Flagged</span></h2>
+    <p class="muted">
+        You have already applied to <strong>{{ job.company }}</strong> with
+        {% if data.duplicate_is_identical %}an identical CV{% else %}a different CV{% endif %}.
+        An ATS compares the parsed text of incoming applications and merges them
+        into a single candidate profile, so a recruiter will see both together.
+    </p>
+</div>
+{% endif %}
+
+{% if data.rejection_reasons %}
+<div class="card">
+    <h2>Why this CV would be rejected</h2>
+    <ul>
+        {% for reason in data.rejection_reasons %}
+            <li><span class="badge badge-red">✗</span> {{ reason }}</li>
+        {% endfor %}
+    </ul>
+</div>
+{% endif %}
+
+{% if phases.phase1_parsing %}
+{% with p1=phases.phase1_parsing %}
+<div class="card">
+    <h2>Phase 1 — Parsing &amp; formatting
+        {% if p1.pass %}<span class="badge badge-green">Pass</span>{% else %}<span class="badge badge-red">Fail</span>{% endif %}
+    </h2>
+    <div class="table-wrap">
+        <table>
+            <tbody>
+                <tr><td>File format</td><td>{{ p1.file_format|default:"—" }}</td></tr>
+                <tr><td>Layout</td><td>{{ p1.layout|default:"—" }}</td></tr>
+                <tr>
+                    <td>Prohibited elements</td>
+                    <td>{% if p1.prohibited_elements %}<span class="badge badge-red">{{ p1.prohibited_elements|join:", " }}</span>{% else %}<span class="muted">None</span>{% endif %}</td>
+                </tr>
+                <tr>
+                    <td>Sections found</td>
+                    <td>{{ p1.standard_headers|join:", "|default:"—" }}</td>
+                </tr>
+                <tr>
+                    <td>Sections missing</td>
+                    <td>{% if p1.missing_headers %}<span class="badge badge-red">{{ p1.missing_headers|join:", " }}</span>{% else %}<span class="muted">None</span>{% endif %}</td>
+                </tr>
+                <tr>
+                    <td>Font issues</td>
+                    <td>{% if p1.font_issues %}<span class="badge badge-yellow">{{ p1.font_issues|join:", " }}</span>{% else %}<span class="muted">None</span>{% endif %}</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endwith %}
+{% endif %}
+
+{% if phases.phase2_knockout %}
+{% with p2=phases.phase2_knockout %}
+<div class="card">
+    <h2>Phase 2 — Knock-out filters
+        {% if p2.pass %}<span class="badge badge-green">Pass</span>{% else %}<span class="badge badge-red">Fail</span>{% endif %}
+    </h2>
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th>Filter</th><th>Required</th><th>Found on CV</th><th>Result</th></tr></thead>
+            <tbody>
+                <tr>
+                    <td>Years of experience</td>
+                    <td>{{ p2.experience_years.required|default:"—" }}</td>
+                    <td>{{ p2.experience_years.found }}</td>
+                    <td>{% if p2.experience_years.skipped %}<span class="muted">n/a</span>{% elif p2.experience_years.pass %}<span class="badge badge-green">Pass</span>{% else %}<span class="badge badge-red">Fail</span>{% endif %}</td>
+                </tr>
+                <tr>
+                    <td>Education</td>
+                    <td>{{ p2.education.required|default:"—" }}</td>
+                    <td>{{ p2.education.found|default:"—" }}</td>
+                    <td>{% if p2.education.skipped %}<span class="muted">n/a</span>{% elif p2.education.pass %}<span class="badge badge-green">Pass</span>{% else %}<span class="badge badge-red">Fail</span>{% endif %}</td>
+                </tr>
+                <tr>
+                    <td>Certifications</td>
+                    <td>{{ p2.certifications.required|join:", "|default:"—" }}</td>
+                    <td>{{ p2.certifications.found|join:", "|default:"—" }}</td>
+                    <td>{% if p2.certifications.skipped %}<span class="muted">n/a</span>{% elif p2.certifications.pass %}<span class="badge badge-green">Pass</span>{% else %}<span class="badge badge-red">Fail</span>{% endif %}</td>
+                </tr>
+                <tr>
+                    <td>Minimum GPA</td>
+                    <td>{{ p2.gpa.required|default:"—" }}</td>
+                    <td>{{ p2.gpa.found|default:"—" }}</td>
+                    <td>{% if p2.gpa.skipped %}<span class="muted">n/a</span>{% elif p2.gpa.pass %}<span class="badge badge-green">Pass</span>{% else %}<span class="badge badge-red">Fail</span>{% endif %}</td>
+                </tr>
+                <tr>
+                    <td>Location</td>
+                    <td>{{ p2.location.required|default:"—" }}</td>
+                    <td>{{ p2.location.found|default:"—" }}</td>
+                    <td>{% if p2.location.skipped %}<span class="muted">n/a</span>{% elif p2.location.pass %}<span class="badge badge-green">Pass</span>{% else %}<span class="badge badge-red">Fail</span>{% endif %}</td>
+                </tr>
+                <tr>
+                    <td>Work authorisation</td>
+                    <td>{{ p2.work_authorization.required|default:"—" }}</td>
+                    <td>{{ p2.work_authorization.found|default:"—" }}</td>
+                    <td>{% if p2.work_authorization.skipped %}<span class="muted">n/a</span>{% elif p2.work_authorization.pass %}<span class="badge badge-green">Pass</span>{% else %}<span class="badge badge-red">Fail</span>{% endif %}</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endwith %}
+{% endif %}
+
+{% if phases.phase3_keyword %}
+{% with p3=phases.phase3_keyword %}
+<div class="card">
+    <h2>Phase 3 — Keyword matching <span class="badge badge-blue">{{ p3.score }}/100</span></h2>
+    <p class="muted">
+        Matched {{ p3.matched_keywords|length }} of {{ p3.total_keywords }} keywords
+        ({{ p3.match_percentage }}%), {{ p3.exact_matches }} of them exact.
+    </p>
+    {% if p3.hard_skills_found %}
+        <p><strong>Hard skills found:</strong>
+            {% for s in p3.hard_skills_found %}<span class="badge badge-green">{{ s }}</span> {% endfor %}
+        </p>
+    {% endif %}
+    {% if p3.hard_skills_missing %}
+        <p><strong>Hard skills missing:</strong>
+            {% for s in p3.hard_skills_missing %}<span class="badge badge-red">{{ s }}</span> {% endfor %}
+        </p>
+    {% endif %}
+    {% if p3.soft_skills_found %}
+        <p><strong>Soft skills found:</strong>
+            {% for s in p3.soft_skills_found %}<span class="badge badge-blue">{{ s }}</span> {% endfor %}
+        </p>
+    {% endif %}
+    {% if p3.keyword_stuffing %}
+        <p class="badge badge-yellow">Keyword stuffing detected: {{ p3.stuffed_keywords|join:", " }}</p>
+    {% endif %}
+    {% if p3.underused_keywords %}
+        <p><strong>Underused</strong> — central to the job, barely on your CV:</p>
+        <ul>
+            {% for u in p3.underused_keywords %}
+                <li class="muted">
+                    <strong>{{ u.term }}</strong> — the job mentions it {{ u.jd_count }}×,
+                    your CV {{ u.cv_count }}× (aim for {{ u.expected }})
+                </li>
+            {% endfor %}
+        </ul>
+    {% endif %}
+</div>
+{% endwith %}
+{% endif %}
+
+{% if phases.phase4_context %}
+{% with p4=phases.phase4_context p5=phases.phase5_experience p6=phases.phase6_education %}
+<div class="card">
+    <h2>Phases 4-6 — Context, chronology &amp; education</h2>
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th>Check</th><th>Score</th><th>Detail</th></tr></thead>
+            <tbody>
+                <tr><td>Job title match</td><td>{{ p4.job_title_match }}</td><td class="muted">{{ p4.cv_job_titles|join:", "|default:"—" }}</td></tr>
+                <tr><td>Proximity (skills evidenced in experience)</td><td>{{ p4.proximity_score }}</td><td class="muted">Skills backed by real bullet points, not just listed</td></tr>
+                <tr><td>Recency (skills in 2 most recent roles)</td><td>{{ p4.recency_score }}</td><td class="muted">Recent experience is weighted highest</td></tr>
+                <tr><td>Quantification</td><td>{{ p4.quantification_score }}</td><td class="muted">Bullets containing numbers, %, or currency</td></tr>
+                {% if p5 %}
+                <tr>
+                    <td>Chronology</td><td>{{ p5.score }}</td>
+                    <td class="muted">
+                        {{ p5.roles_found }} role(s), {{ p5.total_experience_years }} yrs total,
+                        avg tenure {{ p5.avg_tenure_years }} yrs
+                        {% if not p5.reverse_chronological %} · <span class="badge badge-red">not reverse-chronological</span>{% endif %}
+                        {% if p5.gaps %} · <span class="badge badge-yellow">{{ p5.gaps|length }} gap(s)</span>{% endif %}
+                        {% if p5.job_hopping %} · <span class="badge badge-yellow">job-hopping</span>{% endif %}
+                    </td>
+                </tr>
+                {% endif %}
+                {% if p6 %}
+                <tr>
+                    <td>Education</td><td>{{ p6.score }}</td>
+                    <td class="muted">
+                        {{ p6.degree_hierarchy|default:"No degree detected" }}
+                        {% if p6.graduation_year %} · graduated {{ p6.graduation_year }}{% endif %}
+                        {% if p6.gpa %} · GPA/classification {{ p6.gpa }}{% endif %}
+                    </td>
+                </tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endwith %}
+{% endif %}
+
+{% if data.recommendations %}
+<div class="card">
+    <h2>How to improve this CV</h2>
+    <ol>
+        {% for rec in data.recommendations %}<li style="margin-bottom:0.4rem;">{{ rec }}</li>{% endfor %}
+    </ol>
+</div>
+{% endif %}
+{% endwith %}
+{% endblock %}

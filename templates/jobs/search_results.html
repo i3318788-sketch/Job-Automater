@@ -23,6 +23,13 @@
 
 <div class="card">
     <h2>Jobs ({{ jobs|length }})</h2>
+    {% if ats_rejected_count %}
+        <p class="muted">
+            <span class="badge badge-red">{{ ats_rejected_count }} ATS Rejected</span>
+            These jobs failed a hard ATS filter (unparsable CV, or a knock-out such as
+            required years, degree or certification), so no tailored CV was generated.
+        </p>
+    {% endif %}
     {% if jobs %}
         <div class="table-wrap">
             <table>
@@ -42,8 +49,14 @@
                                 {% else %}<span class="badge badge-lg badge-red">{{ job.match_score|default:"0" }}</span>{% endif %}
                             </td>
                             <td>
-                                {% if job.ats_score %}
-                                    <span class="badge {% if job.ats_score >= 90 %}badge-green{% elif job.ats_score >= 70 %}badge-yellow{% else %}badge-red{% endif %}">{{ job.ats_score }}</span>
+                                {% if job.ats_status == 'REJECTED' %}
+                                    <a href="{% url 'ats_report' job.id %}" title="Failed a hard ATS filter — see the report">
+                                        <span class="badge badge-red">Rejected</span>
+                                    </a>
+                                {% elif job.ats_score is not None %}
+                                    <a href="{% url 'ats_report' job.id %}" title="View the full ATS report">
+                                        <span class="badge {% if job.ats_score >= ATS_THRESHOLD %}badge-green{% elif job.ats_score >= 60 %}badge-yellow{% else %}badge-red{% endif %}">{{ job.ats_score }}</span>
+                                    </a>
                                 {% else %}<span class="muted">—</span>{% endif %}
                             </td>
                             <td>{{ job.title }}</td>
