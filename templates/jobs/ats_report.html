@@ -65,6 +65,21 @@
 </div>
 {% endif %}
 
+{% if data.claims_needing_review %}
+<div class="card" style="border-left:4px solid #b7791f;">
+    <h2>Worth a quick check <span class="badge badge-yellow">Reworded</span></h2>
+    <p class="muted">
+        These phrases restate your real experience in the job advert's wording —
+        e.g. "cost optimisation" where your CV said "tuning warehouse costs". They
+        are grounded in what you actually did, but read them once and make sure
+        each is a fair description you would be happy to defend at interview.
+    </p>
+    <p>
+        {% for c in data.claims_needing_review %}<span class="badge badge-yellow">{{ c }}</span> {% endfor %}
+    </p>
+</div>
+{% endif %}
+
 {% if data.duplicate_application %}
 <div class="card">
     <h2>Duplicate application <span class="badge badge-yellow">Flagged</span></h2>

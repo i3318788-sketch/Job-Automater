@@ -130,53 +130,114 @@ def _openai_configured():
     return bool(getattr(settings, 'OPENAI_API_KEY', ''))
 
 
-def _keyword_brief(job_description):
-    """The exact keywords the ATS will screen for, with the density each needs.
+def _keyword_brief(job_description, contract=None):
+    """The exact terms the CV will be scored against, rendered for the prompt.
 
-    Handing the model the checker's own target list is the single highest-leverage
-    part of this prompt: it removes the guesswork about which words matter, so the
-    rewrite optimises for what is actually measured instead of what reads well.
+    Handing the model the same contract the scorer uses is the highest-leverage
+    part of this prompt: tailoring and scoring optimise for the same words, so a
+    high score means the CV genuinely covers what the job asked for — rather than
+    what our vocabulary happened to recognise.
     """
     from .ats_checker import _expected_frequency, extract_jd_keywords
 
+    if contract and (contract.get('hard_skills') or contract.get('must_have')):
+        lines = []
+        if contract.get('must_have'):
+            lines.append(
+                'MANDATORY (the advert states these are required): '
+                + ', '.join(f'"{t}"' for t in contract['must_have'])
+            )
+        if contract.get('hard_skills'):
+            lines.append(
+                'SKILLS THE ADVERT NAMES (most important first): '
+                + ', '.join(f'"{t}"' for t in contract['hard_skills'])
+            )
+        if contract.get('acronyms'):
+            lines.append(
+                'WRITE BOTH FORMS where the candidate genuinely has the skill, '
+                'since different ATS platforms look for different forms: '
+                + ', '.join(
+                    f'"{a}" / "{e}"' for a, e in contract['acronyms']
+                )
+            )
+        if contract.get('soft_skills'):
+            lines.append(
+                'SOFT SKILLS: ' + ', '.join(f'"{t}"' for t in contract['soft_skills'])
+            )
+        titles = [contract.get('job_title')] + (contract.get('title_variants') or [])
+        titles = [t for t in titles if t]
+        if titles:
+            lines.append('TARGET TITLE (and accepted variants): '
+                         + ', '.join(f'"{t}"' for t in titles))
+
+        return (
+            'ATS KEYWORD CONTRACT — the CV is scored on how many of these terms it '
+            'contains, using EXACTLY this wording. Include every term the original '
+            'CV shows the candidate GENUINELY has. Omit the rest: a term the '
+            'candidate cannot evidence must not appear, whatever it costs the '
+            'score.\n' + '\n'.join(lines) + '\n\n'
+        )
+
+    # No contract (OpenAI unavailable): fall back to the built-in extractor.
     keywords = extract_jd_keywords(job_description)
     if not keywords:
         return ''
-
     lines = []
     for group, label in (('hard', 'ESSENTIAL SKILLS'),
                          ('certification', 'CERTIFICATIONS'),
                          ('general', 'ROLE TERMS'),
                          ('soft', 'SOFT SKILLS')):
         terms = [k for k in keywords if k['type'] == group]
-        if not terms:
-            continue
-        rendered = ', '.join(
-            f'"{k["term"]}" (x{_expected_frequency(k["jd_count"])})' for k in terms
-        )
-        lines.append(f'{label}: {rendered}')
-
+        if terms:
+            lines.append(f'{label}: ' + ', '.join(
+                f'"{k["term"]}" (x{_expected_frequency(k["jd_count"])})' for k in terms
+            ))
     return (
-        'ATS KEYWORDS TO INCLUDE — use the exact wording, at roughly the frequency '
-        'shown in brackets, but ONLY where the original CV shows the candidate '
-        'genuinely has that skill:\n' + '\n'.join(lines) + '\n\n'
+        'ATS KEYWORDS TO INCLUDE — use the exact wording, but ONLY where the '
+        'original CV shows the candidate genuinely has that skill:\n'
+        + '\n'.join(lines) + '\n\n'
     )
 
 
-def _build_user_prompt(cv_text, job_description, job_title, company):
+def _recovery_brief(missing_terms):
+    """Second-pass instruction: recover genuine coverage the first draft dropped."""
+    if not missing_terms:
+        return ''
+    return (
+        'TERMS THE PREVIOUS DRAFT DID NOT COVER: '
+        + ', '.join(f'"{t}"' for t in missing_terms)
+        + '\nFor EACH one, re-read the original CV. If the candidate genuinely did '
+        'this — even if the original CV words it differently ("helped move apps to '
+        'the cloud" is genuine evidence for "cloud migration") — restate that real '
+        'experience using the advert\'s wording above.\n'
+        'If the original CV contains NO evidence for a term, LEAVE IT OUT. Do not '
+        'add it to the skills list, do not imply it, do not invent a project for '
+        'it. Missing terms are expected and acceptable; invented ones are not.\n\n'
+    )
+
+
+def _build_user_prompt(cv_text, job_description, job_title, company,
+                       contract=None, missing_terms=None):
     # Truncate inputs to bound token usage/cost.
     return (
         f'TARGET JOB TITLE: {job_title}\n'
         f'TARGET COMPANY: {company}\n\n'
-        f'{_keyword_brief(job_description)}'
+        f'{_keyword_brief(job_description, contract)}'
+        f'{_recovery_brief(missing_terms)}'
         f'JOB DESCRIPTION:\n{(job_description or "")[:4000]}\n\n'
         f'ORIGINAL CV:\n{cv_text[:4000]}\n\n'
         'Rewrite the CV to best match this job, following the rules strictly.'
     )
 
 
-def tailor_cv_for_job(cv_text, job_description, job_title, company):
+def tailor_cv_for_job(cv_text, job_description, job_title, company,
+                      contract=None, missing_terms=None):
     """Return a tailored version of ``cv_text`` aligned to the given job.
+
+    ``contract`` is the shared keyword contract (see ``job_keywords``); when
+    given, the rewrite targets exactly the terms the CV will be scored on.
+    ``missing_terms`` drives a second pass that recovers genuine coverage the
+    first draft left on the table.
 
     On any failure (missing key, API error, empty input) the original CV text is
     returned so downstream PDF generation still has content to work with.
@@ -198,7 +259,8 @@ def tailor_cv_for_job(cv_text, job_description, job_title, company):
                 {
                     'role': 'user',
                     'content': _build_user_prompt(
-                        cv_text, job_description, job_title, company
+                        cv_text, job_description, job_title, company,
+                        contract, missing_terms,
                     ),
                 },
             ],
@@ -212,7 +274,8 @@ def tailor_cv_for_job(cv_text, job_description, job_title, company):
 
 
 def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
-                               job_location='', target_score=None, max_attempts=None):
+                               job_location='', target_score=None, max_attempts=None,
+                               contract=None):
     """Tailor the CV, then keep improving it until it clears the ATS target.
 
     Each draft is scored by the offline ATS checker (free and deterministic), and
@@ -226,7 +289,10 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
     """
     from .ats_checker import (
         check_cv_against_job,
+        claims_needing_review,
         fabricated_metrics,
+        genuine_missing_terms,
+        score_cv_against_contract,
         unsupported_claims,
     )
 
@@ -237,10 +303,28 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
     max_attempts = max(1, int(max_attempts))
 
     def assess(text):
-        """Score a draft, and check it invented neither skills nor metrics."""
+        """Score a draft against the contract, and check it invented nothing.
+
+        The headline score comes from the contract when there is one: that is the
+        set of terms the job actually asked for, so it is the number that agrees
+        with an external ATS. The seven-phase report is kept alongside it as the
+        diagnostic detail.
+        """
         report = check_cv_against_job(text, job_description, job_title, job_location)
+        if contract and contract.get('hard_skills'):
+            coverage = score_cv_against_contract(text, contract)
+            report['contract_coverage'] = coverage
+            report['phase_score'] = report['overall_score']
+            report['overall_score'] = coverage['score']
+            report['ats_score'] = coverage['score']
+        # Two different things, treated differently: an outright invention blocks
+        # the draft; a reworded-but-grounded claim is surfaced for the candidate
+        # to sanity-check, without holding the CV back.
         report['unsupported_claims'] = unsupported_claims(
-            cv_text, text, job_description
+            cv_text, text, job_description, contract
+        )
+        report['claims_needing_review'] = claims_needing_review(
+            cv_text, text, job_description, contract
         )
         report['fabricated_metrics'] = fabricated_metrics(cv_text, text)
         report['honest'] = not (
@@ -259,7 +343,9 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
             return candidate[1]['honest']
         return candidate[1]['overall_score'] > incumbent[1]['overall_score']
 
-    tailored = tailor_cv_for_job(cv_text, job_description, job_title, company)
+    tailored = tailor_cv_for_job(
+        cv_text, job_description, job_title, company, contract=contract,
+    )
     best = (tailored, assess(tailored))
     attempts = 1
 
@@ -274,9 +360,20 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
     while attempts < max_attempts and not done():
         attempts += 1
         try:
-            tailored = _retry_with_feedback(
-                cv_text, job_description, job_title, company, best[0], best[1]
-            )
+            if best[1]['honest'] and best[1].get('contract_coverage'):
+                # Honest but short of target: the gap is coverage, so name the
+                # exact terms to recover from the candidate's real experience.
+                missing = genuine_missing_terms(best[1]['contract_coverage'])
+                tailored = tailor_cv_for_job(
+                    cv_text, job_description, job_title, company,
+                    contract=contract, missing_terms=missing,
+                )
+            else:
+                # Dishonest, or no contract: feed back the checker's findings.
+                tailored = _retry_with_feedback(
+                    cv_text, job_description, job_title, company, best[0], best[1],
+                    contract=contract,
+                )
         except Exception:  # pragma: no cover - network dependent
             logger.exception('ATS-guided retailoring failed; keeping best draft.')
             break
@@ -312,12 +409,19 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
 
 
 def _retry_with_feedback(cv_text, job_description, job_title, company,
-                         previous_draft, report):
+                         previous_draft, report, contract=None):
     """One more tailoring pass, with the ATS checker's findings in the prompt."""
     from openai import OpenAI
 
+    coverage = report.get('contract_coverage') or {}
     phase3 = report['phases'].get('phase3_keyword', {})
-    missing = phase3.get('hard_skills_missing') or phase3.get('missing_keywords') or []
+    missing = (
+        coverage.get('missing_must')
+        or coverage.get('missing_hard')
+        or phase3.get('hard_skills_missing')
+        or phase3.get('missing_keywords')
+        or []
+    )
     findings = report.get('recommendations') or ['No specific findings.']
 
     feedback = ATS_FEEDBACK_PROMPT.format(
@@ -364,7 +468,7 @@ def _retry_with_feedback(cv_text, job_description, job_title, company,
             {
                 'role': 'user',
                 'content': _build_user_prompt(
-                    cv_text, job_description, job_title, company
+                    cv_text, job_description, job_title, company, contract,
                 ),
             },
             {'role': 'assistant', 'content': previous_draft},

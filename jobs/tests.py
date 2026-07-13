@@ -1,3 +1,4 @@
+import json
 import io
 import os
 import tempfile
@@ -1298,6 +1299,266 @@ class ATSCategoryBreakdownTests(TestCase):
             max(categories, key=lambda k: categories[k]['weight']), 'keyword_matching'
         )
         self.assertEqual(report['score_needed'], 90)
+
+
+# A modern-stack advert: almost none of these tools are in the 115-word vocab.
+MODERN_JD = """Senior Analytics Engineer - London
+
+What We're Looking For
+- Strong dbt and Snowflake experience is essential
+- Build pipelines with Dagster and Fivetran
+- Model data for Looker dashboards
+- Terraform for infrastructure
+- Excellent communication
+
+Benefits
+- 25 days holiday and private healthcare
+"""
+
+MODERN_CONTRACT = {
+    'job_title': 'senior analytics engineer',
+    'title_variants': ['analytics engineer', 'data engineer'],
+    'hard_skills': ['dbt', 'snowflake', 'dagster', 'fivetran', 'looker', 'terraform'],
+    'acronyms': [['ci/cd', 'continuous integration']],
+    'soft_skills': ['communication'],
+    'must_have': ['dbt', 'snowflake'],
+    'source': 'test',
+}
+
+
+class JobKeywordContractTests(TestCase):
+    def test_contract_helpers_flatten_both_acronym_forms(self):
+        from jobs.services.job_keywords import all_contract_terms
+        terms = all_contract_terms(MODERN_CONTRACT)
+        self.assertIn('dbt', terms)
+        self.assertIn('ci/cd', terms)
+        self.assertIn('continuous integration', terms)
+
+    def test_term_present_is_word_boundary_safe(self):
+        from jobs.services.job_keywords import term_present
+        self.assertTrue(term_present('ci/cd', 'we use ci/cd pipelines'))
+        self.assertTrue(term_present('r', 'i code in r daily'))
+        self.assertFalse(term_present('r', 'i code in ruby daily'))
+        self.assertFalse(term_present('dbt', 'we use dbtx'))
+
+    @override_settings(OPENAI_API_KEY='')
+    def test_fallback_contract_without_openai_still_finds_skills(self):
+        from jobs.services.job_keywords import extract_job_keywords
+        contract = extract_job_keywords(MODERN_JD, 'Senior Analytics Engineer')
+        self.assertEqual(contract['source'], 'fallback')
+        self.assertIn('terraform', contract['hard_skills'])
+        # The fallback cannot know what is mandatory, so it claims nothing rather
+        # than guessing and knocking a candidate out on a guess.
+        self.assertEqual(contract['must_have'], [])
+
+    @override_settings(OPENAI_API_KEY='')
+    def test_fallback_excludes_benefits_boilerplate(self):
+        from jobs.services.job_keywords import extract_job_keywords
+        contract = extract_job_keywords(MODERN_JD)
+        for noise in ('holiday', 'healthcare', 'benefits'):
+            self.assertNotIn(noise, contract['hard_skills'])
+
+    @override_settings(OPENAI_API_KEY='sk-test')
+    @mock.patch('openai.OpenAI')
+    def test_openai_contract_is_normalised(self, mock_openai):
+        from jobs.services.job_keywords import extract_job_keywords
+        payload = {
+            'job_title': 'Senior Analytics Engineer',
+            'title_variants': ['Analytics Engineer'],
+            'hard_skills': ['dbt', 'Snowflake', 'DBT', 'experience', 'x' * 200],
+            'acronyms': [['CI/CD', 'Continuous Integration'], ['bad']],
+            'soft_skills': ['Communication'],
+            'must_have': ['dbt', 'not-a-real-skill'],
+        }
+        mock_openai.return_value.chat.completions.create.return_value = mock.Mock(
+            choices=[mock.Mock(message=mock.Mock(content=json.dumps(payload)))]
+        )
+        contract = extract_job_keywords(MODERN_JD, 'Senior Analytics Engineer')
+
+        self.assertEqual(contract['source'], 'openai')
+        # Lowercased and de-duplicated; noise words and over-long phrases dropped.
+        self.assertEqual(contract['hard_skills'], ['dbt', 'snowflake'])
+        self.assertNotIn('experience', contract['hard_skills'])
+        # must_have is only meaningful as a subset of hard_skills.
+        self.assertEqual(contract['must_have'], ['dbt'])
+        # Malformed acronym pairs are discarded, valid ones lowercased.
+        self.assertEqual(contract['acronyms'], [['ci/cd', 'continuous integration']])
+
+    @override_settings(OPENAI_API_KEY='sk-test')
+    @mock.patch('openai.OpenAI')
+    def test_openai_failure_falls_back_never_raises(self, mock_openai):
+        from jobs.services.job_keywords import extract_job_keywords
+        mock_openai.side_effect = RuntimeError('api down')
+        contract = extract_job_keywords(MODERN_JD, 'Senior Analytics Engineer')
+        self.assertEqual(contract['source'], 'fallback')
+        self.assertTrue(contract['hard_skills'])
+
+    def test_empty_description_returns_empty_contract(self):
+        from jobs.services.job_keywords import extract_job_keywords
+        contract = extract_job_keywords('', 'Engineer')
+        self.assertEqual(contract['hard_skills'], [])
+        self.assertEqual(contract['source'], 'empty')
+
+
+class ContractScoringTests(TestCase):
+    """The Jobscan-style number: coverage of the terms the job actually asked for."""
+
+    def _cv(self, skills):
+        return f"""JANE DOE
+jane@example.com | London
+
+PROFESSIONAL PROFILE
+Senior Analytics Engineer.
+
+KEY SKILLS
+{chr(10).join('- ' + s for s in skills)}
+
+PROFESSIONAL EXPERIENCE
+Analytics Engineer | Acme | London
+Jan 2019 - Present
+- Did the work.
+
+EDUCATION
+BSc Computing | Leeds | 2015 - 2018
+"""
+
+    def test_full_coverage_scores_high(self):
+        from jobs.services.ats_checker import score_cv_against_contract
+        cv = self._cv(['dbt', 'Snowflake', 'Dagster', 'Fivetran', 'Looker',
+                       'Terraform', 'CI/CD'])
+        result = score_cv_against_contract(cv, MODERN_CONTRACT)
+        self.assertGreaterEqual(result['score'], 90)
+        self.assertEqual(result['missing_hard'], [])
+        self.assertEqual(result['missing_must'], [])
+        self.assertTrue(result['title_ok'])
+
+    def test_missing_must_haves_are_reported_and_cost_the_score(self):
+        from jobs.services.ats_checker import score_cv_against_contract
+        cv = self._cv(['Looker', 'Terraform'])
+        result = score_cv_against_contract(cv, MODERN_CONTRACT)
+        self.assertIn('dbt', result['missing_must'])
+        self.assertIn('snowflake', result['missing_must'])
+        self.assertLess(result['score'], 60)
+
+    def test_acronym_expansion_counts_as_coverage(self):
+        """A CV saying 'continuous integration' satisfies an advert's 'ci/cd'."""
+        from jobs.services.ats_checker import score_cv_against_contract
+        cv = self._cv(['dbt', 'Snowflake', 'Dagster', 'Fivetran', 'Looker',
+                       'Terraform', 'Continuous Integration'])
+        result = score_cv_against_contract(cv, MODERN_CONTRACT)
+        self.assertEqual(result['missing_acronyms'], [])
+
+    def test_genuine_missing_terms_puts_must_haves_first(self):
+        from jobs.services.ats_checker import (
+            genuine_missing_terms,
+            score_cv_against_contract,
+        )
+        result = score_cv_against_contract(self._cv(['Looker']), MODERN_CONTRACT)
+        terms = genuine_missing_terms(result)
+        self.assertEqual(set(terms[:2]), {'dbt', 'snowflake'})  # must-haves lead
+        self.assertIn('dagster', terms)
+
+    def test_scoring_never_raises_on_junk(self):
+        from jobs.services.ats_checker import score_cv_against_contract
+        self.assertEqual(score_cv_against_contract('', MODERN_CONTRACT)['score'], 0)
+        self.assertEqual(score_cv_against_contract('cv text', None)['score'], 0)
+
+    def test_contract_catches_skills_the_hardcoded_vocab_cannot_see(self):
+        """The whole point: dbt/Snowflake/Dagster are invisible to SKILL_VOCAB."""
+        from jobs.services.keyword_extractor import extract_skills_from_text
+        from jobs.services.ats_checker import score_cv_against_contract
+
+        vocab_view = extract_skills_from_text(MODERN_JD)
+        self.assertNotIn('snowflake', vocab_view)
+        self.assertNotIn('dbt', vocab_view)
+
+        # A CV with none of the real tools would look fine to the old vocabulary,
+        # but the contract scores it for what it is.
+        cv = self._cv(['Terraform', 'Communication'])
+        self.assertLess(score_cv_against_contract(cv, MODERN_CONTRACT)['score'], 55)
+
+    def test_fabrication_guard_covers_contract_skills(self):
+        """An invented 'snowflake' must be caught, though no vocabulary knows it."""
+        from jobs.services.ats_checker import unsupported_claims
+        original = 'Jane Doe. I use Looker and Terraform.'
+        tailored = original + ' Also expert in Snowflake and dbt.'
+        claims = unsupported_claims(original, tailored, MODERN_JD, MODERN_CONTRACT)
+        self.assertIn('snowflake', claims)
+        self.assertIn('dbt', claims)
+        self.assertNotIn('looker', claims)
+
+    def test_compositional_terms_are_evidenced_word_by_word(self):
+        """"dbt testing" is genuine if the CV says "using dbt, adding tests".
+
+        Restating real experience in the advert's wording is the entire job of
+        tailoring. A guard that flagged this would cry wolf on every honest
+        rewrite and make the honesty signal worthless.
+        """
+        from jobs.services.ats_checker import unsupported_claims
+        contract = dict(MODERN_CONTRACT,
+                        hard_skills=['dbt testing', 'dbt macros', 'curated marts'],
+                        must_have=[])
+        original = 'Rebuilt warehouse models using dbt, adding tests and macros.'
+        tailored = original + ' Led dbt testing and wrote dbt macros.'
+        claims = unsupported_claims(original, tailored, MODERN_JD, contract)
+        self.assertNotIn('dbt testing', claims)
+        self.assertNotIn('dbt macros', claims)
+
+    def test_compositional_check_still_catches_real_invention(self):
+        from jobs.services.ats_checker import unsupported_claims
+        contract = dict(MODERN_CONTRACT,
+                        hard_skills=['curated marts', 'performance tuning'],
+                        must_have=[])
+        original = 'Rebuilt warehouse models using dbt, adding tests and macros.'
+        # Neither "curated"/"marts" nor "performance"/"tuning" appear anywhere.
+        tailored = original + ' Built curated marts and led performance tuning.'
+        claims = unsupported_claims(original, tailored, MODERN_JD, contract)
+        self.assertIn('curated marts', claims)
+        self.assertIn('performance tuning', claims)
+
+    def test_reworded_claims_are_flagged_for_review_not_blocked(self):
+        """"cost optimisation" for "tuning warehouse costs" is a rewording.
+
+        Blocking these would fire on nearly every honest rewrite, and a warning
+        that always fires is a warning nobody reads. They are surfaced for the
+        candidate to eyeball instead.
+        """
+        from jobs.services.ats_checker import (
+            claims_needing_review,
+            unsupported_claims,
+        )
+        contract = dict(MODERN_CONTRACT,
+                        hard_skills=['cost optimisation', 'snowflake'],
+                        must_have=[])
+        original = 'Ran Snowflake and spent time tuning warehouse costs.'
+        tailored = original + ' Led cost optimisation on Snowflake.'
+
+        # Grounded in "costs", so not an invention -> does not block the draft.
+        self.assertNotIn(
+            'cost optimisation',
+            unsupported_claims(original, tailored, MODERN_JD, contract),
+        )
+        # But surfaced, because "optimisation" is our word, not the candidate's.
+        self.assertIn(
+            'cost optimisation',
+            claims_needing_review(original, tailored, MODERN_JD, contract),
+        )
+
+    def test_wholly_invented_single_word_skill_always_blocks(self):
+        from jobs.services.ats_checker import (
+            claims_needing_review,
+            unsupported_claims,
+        )
+        contract = dict(MODERN_CONTRACT, hard_skills=['snowflake'], must_have=[])
+        original = 'I use Looker and Terraform.'
+        tailored = original + ' Expert in Snowflake.'
+        self.assertIn(
+            'snowflake', unsupported_claims(original, tailored, MODERN_JD, contract)
+        )
+        self.assertNotIn(
+            'snowflake',
+            claims_needing_review(original, tailored, MODERN_JD, contract),
+        )
 
 
 class ATSFileChecksTests(TestCase):

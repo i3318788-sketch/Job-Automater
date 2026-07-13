@@ -365,7 +365,14 @@ def _count_term(haystack_lower, term):
 
 
 def _tokens(text):
-    return re.findall(r"[a-z0-9+#./]+", (text or '').lower())
+    """Tokenise, keeping the punctuation that lives *inside* skill names.
+
+    ``.`` and ``/`` are word characters here so that "node.js", "ci/cd" and
+    ".net" survive intact — but a trailing one is sentence punctuation, and
+    leaving it attached means "macros." never matches "macros".
+    """
+    raw = re.findall(r"[a-z0-9+#./]+", (text or '').lower())
+    return [t for t in (token.rstrip('./') for token in raw) if t]
 
 
 def _sentences(text):
@@ -2200,20 +2207,165 @@ def fabricated_metrics(original_cv_text, tailored_cv_text):
     return sorted(set(invented))
 
 
-def unsupported_claims(original_cv_text, tailored_cv_text, job_description):
-    """Hard skills the tailored CV claims that the original CV gives no evidence for.
+# ---------------------------------------------------------------------------
+# Contract-based coverage scoring (the Jobscan-style number)
+# ---------------------------------------------------------------------------
+# Weights for score_cv_against_contract. Hard-skill and must-have coverage
+# dominate, as they do in the tools candidates actually get measured by.
+CONTRACT_WEIGHTS = {
+    'hard_skills': 0.40,
+    'must_have': 0.25,
+    'title': 0.15,
+    'acronyms': 0.10,
+    'sections': 0.10,
+}
+
+
+def score_cv_against_contract(cv_text, contract):
+    """Score a CV's coverage of a job's keyword contract (0-100). Never raises.
+
+    This is the number to compare against an external ATS tool: it measures
+    exactly the terms the job asks for, rather than the terms our vocabulary
+    happens to know. The seven-phase report remains the diagnostic view; this is
+    the headline.
+    """
+    from .job_keywords import term_present
+
+    empty = {
+        'score': 0, 'missing_hard': [], 'missing_must': [], 'missing_acronyms': [],
+        'title_ok': False, 'breakdown': {},
+    }
+    if not (cv_text and contract):
+        return empty
+
+    try:
+        lowered = cv_text.lower()
+
+        def covered(term):
+            """Is this term on the CV, in any accepted surface form?"""
+            if term_present(term, lowered):
+                return True
+            # An acronym is satisfied by its expansion, and vice versa.
+            for acronym, expansion in contract.get('acronyms') or []:
+                if term == acronym and term_present(expansion, lowered):
+                    return True
+                if term == expansion and term_present(acronym, lowered):
+                    return True
+            return False
+
+        hard = contract.get('hard_skills') or []
+        must = contract.get('must_have') or []
+        acronyms = contract.get('acronyms') or []
+
+        found_hard = [t for t in hard if covered(t)]
+        missing_hard = [t for t in hard if t not in found_hard]
+        found_must = [t for t in must if covered(t)]
+        missing_must = [t for t in must if t not in found_must]
+
+        # An acronym counts as covered when EITHER form appears; ideally both do,
+        # since different ATS platforms look for different forms.
+        found_acronyms, missing_acronyms = [], []
+        for pair in acronyms:
+            if any(term_present(form, lowered) for form in pair):
+                found_acronyms.append(pair[0])
+            else:
+                missing_acronyms.append(pair[0])
+
+        titles = [contract.get('job_title') or ''] + (contract.get('title_variants') or [])
+        titles = [t for t in titles if t]
+        title_ok = any(term_present(t, lowered) for t in titles)
+        if not title_ok and titles:
+            # Partial credit for a close title ("Backend Engineer" vs "Senior
+            # Backend Engineer") — an ATS fuzzy-matches titles, it doesn't demand
+            # a literal string.
+            title_score = max(_fuzzy_ratio(t, lowered[:400]) for t in titles)
+            title_score = 100 if title_score >= 85 else (60 if title_score >= 50 else 0)
+        else:
+            title_score = 100 if title_ok else 50  # no title stated -> neutral
+
+        sections = _section_coverage(cv_text)
+
+        def pct(found, total):
+            return 100.0 if not total else len(found) / len(total) * 100.0
+
+        breakdown = {
+            'hard_skills': round(pct(found_hard, hard), 1),
+            'must_have': round(pct(found_must, must), 1),
+            'title': float(title_score),
+            'acronyms': round(pct(found_acronyms, acronyms), 1),
+            'sections': float(sections),
+        }
+        score = _clamp(
+            sum(breakdown[k] * w for k, w in CONTRACT_WEIGHTS.items())
+        )
+
+        return {
+            'score': score,
+            'missing_hard': missing_hard,
+            'missing_must': missing_must,
+            'missing_acronyms': missing_acronyms,
+            'found_hard': found_hard,
+            'title_ok': bool(title_ok),
+            'breakdown': breakdown,
+        }
+    except Exception:
+        logger.exception('Contract scoring failed')
+        return empty
+
+
+def _section_coverage(cv_text):
+    """Percentage of the sections an ATS needs in order to parse a CV at all."""
+    standard, _creative = find_headings(cv_text)
+    found = {
+        SECTION_ALIASES[_normalize_heading(h)]
+        for h in standard if _normalize_heading(h) in SECTION_ALIASES
+    }
+    required = {'profile', 'experience', 'education', 'skills'}
+    have = len(required & found)
+    # Contact details count for the fifth slot.
+    if re.search(r'[\w.+-]+@[\w-]+\.\w+|\+?\d[\d\s()-]{7,}', cv_text or ''):
+        have += 1
+    return _clamp(have / (len(required) + 1) * 100)
+
+
+def genuine_missing_terms(ats_result, limit=15):
+    """The terms a second tailoring pass should try to recover, most important first.
+
+    Must-haves before nice-to-haves, and acronyms last. These are *candidates for
+    recovery*, not instructions to fabricate: the tailoring prompt only surfaces a
+    term when the original CV genuinely evidences it, and the fabrication guard
+    rejects any draft that claims one it does not.
+    """
+    if not ats_result:
+        return []
+    ordered = (
+        list(ats_result.get('missing_must') or [])
+        + [t for t in (ats_result.get('missing_hard') or [])
+           if t not in (ats_result.get('missing_must') or [])]
+        + list(ats_result.get('missing_acronyms') or [])
+    )
+    seen, out = set(), []
+    for term in ordered:
+        if term and term not in seen:
+            seen.add(term)
+            out.append(term)
+    return out[:limit]
+
+
+def _classify_claims(original_cv_text, tailored_cv_text, job_description,
+                     contract=None):
+    """Split the rewrite's skill claims into (invented, needs-review).
 
     A model told to raise a keyword score will, sooner or later, add a skill the
     candidate does not have — we saw it add "CI/CD" to a CV whose only relevant
     line was "helped out with deployments". Instructions alone do not prevent
     this, so the output is verified against the source instead of trusted.
 
-    Only hard skills and certifications are checked. Soft skills and role nouns
-    are rephrasings by nature ("worked in a team" -> "collaboration"), and
-    flagging those would be noise.
+    Only hard skills and certifications are checked. Soft skills are rephrasings
+    by nature ("worked in a team" -> "collaboration"), and flagging them is noise.
     """
     if not (original_cv_text and tailored_cv_text):
-        return []
+        return [], []
 
     original = original_cv_text.lower()
     tailored = tailored_cv_text.lower()
@@ -2226,20 +2378,83 @@ def unsupported_claims(original_cv_text, tailored_cv_text, job_description):
         if _contains_term(original, skill):
             supported.update(implied)
 
-    claimed = []
-    for keyword in extract_jd_keywords(job_description or ''):
-        if keyword['type'] not in ('hard', 'certification'):
+    # Check every skill the job actually asks for. Taking these from the contract
+    # rather than the built-in vocabulary is what lets the guard catch an invented
+    # "snowflake" or "dbt" — terms the vocabulary has never heard of.
+    if contract:
+        candidates = list(contract.get('hard_skills') or [])
+        candidates += [pair[0] for pair in (contract.get('acronyms') or [])]
+    else:
+        candidates = [
+            k['term'] for k in extract_jd_keywords(job_description or '')
+            if k['type'] in ('hard', 'certification')
+        ]
+
+    original_stems = {_stem(t) for t in _tokens(original)}
+
+    def evidence_for(term):
+        """How well the original CV supports this claim: full, partial or none.
+
+        The distinction matters. Claiming "Snowflake" on a CV that has never
+        touched it is a lie, and must block the draft. Writing "cost optimisation"
+        for a CV that says "spent a lot of time tuning warehouse costs" is the
+        rephrasing that tailoring exists to do — treating that as a fabrication
+        would make the honesty flag fire on almost every honest rewrite, and a
+        warning that always fires is a warning nobody reads.
+        """
+        if term.lower() in supported or checker._found_in(original, term):
+            return 'full'
+
+        words = [w for w in _tokens(term) if w not in STOPWORDS]
+        if len(words) > 1:
+            hits = sum(1 for w in words if _stem(w) in original_stems)
+            if hits == len(words):
+                return 'full'    # every word of the phrase is evidenced
+            if hits:
+                return 'partial'  # reworded, but grounded in something real
+        return 'none'
+
+    invented, review = [], []
+    for term in candidates:
+        if term in invented or term in review:
             continue
-        term = keyword['term']
-        if term.lower() in supported:
-            continue
-        # Claimed in the rewrite, but nothing in the original CV supports it.
         in_tailored = any(
             _contains_term(tailored, form) for form in _synonyms_for(term)
         )
-        if in_tailored and not checker._found_in(original, term):
-            claimed.append(term)
-    return claimed
+        if not in_tailored:
+            continue
+        evidence = evidence_for(term)
+        if evidence == 'none':
+            invented.append(term)
+        elif evidence == 'partial':
+            review.append(term)
+
+    return invented, review
+
+
+def unsupported_claims(original_cv_text, tailored_cv_text, job_description,
+                       contract=None):
+    """Skills the tailored CV claims with NO support at all in the original.
+
+    The blocking check: these are outright fabrications, not rewordings.
+    """
+    invented, _review = _classify_claims(
+        original_cv_text, tailored_cv_text, job_description, contract
+    )
+    return invented
+
+
+def claims_needing_review(original_cv_text, tailored_cv_text, job_description,
+                          contract=None):
+    """Reworded claims that are grounded in the CV but not literally in it.
+
+    Not fabrications, but the candidate should confirm each one reads fairly —
+    "cost optimisation" for "tuning warehouse costs" is fine; a stretch is not.
+    """
+    _invented, review = _classify_claims(
+        original_cv_text, tailored_cv_text, job_description, contract
+    )
+    return review
 
 
 def check_cv_format(cv_text, file_path=None):
