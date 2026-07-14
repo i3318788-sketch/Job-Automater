@@ -1451,6 +1451,58 @@ MODERN_CONTRACT = {
 
 
 class JobKeywordContractTests(TestCase):
+    # -- the job title is not a requirement ---------------------------------
+
+    def test_title_echoes_are_not_requirements(self):
+        """Words mined only because the advert repeats its own title are dropped.
+
+        Verbatim from a real run: a 'Digital Marketing Executive' advert yielded
+        exactly these five "skills", every one of them a fragment of its own
+        title. The candidate's CV contained all five — their job title is Digital
+        Marketing Executive — so the job scored 100/100 while telling us nothing.
+        """
+        from jobs.services.job_keywords import drop_title_echoes
+
+        mined = ['digital', 'digital marketing', 'executive', 'marketing',
+                 'marketing executive']
+        self.assertEqual(
+            drop_title_echoes(mined, 'Digital Marketing Executive'), []
+        )
+
+    def test_a_real_skill_named_in_the_title_survives(self):
+        """A 'Python Developer' advert really does require Python."""
+        from jobs.services.job_keywords import drop_title_echoes
+
+        kept = drop_title_echoes(['python', 'developer', 'django'],
+                                 'Python Developer')
+        self.assertIn('python', kept)   # a concrete skill, title or not
+        self.assertIn('django', kept)   # not in the title at all
+        self.assertNotIn('developer', kept)  # pure title noise
+
+    def test_title_only_advert_ends_up_unscorable(self):
+        """End to end: the fake 100 becomes an honest "not scored"."""
+        from jobs.services.ats_checker import score_cv_against_contract
+        from jobs.services.job_keywords import extract_job_keywords
+
+        # The real advert text, from the run that produced a 100.
+        advert = (
+            'An exciting opportunity has arisen for a Digital Marketing '
+            'Executive to join the Marketing team. We are looking for a '
+            'Digital Marketing Executive with a broad range of digital '
+            'marketing experience.'
+        )
+        contract = extract_job_keywords(
+            advert, 'Digital Marketing Executive', use_openai=False,
+        )
+        self.assertEqual(contract['hard_skills'], [])
+
+        cv = 'Ibrahim Khan\nDigital Marketing Executive\n\nEXPERIENCE\n' \
+             'Digital Marketing Executive | Acme | 2020 - Present\n' \
+             'SKILLS\nMarketing, campaigns\nEDUCATION\nBSc Marketing'
+        result = score_cv_against_contract(cv, contract)
+        self.assertIsNone(result['score'], 'must not invent a score')
+        self.assertNotEqual(result['score'], 100)
+
     def test_contract_helpers_flatten_both_acronym_forms(self):
         from jobs.services.job_keywords import all_contract_terms
         terms = all_contract_terms(MODERN_CONTRACT)

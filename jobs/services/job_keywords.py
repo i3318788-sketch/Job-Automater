@@ -190,9 +190,50 @@ def _extract_via_openai(job_description, job_title):
     return contract
 
 
+def _term_tokens(text):
+    return re.findall(r"[a-z0-9+#./]+", (text or '').lower())
+
+
+def drop_title_echoes(terms, job_title):
+    """Remove mined "skills" that only repeat the job's own title.
+
+    A short advert says its title several times and little else, so the phrase
+    miner promotes the title's own words to requirements: a "Digital Marketing
+    Executive" ad yielded hard skills of ``digital``, ``marketing``, ``executive``,
+    ``digital marketing`` and ``marketing executive``. The candidate's CV contains
+    all of them — because their job title is Digital Marketing Executive — so the
+    advert scored a flawless 100/100 while telling us nothing about the job.
+
+    Covering a job's title is not covering its requirements. A term is dropped
+    when every word of it already appears in the title.
+
+    A concrete skill from the vocabulary is kept even when the title names it: a
+    "Python Developer" advert really does require Python, and dropping it would
+    throw away the one requirement the advert actually stated.
+    """
+    from .keyword_extractor import SKILL_VOCAB
+
+    title_tokens = set(_term_tokens(job_title))
+    if not title_tokens:
+        return terms
+
+    vocabulary = {s.lower() for s in SKILL_VOCAB}
+    kept = []
+    for term in terms:
+        if term.lower() in vocabulary:
+            kept.append(term)
+            continue
+        tokens = _term_tokens(term)
+        if tokens and all(t in title_tokens for t in tokens):
+            continue  # nothing here but the title, said back to us
+        kept.append(term)
+    return kept
+
+
 def _normalise(data, job_title, source):
     """Validate and clean a raw contract dict from the model."""
     hard = _clean_terms(data.get('hard_skills'), MAX_HARD_SKILLS)
+    hard = drop_title_echoes(hard, data.get('job_title') or job_title)
     # must_have is only meaningful as a subset of hard_skills.
     must = [t for t in _clean_terms(data.get('must_have'), MAX_HARD_SKILLS) if t in hard]
 
@@ -243,6 +284,7 @@ def _fallback_contract(job_description, job_title):
     ]
 
     hard = _clean_terms(hard + extra, MAX_HARD_SKILLS)
+    hard = drop_title_echoes(hard, job_title)
     soft = [s for s in SOFT_SKILLS if term_present(s, lowered)][:MAX_SOFT_SKILLS]
     acronyms = [
         [a, e] for a, e in COMMON_ACRONYMS
