@@ -4,7 +4,6 @@ Uses a service account. Best-effort throughout: if credentials are missing or th
 API fails, the error is logged and the caller continues — a search must never
 fail because of logging.
 """
-import datetime
 import logging
 import os
 import re
@@ -18,13 +17,30 @@ SCOPES = [
     'https://www.googleapis.com/auth/drive',
 ]
 
+# The sheet's columns, A-L, in order. build_row() must return values in exactly
+# this order and of exactly this length — the two are checked against each other
+# on every write, because a row that is one item short silently shifts every
+# value after it into the wrong column.
 HEADERS = [
-    'Date', 'Job Title', 'Company', 'Location', 'Salary',
-    'Match Score', 'Match Reason', 'Sponsorship Flag',
-    'Application Link', 'Tailored CV Filename',
-    'CV Parsed Skills', 'Job Required Skills',
-    'Missing Skills', 'ATS Score', 'Status',
+    'Job Title',                # A
+    'Company Name',             # B
+    'Location',                 # C
+    'Date Posted',              # D
+    'Employment Type',          # E
+    'Seniority Level',          # F
+    'Salary',                   # G
+    'Sponsorship Flag',         # H
+    'Match Score',              # I
+    'Match Reason',             # J
+    'Direct Application Link',  # K
+    'Tailored CV Filename',     # L
 ]
+
+# Column L. Derived, so adding a header cannot leave this stale.
+LAST_COLUMN = chr(ord('A') + len(HEADERS) - 1)
+
+# Row 1 is the header row. Data starts at row 2 and never above it.
+FIRST_DATA_ROW = 2
 
 # Characters Google Sheets disallows in a worksheet title.
 _INVALID_TAB_CHARS = re.compile(r"[\[\]:*?/\\]")
@@ -34,15 +50,6 @@ def sanitize_tab_name(name):
     """Make a candidate name safe for use as a worksheet title."""
     cleaned = _INVALID_TAB_CHARS.sub('-', str(name or '').strip())
     return (cleaned or 'Candidate')[:50]
-
-
-def _join(values):
-    """Render a list of skills as a comma-separated cell value."""
-    if not values:
-        return ''
-    if isinstance(values, str):
-        return values
-    return ', '.join(str(v) for v in values)
 
 
 class GoogleSheetsLogger:
@@ -99,7 +106,13 @@ class GoogleSheetsLogger:
                 worksheet = self.sheet.add_worksheet(
                     title=title, rows=1000, cols=len(HEADERS)
                 )
-                worksheet.append_row(HEADERS, value_input_option='USER_ENTERED')
+                # Headers go in row 1 of the new tab, by explicit range. An
+                # existing tab is never touched — its row 1 is left exactly as
+                # the candidate set it up.
+                worksheet.update(
+                    range_name=f'A1:{LAST_COLUMN}1', values=[HEADERS],
+                    value_input_option='USER_ENTERED',
+                )
                 logger.info('Created Google Sheets tab "%s"', title)
                 return worksheet
         except Exception:
@@ -107,44 +120,66 @@ class GoogleSheetsLogger:
             return None
 
     def build_row(self, job, cv_skills=None):
-        """Build the row values for a Job, in HEADERS order."""
+        """Build one job's values for columns A-L, in HEADERS order.
+
+        ``cv_skills`` is accepted and ignored: the sheet has no skills columns.
+        The parameter stays so callers do not have to change.
+        """
         tailored_name = (
             os.path.basename(job.tailored_pdf.name) if job.tailored_pdf else ''
         )
-        return [
-            datetime.date.today().isoformat(),
-            job.title,
-            job.company,
-            job.location,
-            job.salary or '',
+        row = [
+            job.title or '',                                # A Job Title
+            job.company or '',                              # B Company Name
+            job.location or '',                             # C Location
+            job.date_posted or '',                          # D Date Posted
+            job.employment_type or '',                      # E Employment Type
+            job.seniority_level or '',                      # F Seniority Level
+            job.salary or '',                               # G Salary
+            job.get_sponsorship_flag_display(),             # H Sponsorship Flag
             # Blank, not 0: an unscored job has no score, and writing a zero into
             # the sheet would read as "terrible match" rather than "not measured".
-            job.match_score if job.match_score is not None else '',
-            job.match_reason or '',
-            job.get_sponsorship_flag_display(),
-            job.application_link or '',
-            tailored_name,
-            _join(cv_skills),
-            _join(job.job_skills),
-            _join(job.missing_skills),
-            job.ats_score if job.ats_score is not None else '',
-            'Active',
+            job.match_score if job.match_score is not None else '',   # I Match Score
+            job.match_reason or '',                         # J Match Reason
+            job.application_link or '',                     # K Direct Application Link
+            tailored_name,                                  # L Tailored CV Filename
         ]
+        if len(row) != len(HEADERS):  # pragma: no cover - guards a coding error
+            raise ValueError(
+                f'build_row produced {len(row)} values for {len(HEADERS)} columns; '
+                'a mismatch shifts every later value into the wrong column.'
+            )
+        return row
+
+    def next_data_row(self, worksheet):
+        """The first free row, never above the header row.
+
+        ``append_row`` is not used here. It appends after whatever gspread decides
+        the last row of the "table" is, which is why rows landed above the headers
+        when the sheet's first rows were not what it expected. Reading the used
+        range and writing to an explicit A-L range removes the guesswork: the
+        target cells are chosen here, not inferred by the API.
+        """
+        existing = worksheet.get_all_values()
+        return max(len(existing) + 1, FIRST_DATA_ROW)
 
     def log_job(self, job, candidate_name, cv_skills=None):
-        """Append one job row to the candidate's tab. Returns True on success."""
+        """Write one job into columns A-L of the next free row. True on success."""
         if not self.enabled:
             return False
         worksheet = self.get_or_create_worksheet(candidate_name)
         if worksheet is None:
             return False
         try:
-            worksheet.append_row(
-                self.build_row(job, cv_skills), value_input_option='USER_ENTERED'
+            row = self.build_row(job)
+            index = self.next_data_row(worksheet)
+            target = f'A{index}:{LAST_COLUMN}{index}'
+            worksheet.update(
+                range_name=target, values=[row], value_input_option='USER_ENTERED',
             )
             logger.info(
-                'Logged job %s to Google Sheets tab "%s"',
-                job.pk, sanitize_tab_name(candidate_name),
+                'Logged job %s to Google Sheets tab "%s" at %s',
+                job.pk, sanitize_tab_name(candidate_name), target,
             )
             return True
         except Exception:

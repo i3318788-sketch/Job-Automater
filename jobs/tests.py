@@ -112,6 +112,84 @@ class ApifyInputTests(TestCase):
         self.assertEqual(job['applyLink'], 'https://x/1')
         self.assertEqual(job['title'], 'Dev')
 
+    # -- employer index pages are not jobs ----------------------------------
+    # These payloads are copied verbatim from a real Apify dataset. The board's
+    # "all jobs at <employer>" index page gets scraped as if it were a listing:
+    # the title is the company, the company is the scraper's stray "Posted"
+    # label, and there is no description, location or salary to work with.
+
+    EMPLOYER_INDEX_ITEM = {
+        'title': 'Sir Robert McAlpine',
+        'company': 'Posted',
+        'location': '',
+        'description': '',
+        'salary_raw': '',
+        'date_posted': '2 days ago',
+        'url': 'https://www.cv-library.co.uk/list-jobs/298205/sir-robert-mcalpine-jobs',
+        'direct_apply_url': 'https://www.cv-library.co.uk/list-jobs/298205/sir-robert-mcalpine-jobs',
+        'source': 'cv-library.co.uk',
+    }
+
+    REAL_JOB_ITEM = {
+        'title': 'Web Developer',
+        'company': 'South East Water',
+        'location': 'Kent',
+        'description': 'PHP, Laravel and MySQL. Building internal tooling.',
+        'url': 'https://www.cv-library.co.uk/job/223344/web-developer',
+        'direct_apply_url': 'https://www.cv-library.co.uk/job/223344/web-developer',
+        'source': 'cv-library.co.uk',
+    }
+
+    def test_employer_index_page_is_not_a_job_advert(self):
+        from jobs.services.apify_service import is_job_advert
+        self.assertFalse(is_job_advert(self.EMPLOYER_INDEX_ITEM))
+
+    def test_real_listing_is_a_job_advert(self):
+        from jobs.services.apify_service import is_job_advert
+        self.assertTrue(is_job_advert(self.REAL_JOB_ITEM))
+
+    def test_posting_date_mistaken_for_a_company_is_rejected(self):
+        """The 'company' is a date artifact — whatever the link looks like."""
+        from jobs.services.apify_service import is_job_advert
+        for artifact in ('Posted', 'posted today', 'Today', 'Yesterday',
+                         '2 days ago', '3 hours ago', 'just now'):
+            item = dict(self.REAL_JOB_ITEM, company=artifact)
+            self.assertFalse(
+                is_job_advert(item), f'{artifact!r} must not pass as a company'
+            )
+
+    def test_a_real_company_is_never_mistaken_for_a_date(self):
+        """The date filter must not eat legitimate employers."""
+        from jobs.services.apify_service import is_job_advert
+        for company in ('Today Translations', 'Posted Solutions Ltd',
+                        'Yesterday Media Group', 'Hays', 'Sir Robert McAlpine'):
+            item = dict(self.REAL_JOB_ITEM, company=company)
+            self.assertTrue(
+                is_job_advert(item), f'{company!r} is a real employer'
+            )
+
+    def test_search_jobs_drops_employer_index_pages(self):
+        """End to end: the junk never reaches the caller."""
+        from jobs.services import apify_service
+
+        items = [self.REAL_JOB_ITEM, self.EMPLOYER_INDEX_ITEM, self.REAL_JOB_ITEM]
+
+        with override_settings(APIFY_API_TOKEN='token'):
+            # ApifyClient is imported inside search_jobs, so patch it at source.
+            with mock.patch('apify_client.ApifyClient') as client_cls:
+                client = client_cls.return_value
+                client.actor.return_value.call.return_value = {
+                    'defaultDatasetId': 'ds1'
+                }
+                client.dataset.return_value.iterate_items.return_value = iter(items)
+
+                jobs = apify_service.search_jobs(['United Kingdom'])
+
+        self.assertEqual(len(jobs), 2)
+        titles = [j['title'] for j in jobs]
+        self.assertNotIn('Sir Robert McAlpine', titles)
+        self.assertEqual(set(titles), {'Web Developer'})
+
 
 class KeywordExtractorTests(TestCase):
     def test_extract_skills_from_text(self):
@@ -1478,6 +1556,48 @@ BSc Computing | Leeds | 2015 - 2018
         self.assertEqual(result['missing_must'], [])
         self.assertTrue(result['title_ok'])
 
+    def test_title_alone_is_not_scorable(self):
+        """An advert we mined no requirements from has no honest score.
+
+        A matching job title says the advert is called what the candidate calls
+        themselves — nothing about whether they can do the job. Scoring on the
+        title plus the CV's section headings (both properties of the CV alone)
+        handed a perfect 100 to every job whose requirements we failed to parse.
+        """
+        from jobs.services.ats_checker import score_cv_against_contract
+
+        cv = self._cv(['dbt', 'Snowflake', 'Dagster'])
+        title_only = {
+            'job_title': 'Analytics Engineer',
+            'title_variants': [],
+            'hard_skills': [],
+            'must_have': [],
+            'acronyms': [],
+            'source': 'test',
+        }
+        result = score_cv_against_contract(cv, title_only)
+
+        self.assertIsNone(result['score'], 'a title-only advert must not be scored')
+        self.assertFalse(result['scorable'])
+
+    def test_one_real_requirement_is_still_scorable(self):
+        """The guard must refuse title-only adverts without silencing real ones."""
+        from jobs.services.ats_checker import score_cv_against_contract
+
+        cv = self._cv(['dbt', 'Snowflake', 'Dagster'])
+        one_skill = {
+            'job_title': 'Analytics Engineer',
+            'title_variants': [],
+            'hard_skills': ['dbt'],
+            'must_have': [],
+            'acronyms': [],
+            'source': 'test',
+        }
+        result = score_cv_against_contract(cv, one_skill)
+
+        self.assertTrue(result['scorable'])
+        self.assertIsNotNone(result['score'])
+
     def test_missing_must_haves_are_reported_and_cost_the_score(self):
         from jobs.services.ats_checker import score_cv_against_contract
         cv = self._cv(['Looker', 'Terraform'])
@@ -2376,23 +2496,52 @@ class ScoreVarianceTests(TestCase):
         mock_search.return_value = [
             # Close to the CV (Python/Django/AWS/Docker/PostgreSQL).
             self._raw('Backend Engineer', ATS_JOB_DESCRIPTION),
-            # Nothing to do with it.
-            self._raw('Pastry Chef', 'We need a pastry chef. Baking, patisserie, '
-                                     'cake decoration and food hygiene essential.'),
             # Partial overlap.
             self._raw('Data Analyst', 'Python and SQL required. Tableau, Excel, '
                                       'statistics and data analysis.'),
+            # Barely any overlap.
+            self._raw('Frontend Engineer', 'React, TypeScript, CSS and Figma. '
+                                           'Building accessible user interfaces.'),
         ]
 
         run_job_search(self.run.pk)
 
         scores = {j.title: j.match_score for j in self.run.jobs.all()}
-        # Every job has a real score — none is a placeholder 0.
+        # Every job whose advert states requirements gets a real score.
         self.assertEqual(len(scores), 3)
         self.assertTrue(all(s is not None for s in scores.values()))
-        # And they genuinely differ: the aligned job beats the unrelated one.
-        self.assertGreater(scores['Backend Engineer'], scores['Pastry Chef'])
+        # And they genuinely differ: the aligned job beats the distant one.
+        self.assertGreater(scores['Backend Engineer'], scores['Frontend Engineer'])
         self.assertGreater(len(set(scores.values())), 1, f'constant scores: {scores}')
+
+    @mock.patch('jobs.tasks.GoogleSheetsLogger')
+    @mock.patch('jobs.tasks.search_jobs')
+    def test_advert_with_no_stated_requirements_is_not_scored(self, mock_search, _s):
+        """An advert we can mine nothing from gets None — never an invented number.
+
+        The offline extractor's vocabulary is finite, so some adverts yield no
+        requirement at all. The honest answer is "we don't know": the job is still
+        shown, and it sorts last. What must NOT happen is a score conjured from the
+        job title and the CV's section headings — both properties of the CV alone,
+        which is how these adverts used to score a silent 100/100.
+        """
+        from jobs.tasks import run_job_search
+        mock_search.return_value = [
+            self._raw('Backend Engineer', ATS_JOB_DESCRIPTION),
+            # Pure fluff: a title, and not one stated requirement.
+            self._raw('Digital Marketing Executive',
+                      'We are looking for a Digital Marketing Executive to join '
+                      'our friendly team. Great culture, competitive salary, 25 '
+                      'days holiday and a cycle to work scheme.'),
+        ]
+
+        run_job_search(self.run.pk)
+
+        scores = {j.title: j.match_score for j in self.run.jobs.all()}
+        self.assertIsNone(scores['Digital Marketing Executive'])
+        self.assertNotEqual(scores['Digital Marketing Executive'], 100)
+        # The measurable job is unaffected.
+        self.assertIsNotNone(scores['Backend Engineer'])
 
     @mock.patch('jobs.tasks.GoogleSheetsLogger')
     @mock.patch('jobs.tasks.search_jobs')
@@ -3028,6 +3177,8 @@ class GoogleSheetsTests(TestCase):
         self.run = SearchRun.objects.create(user=self.user)
         self.job = Job.objects.create(
             search_run=self.run, title='Dev', company='Acme', location='London',
+            date_posted='2026-07-10', employment_type='Full-time',
+            seniority_level='Senior', salary='£80,000',
             match_score=90, application_link='https://x.com/1',
             job_skills=['python', 'sql'], missing_skills=['sql'], ats_score=92,
         )
@@ -3047,20 +3198,51 @@ class GoogleSheetsTests(TestCase):
         self.assertEqual(len(sanitize_tab_name('x' * 80)), 50)
 
     def test_build_row_matches_headers(self):
+        """One value per column, in column order — a short row shifts everything."""
         from jobs.services.google_sheets import HEADERS, GoogleSheetsLogger
         with override_settings(GOOGLE_SHEET_ID='', GOOGLE_SHEETS_CREDENTIALS_JSON=''):
             sheets = GoogleSheetsLogger()
-        row = sheets.build_row(self.job, cv_skills=['python', 'django'])
-        self.assertEqual(len(row), len(HEADERS))
-        self.assertIn('Dev', row)
+        row = sheets.build_row(self.job)
+
+        self.assertEqual(len(HEADERS), 12)
+        self.assertEqual(len(row), 12)
+        self.assertEqual(row[HEADERS.index('Job Title')], 'Dev')
+        self.assertEqual(row[HEADERS.index('Company Name')], 'Acme')
+        self.assertEqual(row[HEADERS.index('Location')], 'London')
+        self.assertEqual(row[HEADERS.index('Date Posted')], '2026-07-10')
+        self.assertEqual(row[HEADERS.index('Employment Type')], 'Full-time')
+        self.assertEqual(row[HEADERS.index('Seniority Level')], 'Senior')
+        self.assertEqual(row[HEADERS.index('Salary')], '£80,000')
         self.assertEqual(row[HEADERS.index('Match Score')], 90)
-        self.assertEqual(row[HEADERS.index('ATS Score')], 92)
-        self.assertEqual(row[HEADERS.index('CV Parsed Skills')], 'python, django')
-        self.assertEqual(row[HEADERS.index('Job Required Skills')], 'python, sql')
-        self.assertEqual(row[HEADERS.index('Missing Skills')], 'sql')
+        self.assertEqual(row[HEADERS.index('Direct Application Link')], 'https://x.com/1')
+
+    def test_unscored_job_writes_blank_not_zero(self):
+        from jobs.services.google_sheets import HEADERS, GoogleSheetsLogger
+        self.job.match_score = None
+        with override_settings(GOOGLE_SHEET_ID='', GOOGLE_SHEETS_CREDENTIALS_JSON=''):
+            sheets = GoogleSheetsLogger()
+        row = sheets.build_row(self.job)
+        self.assertEqual(row[HEADERS.index('Match Score')], '')
+
+    def test_next_data_row_never_lands_above_the_headers(self):
+        """Row 1 is the headers. The first job must go to row 2, never row 1."""
+        from jobs.services.google_sheets import GoogleSheetsLogger
+        with override_settings(GOOGLE_SHEET_ID='', GOOGLE_SHEETS_CREDENTIALS_JSON=''):
+            sheets = GoogleSheetsLogger()
+
+        worksheet = mock.Mock()
+        # Headers only -> first job goes to row 2.
+        worksheet.get_all_values.return_value = [['Job Title', 'Company Name']]
+        self.assertEqual(sheets.next_data_row(worksheet), 2)
+        # Headers + 3 jobs -> next job goes to row 5.
+        worksheet.get_all_values.return_value = [['h']] + [['x']] * 3
+        self.assertEqual(sheets.next_data_row(worksheet), 5)
+        # Even a completely empty tab starts at row 2, not row 1.
+        worksheet.get_all_values.return_value = []
+        self.assertEqual(sheets.next_data_row(worksheet), 2)
 
     @mock.patch('jobs.services.google_sheets.os.path.exists', return_value=True)
-    def test_creates_tab_per_candidate_and_appends(self, _exists):
+    def test_creates_tab_per_candidate_and_writes_to_a_to_l(self, _exists):
         from jobs.services.google_sheets import GoogleSheetsLogger, HEADERS
         import gspread
 
@@ -3072,6 +3254,7 @@ class GoogleSheetsTests(TestCase):
                 # Candidate has no tab yet -> a new one is created with headers.
                 sheet.worksheet.side_effect = gspread.exceptions.WorksheetNotFound('nope')
                 new_tab = sheet.add_worksheet.return_value
+                new_tab.get_all_values.return_value = [HEADERS]
 
                 sheets = GoogleSheetsLogger()
                 self.assertTrue(sheets.enabled)
@@ -3079,8 +3262,18 @@ class GoogleSheetsTests(TestCase):
 
         sheet.add_worksheet.assert_called_once()
         self.assertEqual(sheet.add_worksheet.call_args.kwargs['title'], 'Haseeb Ijaz')
-        # First append writes headers, second writes the job row.
-        first_call = new_tab.append_row.call_args_list[0].args[0]
-        second_call = new_tab.append_row.call_args_list[1].args[0]
-        self.assertEqual(first_call, HEADERS)
-        self.assertIn('Dev', second_call)
+
+        # Nothing is appended blindly any more: both writes name their range.
+        new_tab.append_row.assert_not_called()
+        header_call, job_call = new_tab.update.call_args_list
+
+        self.assertEqual(header_call.kwargs['range_name'], 'A1:L1')
+        self.assertEqual(header_call.kwargs['values'], [HEADERS])
+
+        # The job row lands in A2:L2 — below the headers, exactly 12 wide.
+        self.assertEqual(job_call.kwargs['range_name'], 'A2:L2')
+        values = job_call.kwargs['values']
+        self.assertEqual(len(values), 1)
+        self.assertEqual(len(values[0]), 12)
+        self.assertEqual(values[0][0], 'Dev')
+        self.assertEqual(values[0][11], '')  # no tailored PDF on this job

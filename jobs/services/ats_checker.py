@@ -1965,17 +1965,24 @@ def score_cv_against_contract(cv_text, contract):
         titles = [contract.get('job_title') or ''] + (contract.get('title_variants') or [])
         titles = [t for t in titles if t]
 
-        # Nothing job-specific to measure against: the advert yielded no skills, no
-        # must-haves, no acronyms and no title. There is no honest score to give —
-        # and emphatically not the CV's section-heading coverage, which is a
-        # property of the CV alone and used to hand these jobs a silent 100/100
-        # while the reason column said "no screenable skills could be mined". The
-        # caller shows these as "Not scored" and sorts them last.
-        if not (hard or must or acronyms or titles):
+        # No requirement to measure against: the advert yielded no hard skills, no
+        # must-haves and no acronyms. There is no honest score to give.
+        #
+        # A job title is NOT a requirement. Matching one says only that the advert
+        # is called what the candidate calls themselves — it says nothing about
+        # whether they can do the job. When the title was allowed to carry a score
+        # on its own, the only two things left to weigh were the title and the CV's
+        # section-heading coverage, and both are properties of the CV alone: any
+        # well-formatted CV whose title matched scored ~100/100 against an advert
+        # whose requirements we had failed to parse. That is the silent 100 this
+        # guard exists to prevent, so it refuses a title-only contract too.
+        #
+        # The caller shows these as "Not scored" and sorts them last.
+        if not (hard or must or acronyms):
             logger.info(
-                'Contract carries no skills, must-haves, acronyms or title '
-                '(source=%s) — not scorable, returning None.',
-                contract.get('source'),
+                'Contract carries no hard skills, must-haves or acronyms '
+                '(source=%s, title=%r) — not scorable, returning None.',
+                contract.get('source'), contract.get('job_title'),
             )
             return dict(empty, breakdown={'sections': float(_section_coverage(cv_text))})
 

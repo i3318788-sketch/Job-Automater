@@ -6,6 +6,7 @@ aggregator. Returns a list of normalized job dicts so callers don't depend on
 the actor's raw field names.
 """
 import logging
+import re
 
 from django.conf import settings
 
@@ -85,6 +86,53 @@ def _best_description(raw):
         if isinstance(value, str) and len(value.strip()) > len(best):
             best = value.strip()
     return best
+
+
+# Job boards publish an employer index — "all 40 jobs at South East Water" — and
+# it looks enough like a listing that the scraper returns it as one. cv-library's
+# has the shape /list-jobs/<id>/<employer>-jobs.
+EMPLOYER_INDEX_RE = re.compile(r'/list-jobs/', re.IGNORECASE)
+
+# "Posted", "today", "2 days ago". On an employer index page there is no employer
+# line to scrape, so the scraper lands on the posting date and returns it as the
+# company. No real company is called this.
+#
+# Anchored end-to-end and deliberately narrow: "Posted" on its own is the
+# artifact, but "Posted Solutions Ltd" and "Today Translations" are real
+# employers, and a filter that swallowed those would silently drop real jobs —
+# a far worse failure than letting a little junk through.
+_DATE_WORD = (
+    r'(?:today|yesterday|just\s+now|'
+    r'\d+\+?\s*(?:min\w*|hour|day|week|month)s?\s+ago)'
+)
+DATE_ARTIFACT_RE = re.compile(
+    rf'^(?:posted(?:\s+{_DATE_WORD})?|{_DATE_WORD})$',
+    re.IGNORECASE,
+)
+
+
+def is_job_advert(raw):
+    """Is this dataset item an actual job advert, or the board's furniture?
+
+    An employer index page is not a job: it carries no description, no location
+    and no salary, its title is the *company* name (which is why these arrived as
+    jobs called "Sir Robert McAlpine"), its "company" is the scraper's stray
+    "Posted" label, and its link goes to a list of the company's vacancies rather
+    than to an application. Nothing downstream can do anything useful with one —
+    it cannot be scored, and applying to it is impossible.
+
+    These are dropped rather than shown. That is not the same as hiding a job the
+    candidate might have wanted: there is no job here to hide.
+    """
+    company = str(raw.get('company') or '').strip()
+    if DATE_ARTIFACT_RE.match(company):
+        return False
+
+    links = f"{raw.get('url') or ''} {raw.get('direct_apply_url') or ''}"
+    if EMPLOYER_INDEX_RE.search(links):
+        return False
+
+    return True
 
 
 def normalize_job(raw):
@@ -245,9 +293,18 @@ def search_jobs(country_list, min_salary=None, limit=200, keywords=None, city=''
         raise ApifySearchError('Apify run returned no dataset')
 
     jobs = []
+    not_adverts = 0
     try:
         for item in client.dataset(dataset_id).iterate_items():
-            jobs.append(normalize_job(_as_dict(item)))
+            raw = _as_dict(item)
+            if not is_job_advert(raw):
+                not_adverts += 1
+                logger.info(
+                    'Skipping "%s" — an employer index page, not a job advert (%s).',
+                    raw.get('title', '?'), raw.get('url', ''),
+                )
+                continue
+            jobs.append(normalize_job(raw))
             if len(jobs) >= limit:
                 break
     except Exception as exc:
@@ -258,9 +315,11 @@ def search_jobs(country_list, min_salary=None, limit=200, keywords=None, city=''
     filtered = _filter_by_location(jobs, country_list, city=city)
     empty = sum(1 for job in filtered if not job['description'].strip())
     logger.info(
-        'Apify returned %d jobs (%d after location filter for %s); %d have no '
-        'description and cannot be scored',
-        len(jobs), len(filtered), city or location, empty,
+        'Apify returned %d items: %d were employer index pages, not jobs; %d real '
+        'jobs (%d after the location filter for %s); %d have no description and '
+        'cannot be scored',
+        len(jobs) + not_adverts, not_adverts, len(jobs), len(filtered),
+        city or location, empty,
     )
     return filtered
 
