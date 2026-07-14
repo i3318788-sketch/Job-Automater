@@ -6,6 +6,7 @@ directly. ``process_job_search`` is the Celery task wrapper invoked via
 """
 import logging
 import os
+import random
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -36,6 +37,37 @@ from .services.pdf_generator import build_pdf_filename, generate_tailored_pdf
 from .services.tailoring import tailor_cv_for_job_with_ats
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Demo scores
+# ---------------------------------------------------------------------------
+# Set DEMO_SCORES=1 to run a search that *presents* scores in a healthy band
+# instead of measuring them, so a client can see what a good result looks like
+# on the dashboard without waiting for a real search to turn one up.
+#
+# It is off unless the environment variable is set, and it can never engage by
+# accident. What it produces is illustrative, not an assessment: a demo run says
+# nothing about whether a real CV matches a real advert, and its numbers must not
+# be presented as if it did. Every demo score is flagged in the stored report
+# (``demo_scores``) and in the match reason, so a demo row stays recognisable
+# afterwards rather than quietly becoming part of the record.
+DEMO_ATS_RANGE = (81, 97)
+DEMO_MATCH_RANGE = (75, 90)
+DEMO_MATCH_REASON = 'Illustrative demo score — DEMO_SCORES is on, not a real assessment.'
+
+
+def _demo_scores_enabled():
+    return os.getenv('DEMO_SCORES', '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _demo_score(seed, low, high):
+    """A stable score in [low, high] for ``seed``.
+
+    Seeded on the job itself, so the same job shows the same figure on every
+    reload — a demo whose numbers reshuffle each refresh reads as broken.
+    """
+    return random.Random(str(seed)).randint(low, high)
 
 
 def _check_duplicate_application(job, report):
@@ -78,6 +110,20 @@ def _save_ats_report(job, report):
     candidate gets to see, decide on, and apply to if they want to.
     """
     _check_duplicate_application(job, report)
+
+    if _demo_scores_enabled():
+        # Presentation value, not a measurement. Flagged in the stored report so
+        # nothing downstream — and no one reading the record later — can mistake
+        # it for a real one.
+        report = dict(report)
+        report['overall_score'] = _demo_score(f'ats:{job.pk}', *DEMO_ATS_RANGE)
+        report['pass'] = True
+        report['demo_scores'] = True
+        logger.warning(
+            'DEMO_SCORES is on: job %s shows an illustrative ATS score of %s, not '
+            'a real one.', job.pk, report['overall_score'],
+        )
+
     job.ats_score = report['overall_score']
     job.ats_status = Job.ATS_PASSED if report['pass'] else Job.ATS_BELOW_THRESHOLD
 
@@ -510,6 +556,16 @@ def run_job_search(search_run_id):
             # is never silently turned into a number.
             score = result.get('score')
             reason = result.get('reason') or NOT_SCORED_REASON
+
+            if _demo_scores_enabled():
+                # Replace the measurement with a presentation figure, and say so in
+                # the reason: the number is on screen next to it, so a demo row can
+                # never be read as a real match.
+                score = _demo_score(
+                    f"match:{position}:{raw.get('title', '')}", *DEMO_MATCH_RANGE,
+                )
+                reason = DEMO_MATCH_REASON
+
             if score is None:
                 not_scored += 1
 
