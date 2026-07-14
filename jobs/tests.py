@@ -191,6 +191,100 @@ class ApifyInputTests(TestCase):
         self.assertEqual(set(titles), {'Web Developer'})
 
 
+REED_JOB_PAGE = '''
+<html><head>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[]}
+</script>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"JobPosting","title":"Digital Marketing Executive","description":"<p>We need a Digital Marketing Executive.</p><ul><li>SEO and PPC campaigns</li><li>Google Analytics</li><li>HubSpot and Salesforce</li></ul>"}
+</script>
+</head><body>page furniture we do not want</body></html>
+'''
+
+
+class DescriptionFetchTests(TestCase):
+    """Boards return a teaser; the advert lives on the job's own page."""
+
+    def test_extracts_the_job_posting_description(self):
+        from jobs.services.job_description import extract_job_posting_description
+        text = extract_job_posting_description(REED_JOB_PAGE)
+        self.assertIn('SEO and PPC campaigns', text)
+        self.assertIn('HubSpot and Salesforce', text)
+        # HTML is stripped, and the page's other JSON-LD blocks are ignored.
+        self.assertNotIn('<li>', text)
+        self.assertNotIn('page furniture', text)
+
+    def test_page_without_a_job_posting_yields_nothing(self):
+        from jobs.services.job_description import extract_job_posting_description
+        self.assertEqual(extract_job_posting_description('<html>nope</html>'), '')
+
+    def test_malformed_json_ld_does_not_lose_a_valid_block(self):
+        from jobs.services.job_description import extract_job_posting_description
+        html = ('<script type="application/ld+json">{ broken,,, }</script>'
+                + REED_JOB_PAGE)
+        self.assertIn('SEO and PPC', extract_job_posting_description(html))
+
+    def test_only_fetchable_boards_are_attempted(self):
+        """indeed and cv-library answer 403 — we must not waste a request."""
+        from jobs.services.job_description import is_fetchable
+        self.assertTrue(is_fetchable('https://www.reed.co.uk/jobs/x/1'))
+        self.assertFalse(is_fetchable('https://uk.indeed.com/viewjob?jk=1'))
+        self.assertFalse(is_fetchable('https://www.cv-library.co.uk/job/1'))
+        self.assertFalse(is_fetchable('https://www.totaljobs.com/job/1'))
+        self.assertFalse(is_fetchable(''))
+
+    def test_blocked_board_is_never_fetched(self):
+        from jobs.services import job_description
+        with mock.patch.object(job_description.requests, 'get') as get:
+            self.assertEqual(
+                job_description.fetch_description('https://uk.indeed.com/viewjob?jk=1'),
+                '',
+            )
+        get.assert_not_called()
+
+    def test_enrich_replaces_the_teaser_with_the_advert(self):
+        from jobs.services import job_description
+
+        jobs = [
+            # A teaser from a fetchable board -> gets the real advert.
+            {'title': 'Digital Marketing Executive', 'description': 'An exciting opp...',
+             'applyLink': 'https://www.reed.co.uk/jobs/dme/57124514'},
+            # Already a full advert -> left alone, never re-fetched.
+            {'title': 'Backend Engineer', 'description': 'x' * 900,
+             'applyLink': 'https://www.reed.co.uk/jobs/be/1'},
+            # A teaser from a blocked board -> keeps its teaser, no request made.
+            {'title': 'Web Developer', 'description': 'short',
+             'applyLink': 'https://uk.indeed.com/viewjob?jk=1'},
+        ]
+
+        response = mock.Mock(status_code=200, text=REED_JOB_PAGE)
+        with mock.patch.object(job_description.requests, 'Session') as session_cls:
+            session_cls.return_value.__enter__.return_value.get.return_value = response
+            improved = job_description.enrich_descriptions(jobs, max_workers=1)
+
+        self.assertEqual(improved, 1)
+        self.assertIn('SEO and PPC campaigns', jobs[0]['description'])
+        self.assertEqual(jobs[1]['description'], 'x' * 900)   # untouched
+        self.assertEqual(jobs[2]['description'], 'short')     # blocked board
+
+    def test_a_failed_fetch_keeps_the_original_description(self):
+        """A blocked or broken page must never cost us the teaser we had."""
+        from jobs.services import job_description
+
+        jobs = [{'title': 'Dev', 'description': 'the teaser',
+                 'applyLink': 'https://www.reed.co.uk/jobs/x/1'}]
+
+        with mock.patch.object(job_description.requests, 'Session') as session_cls:
+            session_cls.return_value.__enter__.return_value.get.side_effect = (
+                Exception('connection reset')
+            )
+            improved = job_description.enrich_descriptions(jobs, max_workers=1)
+
+        self.assertEqual(improved, 0)
+        self.assertEqual(jobs[0]['description'], 'the teaser')
+
+
 class KeywordExtractorTests(TestCase):
     def test_extract_skills_from_text(self):
         from jobs.services.keyword_extractor import extract_skills_from_text

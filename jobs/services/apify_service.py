@@ -313,6 +313,14 @@ def search_jobs(country_list, min_salary=None, limit=200, keywords=None, city=''
 
     # Post-fetch location filter (some actors ignore the location input).
     filtered = _filter_by_location(jobs, country_list, city=city)
+
+    # Most boards hand back a one-line teaser and keep the advert on the job's own
+    # page. A teaser has no requirements to mine, so the job cannot be scored
+    # however well the candidate fits it. Recover the real advert where we can.
+    from .job_description import enrich_descriptions
+
+    enrich_descriptions(filtered)
+
     empty = sum(1 for job in filtered if not job['description'].strip())
     logger.info(
         'Apify returned %d items: %d were employer index pages, not jobs; %d real '
