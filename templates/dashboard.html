@@ -1,43 +1,54 @@
 {% extends 'base.html' %}
 {% load tz %}
-{% block title %}Dashboard · Job Automation{% endblock %}
+{% block title %}Dashboard · Job Automation System{% endblock %}
 
 {% block content %}
 {% if not cv_profiles %}
-    <div class="card" style="text-align:center;">
-        <h1>Welcome, {{ profile.candidate_name|default:user.username }}</h1>
-        <p class="muted">No CVs found. Click <strong>“+”</strong> in the top bar to create your first profile.</p>
-        <p><button type="button" onclick="document.getElementById('add-tab-btn').click()">Create your first profile</button></p>
+    <div class="card" style="text-align:center; padding:3rem;">
+        <div style="font-size:4rem; margin-bottom:1rem;">🚀</div>
+        <h1>Welcome, {{ profile.candidate_name|default:user.username }}!</h1>
+        <p class="muted" style="max-width:480px; margin:0.75rem auto 1.5rem;">
+            You haven't created a profile yet. Click the <strong>"+"</strong> button in the top bar to create your first candidate profile and upload your CV to get started.
+        </p>
+        <button type="button" onclick="document.getElementById('add-tab-btn').click()">
+            ✨ Create First Profile
+        </button>
     </div>
 {% else %}
-    <div class="card">
-        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:1rem; flex-wrap:wrap;">
+    <!-- Welcome Card -->
+    <div class="card" style="background:var(--gradient-hero); color:#fff; border:none; position:relative; overflow:hidden;">
+        <div style="position:absolute; top:-40px; right:-40px; width:200px; height:200px; background:rgba(244,121,33,0.15); border-radius:50%;"></div>
+        <div style="position:absolute; bottom:-60px; right:60px; width:140px; height:140px; background:rgba(29,114,184,0.15); border-radius:50%;"></div>
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem; flex-wrap:wrap; position:relative; z-index:1;">
             <div>
-                <h1>{{ active_cv.display_name }}</h1>
-                <p class="muted">
-                    Signed in as {{ user.username }} · {{ profile.get_role_display }}
+                <p style="font-size:0.8rem; color:rgba(255,255,255,0.6); margin-bottom:0.25rem; font-weight:500; text-transform:uppercase; letter-spacing:0.06em;">Welcome back</p>
+                <h1 style="color:#fff; margin-bottom:0.4rem;">{{ active_cv.display_name }}</h1>
+                <p style="color:rgba(255,255,255,0.75); margin:0; font-size:0.875rem;">
+                    {{ user.username }}
                     {% if user.email %} · {{ user.email }}{% endif %}
-                    <br>
-                    Searching
-                    <strong>{% if preferences.target_city %}{{ preferences.target_city }}{% else %}all cities{% endif %}</strong>
+                    · Joined {{ user.date_joined|date:"d M Y" }}
+                </p>
+                <p style="color:rgba(255,255,255,0.7); margin-top:0.5rem; font-size:0.875rem;">
+                    🔍 Searching
+                    <strong style="color:#fff;">{% if preferences.target_city %}{{ preferences.target_city }}{% else %}all cities{% endif %}</strong>
                     in {{ preferences.target_countries|join:", "|default:"United Kingdom" }}
-                    · joined {{ user.date_joined|date:"d M Y" }}
                 </p>
             </div>
-            <a class="btn btn-secondary" href="{% url 'profile' %}">👤 View profile</a>
+            <a class="btn" href="{% url 'profile' %}" style="background:rgba(255,255,255,0.15); border:1.5px solid rgba(255,255,255,0.35); box-shadow:none; backdrop-filter:blur(8px);">👤 View Profile</a>
         </div>
     </div>
 
+    <!-- Stats Grid -->
     <div class="stats-grid">
         <div class="stat-card">
             <div class="stat-icon">📊</div>
             <div class="stat-value">{{ stats.total_jobs }}</div>
-            <div class="stat-label">Total jobs searched</div>
+            <div class="stat-label">Total Jobs Found</div>
         </div>
         <div class="stat-card">
             <div class="stat-icon">✅</div>
             <div class="stat-value">{{ stats.matched }}</div>
-            <div class="stat-label">Matched (≥ {{ MATCH_THRESHOLD|default:75 }})</div>
+            <div class="stat-label">Matched (≥ {{ MATCH_THRESHOLD|default:75 }}%)</div>
         </div>
         <div class="stat-card">
             <div class="stat-icon">📄</div>
@@ -46,107 +57,157 @@
         </div>
         <div class="stat-card">
             <div class="stat-icon">🕑</div>
-            <div class="stat-value stat-value-sm">{% if stats.last_search %}{{ stats.last_search|date:"d M, H:i" }}{% else %}—{% endif %}</div>
-            <div class="stat-label">Last search</div>
+            <div class="stat-value stat-value-sm">
+                {% if stats.last_search %}{{ stats.last_search|date:"d M, H:i" }}{% else %}—{% endif %}
+            </div>
+            <div class="stat-label">Last Search</div>
         </div>
     </div>
 
+    <!-- CV File Card -->
     <div class="card">
-        <h2>CV file</h2>
+        <div class="card-header">
+            <h2>📎 CV File</h2>
+            {% if active_cv.has_file %}
+                <a class="btn btn-ghost btn-sm" href="{% url 'upload_cv' %}">Replace CV</a>
+            {% endif %}
+        </div>
         {% if active_cv.has_file %}
-            <p style="display:flex; align-items:center; gap:0.75rem; flex-wrap:wrap;">
-                <span>📎 {{ active_cv.original_file.name|cut:"cvs/" }}</span>
-                <a class="btn btn-ghost icon-btn" href="{{ active_cv.original_file.url }}" target="_blank" rel="noopener" title="View file">👁 View</a>
+            <div style="display:flex; align-items:center; gap:0.75rem; flex-wrap:wrap; padding:0.75rem; background:var(--primary-light); border-radius:var(--radius-sm);">
+                <span style="color:var(--primary); font-size:1.4rem;">📄</span>
+                <span style="font-weight:500; flex:1;">{{ active_cv.original_file.name|cut:"cvs/" }}</span>
+                <a class="btn btn-ghost btn-sm" href="{{ active_cv.original_file.url }}" target="_blank" rel="noopener">👁 View</a>
                 <form method="post" action="{% url 'delete_cv' active_cv.id %}" style="margin:0;"
                       onsubmit="return confirm('Are you sure you want to delete this CV?');" data-loading="Deleting CV…">
                     {% csrf_token %}
-                    <button type="submit" class="btn btn-danger icon-btn" title="Delete CV">🗑 Delete</button>
+                    <button type="submit" class="btn btn-danger btn-sm">🗑 Delete</button>
                 </form>
-            </p>
-            <p><a class="btn btn-ghost" href="{% url 'upload_cv' %}">Replace CV</a></p>
+            </div>
         {% else %}
-            <p class="muted">This profile has no CV file yet.</p>
-            <p><a class="btn" href="{% url 'upload_cv' %}">Upload a CV</a></p>
+            <div style="text-align:center; padding:1.5rem; border:2px dashed var(--border); border-radius:var(--radius-sm);">
+                <div style="font-size:2.5rem; margin-bottom:0.75rem;">📂</div>
+                <p class="muted" style="margin-bottom:1rem;">No CV uploaded for this profile yet.</p>
+                <a class="btn" href="{% url 'upload_cv' %}">⬆ Upload CV</a>
+            </div>
         {% endif %}
     </div>
 
+    <!-- Preferences Card -->
     <div class="card">
-        <h2>Preferences</h2>
-        <p><strong>Target countries:</strong>
-            {% if preferences and preferences.target_countries %}{{ preferences.target_countries|join:", " }}{% else %}none set{% endif %}</p>
-        <p><strong>Salary range:</strong>
-            {{ preferences.currency_symbol|default:"£" }}{{ effective_min_salary }}
-            {% if effective_max_salary %}– {{ preferences.currency_symbol|default:"£" }}{{ effective_max_salary }}{% else %}<span class="helptext">and up (no upper limit)</span>{% endif %}
-            {% if not preferences.salary_min %}<span class="helptext">(minimum is system default)</span>{% endif %}</p>
-        <p><a class="btn btn-ghost" href="{% url 'edit_preferences' %}">Edit preferences</a></p>
+        <div class="card-header">
+            <h2>⚙️ Search Preferences</h2>
+            <a class="btn btn-ghost btn-sm" href="{% url 'edit_preferences' %}">Edit</a>
+        </div>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem;">
+            <div style="padding:0.75rem; background:var(--bg); border-radius:var(--radius-sm); border:1px solid var(--border);">
+                <p style="font-size:0.75rem; color:var(--muted); margin-bottom:0.2rem; font-weight:600; text-transform:uppercase; letter-spacing:0.04em;">Target Countries</p>
+                <p style="margin:0; font-weight:500;">{% if preferences and preferences.target_countries %}{{ preferences.target_countries|join:", " }}{% else %}<span class="muted">None set</span>{% endif %}</p>
+            </div>
+            <div style="padding:0.75rem; background:var(--bg); border-radius:var(--radius-sm); border:1px solid var(--border);">
+                <p style="font-size:0.75rem; color:var(--muted); margin-bottom:0.2rem; font-weight:600; text-transform:uppercase; letter-spacing:0.04em;">Salary Range</p>
+                <p style="margin:0; font-weight:500;">
+                    {{ preferences.currency_symbol|default:"£" }}{{ effective_min_salary }}
+                    {% if effective_max_salary %} – {{ preferences.currency_symbol|default:"£" }}{{ effective_max_salary }}{% else %} <span class="muted">and up</span>{% endif %}
+                </p>
+            </div>
+        </div>
     </div>
 
+    <!-- Start Search Card -->
     <div class="card">
-        <h2>Start a job search</h2>
-        <p class="helptext">Runs in the background for <strong>{{ active_cv.display_name }}</strong>:
-            fetches jobs, scores each against this CV, and flags visa sponsorship.</p>
+        <div class="card-header">
+            <div>
+                <h2>🔍 Start a Job Search</h2>
+                <p class="muted" style="margin:0.25rem 0 0;">Runs in the background for <strong>{{ active_cv.display_name }}</strong> — fetches, scores, and tailors CVs automatically.</p>
+            </div>
+        </div>
         {% if active_cv.has_file %}
+            <!-- Cache check notice (populated by JS if cache hit) -->
+            <div id="cache-notice" style="display:none; padding:0.75rem 1rem; background:var(--primary-light); border:1px solid var(--primary); border-radius:var(--radius-sm); margin-bottom:1rem; font-size:0.875rem; color:var(--primary);">
+                ⚡ <strong>Cache hit!</strong> You searched these parameters recently.
+                <a href="#" id="cache-view-link" style="color:var(--primary); font-weight:700;">View cached results →</a>
+                <button type="button" id="cache-refresh-btn" class="btn btn-sm btn-ghost" style="margin-left:0.5rem;">🔄 Refresh</button>
+            </div>
             <form action="{% url 'start_search' %}" method="post" id="search-form" data-loading="Starting search…">
                 {% csrf_token %}
                 <button type="submit" id="search-btn">🔍 Start New Search</button>
             </form>
         {% else %}
-            <p class="muted">Upload a CV for this profile first to enable searching.</p>
+            <div style="padding:1rem; background:var(--warning-bg); border-radius:var(--radius-sm); display:flex; align-items:center; gap:0.75rem;">
+                <span style="font-size:1.25rem;">⚠️</span>
+                <p style="margin:0; color:#B45309;">Upload a CV for this profile to enable searching.</p>
+            </div>
         {% endif %}
     </div>
 
+    <!-- Search Runs Card -->
     <div class="card">
-        <div style="display:flex; align-items:center; justify-content:space-between; gap:1rem; flex-wrap:wrap;">
-            <h2 style="margin:0;">Search runs</h2>
+        <div class="card-header">
+            <h2>📋 Search Runs</h2>
             {% if search_runs %}
-                <button type="button" class="btn btn-danger icon-btn" id="clear-history-btn" title="Delete all search history">🗑 Clear All History</button>
+                <button type="button" class="btn btn-danger btn-sm" id="clear-history-btn">🗑 Clear All History</button>
             {% endif %}
         </div>
         {% if search_runs %}
-            <div class="table-wrap" style="margin-top:1rem;">
-                <table>
-                    <thead>
-                        <tr><th>#</th><th>Date</th><th>Status</th><th>Progress</th><th>Results</th><th>Excel</th></tr>
-                    </thead>
-                    <tbody>
-                        {% for run in search_runs %}
-                            <tr data-run-id="{{ run.id }}" data-status-url="{% url 'search_status' run.id %}">
-                                <td>{{ run.id }}</td>
-                                <td>{{ run.created_at|localtime|date:"d M Y, h:i A" }}</td>
-                                <td>
-                                    <span class="run-status badge
-                                        {% if run.status == 'COMPLETED' %}badge-green
-                                        {% elif run.status == 'RUNNING' %}badge-blue badge-pulse
-                                        {% elif run.status == 'PENDING' %}badge-yellow badge-pulse
-                                        {% else %}badge-red{% endif %}" data-status="{{ run.status }}">{{ run.get_status_display }}</span>
-                                </td>
-                                <td class="run-progress" style="min-width:150px;">
-                                    {% if run.status == 'RUNNING' or run.status == 'PENDING' %}
-                                        <div class="progress"><span class="progress-bar" style="width:{{ run.progress }}%;"></span></div>
-                                        <span class="progress-text helptext">{{ run.progress }}%</span>
-                                        <span class="progress-eta helptext" style="display:block;"></span>
-                                    {% elif run.status == 'FAILED' %}
-                                        <span class="helptext" title="{{ run.error_message }}">{{ run.error_message|truncatechars:40 }}</span>
-                                    {% else %}<span class="helptext">{{ run.total_jobs }} jobs</span>{% endif %}
-                                </td>
-                                <td><a href="{% url 'search_results' run.id %}">View</a></td>
-                                <td class="run-excel">
-                                    {% if run.status == 'COMPLETED' %}<a href="{% url 'export_excel' run.id %}" data-loading="Preparing download…">Download</a>{% else %}—{% endif %}
-                                </td>
-                            </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
+            <div style="display:flex; flex-direction:column; gap:0.75rem;">
+                {% for run in search_runs %}
+                <div class="run-card" data-run-id="{{ run.id }}" data-status-url="{% url 'search_status' run.id %}"
+                     style="display:flex; align-items:center; gap:1rem; padding:1rem; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius-sm); transition:all 0.2s; flex-wrap:wrap;">
+
+                    <!-- Run number badge -->
+                    <div style="min-width:40px; height:40px; background:var(--primary-light); border-radius:var(--radius-sm); display:flex; align-items:center; justify-content:center; font-weight:700; color:var(--primary); font-size:0.85rem; flex-shrink:0;">#{{ run.id }}</div>
+
+                    <!-- Date & Status -->
+                    <div style="flex:1; min-width:140px;">
+                        <div style="font-weight:600; font-size:0.875rem; margin-bottom:0.2rem;">{{ run.created_at|localtime|date:"d M Y, h:i A" }}</div>
+                        <span class="run-status badge
+                            {% if run.status == 'COMPLETED' %}badge-green
+                            {% elif run.status == 'RUNNING' %}badge-blue badge-pulse
+                            {% elif run.status == 'PENDING' %}badge-orange badge-pulse
+                            {% else %}badge-red{% endif %}"
+                            data-status="{{ run.status }}">{{ run.get_status_display }}</span>
+                    </div>
+
+                    <!-- Progress -->
+                    <div class="run-progress" style="flex:2; min-width:180px;">
+                        {% if run.status == 'RUNNING' or run.status == 'PENDING' %}
+                            <div class="progress" style="max-width:100%; margin-bottom:0.35rem;">
+                                <span class="progress-bar" style="width:{{ run.progress }}%;"></span>
+                            </div>
+                            <div style="font-size:0.78rem; color:var(--muted);">
+                                <span class="progress-text">{{ run.progress }}%</span>
+                                <span class="progress-eta" style="display:block;"></span>
+                            </div>
+                        {% elif run.status == 'FAILED' %}
+                            <span class="muted" title="{{ run.error_message }}" style="font-size:0.82rem; color:var(--danger);">{{ run.error_message|truncatechars:50 }}</span>
+                        {% else %}
+                            <span style="font-size:0.82rem; color:var(--muted);">{{ run.total_jobs }} jobs found</span>
+                        {% endif %}
+                    </div>
+
+                    <!-- Actions -->
+                    <div style="display:flex; gap:0.5rem; flex-shrink:0;">
+                        <a class="btn btn-ghost btn-sm" href="{% url 'search_results' run.id %}">View Results</a>
+                        {% if run.status == 'COMPLETED' %}
+                            <a class="btn btn-sm btn-secondary" href="{% url 'export_excel' run.id %}" data-loading="Preparing download…">⬇ Excel</a>
+                        {% endif %}
+                    </div>
+                </div>
+                {% endfor %}
             </div>
         {% else %}
-            <p class="muted">No search runs for this profile yet.</p>
+            <div style="text-align:center; padding:2rem;">
+                <div style="font-size:3rem; margin-bottom:0.75rem;">🔍</div>
+                <p class="muted">No search runs yet for this profile.</p>
+            </div>
         {% endif %}
     </div>
 
+    <!-- Clear History Modal -->
     <div class="modal-overlay" id="clear-history-modal">
         <div class="modal">
-            <h2>Clear all history?</h2>
-            <p class="muted">Are you sure you want to delete <strong>ALL</strong> search history? This also removes their jobs and tailored CVs. This action cannot be undone.</p>
+            <h2>🗑 Clear all history?</h2>
+            <p class="muted">This will permanently delete <strong>ALL</strong> search runs, their job results, and tailored CVs. This action cannot be undone.</p>
             <form method="post" action="{% url 'clear_search_history' %}" data-loading="Clearing history…">
                 {% csrf_token %}
                 <div class="actions">
@@ -157,29 +218,36 @@
         </div>
     </div>
 
+    <!-- Tailored CVs -->
     <div class="card">
-        <h2>Tailored CVs</h2>
+        <h2 style="margin-bottom:1rem;">✨ Tailored CVs</h2>
         {% if tailored_jobs %}
-            <div class="table-wrap">
+            <div class="table-scroll">
                 <table>
                     <thead>
-                        <tr><th>Score</th><th>Job</th><th>Company</th><th>Search</th><th>Download</th></tr>
+                        <tr>
+                            <th>Score</th><th>Job</th><th>Company</th><th>Search</th><th>Download</th>
+                        </tr>
                     </thead>
                     <tbody>
                         {% for job in tailored_jobs %}
                             <tr>
-                                <td><span class="badge badge-green">{{ job.match_score }}</span></td>
+                                <td>
+                                    <span class="badge {% if job.match_score >= MATCH_THRESHOLD %}badge-green{% elif job.match_score >= 50 %}badge-yellow{% else %}badge-red{% endif %}">
+                                        {{ job.match_score }}%
+                                    </span>
+                                </td>
                                 <td>{{ job.title }}</td>
                                 <td>{{ job.company|default:"—" }}</td>
                                 <td><a href="{% url 'search_results' job.search_run_id %}">#{{ job.search_run_id }}</a></td>
-                                <td><a href="{{ job.tailored_pdf.url }}" target="_blank" rel="noopener">PDF</a></td>
+                                <td><a class="btn btn-ghost btn-sm" href="{{ job.tailored_pdf.url }}" target="_blank" rel="noopener">📥 PDF</a></td>
                             </tr>
                         {% endfor %}
                     </tbody>
                 </table>
             </div>
         {% else %}
-            <p class="muted">No tailored CVs yet. They are generated automatically for jobs scoring at or above the match threshold.</p>
+            <p class="muted">No tailored CVs yet — they are generated automatically for jobs scoring above the match threshold.</p>
         {% endif %}
     </div>
 {% endif %}
@@ -188,79 +256,142 @@
 {% block scripts %}
 <script>
 (function () {
-    // Disable the search button on submit.
-    var form = document.getElementById('search-form');
-    if (form) {
-        form.addEventListener('submit', function () {
+    'use strict';
+
+    /* ---- Search button disable on submit ---- */
+    var searchForm = document.getElementById('search-form');
+    if (searchForm) {
+        searchForm.addEventListener('submit', function () {
             var btn = document.getElementById('search-btn');
-            if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+            if (btn) { btn.disabled = true; btn.textContent = '⏳ Starting…'; }
         });
     }
 
-    // Clear-history confirmation modal.
-    var modal = document.getElementById('clear-history-modal');
-    var openBtn = document.getElementById('clear-history-btn');
-    var cancelBtn = document.getElementById('clear-cancel');
-    if (openBtn && modal) { openBtn.addEventListener('click', function () { modal.classList.add('open'); }); }
-    if (cancelBtn && modal) { cancelBtn.addEventListener('click', function () { modal.classList.remove('open'); }); }
-    if (modal) {
-        modal.addEventListener('click', function (e) { if (e.target === modal) modal.classList.remove('open'); });
-        document.addEventListener('keydown', function (e) { if (e.key === 'Escape') modal.classList.remove('open'); });
+    /* ---- sessionStorage cache check ---- */
+    (function () {
+        var notice = document.getElementById('cache-notice');
+        var viewLink = document.getElementById('cache-view-link');
+        var refreshBtn = document.getElementById('cache-refresh-btn');
+        if (!notice || !searchForm) return;
+
+        var cacheKey = 'job_search_cache_{{ active_cv.id|default:"0" }}';
+        var CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+        function getCache() {
+            try { return JSON.parse(sessionStorage.getItem(cacheKey) || 'null'); } catch (e) { return null; }
+        }
+        function clearCache() {
+            sessionStorage.removeItem(cacheKey);
+            if (notice) notice.style.display = 'none';
+        }
+
+        var cached = getCache();
+        if (cached && cached.timestamp && (Date.now() - cached.timestamp) < CACHE_TTL && cached.run_id) {
+            notice.style.display = 'flex';
+            notice.style.alignItems = 'center';
+            notice.style.gap = '0.5rem';
+            if (viewLink) viewLink.href = '/search/' + cached.run_id + '/';
+        }
+        if (refreshBtn) refreshBtn.addEventListener('click', function () { clearCache(); });
+        if (searchForm) {
+            searchForm.addEventListener('submit', function () {
+                clearCache(); // Always clear cache on new search start
+            });
+        }
+    })();
+
+    /* ---- Clear history modal ---- */
+    var clearModal  = document.getElementById('clear-history-modal');
+    var clearOpenBtn  = document.getElementById('clear-history-btn');
+    var clearCancelBtn = document.getElementById('clear-cancel');
+    if (clearOpenBtn && clearModal) clearOpenBtn.addEventListener('click', function () { clearModal.classList.add('open'); });
+    if (clearCancelBtn && clearModal) clearCancelBtn.addEventListener('click', function () { clearModal.classList.remove('open'); });
+    if (clearModal) {
+        clearModal.addEventListener('click', function (e) { if (e.target === clearModal) clearModal.classList.remove('open'); });
+        document.addEventListener('keydown', function (e) { if (e.key === 'Escape') clearModal.classList.remove('open'); });
     }
 
-    // Live status/progress polling.
-    var ACTIVE = {'PENDING': true, 'RUNNING': true};
-    var rows = Array.prototype.slice.call(document.querySelectorAll('tr[data-run-id]'));
-    function activeRows() {
-        return rows.filter(function (row) {
-            var s = row.querySelector('.run-status');
-            return s && ACTIVE[(s.getAttribute('data-status') || '').toUpperCase()];
+    /* ---- Run card hover ---- */
+    document.querySelectorAll('.run-card').forEach(function (card) {
+        card.addEventListener('mouseenter', function () {
+            card.style.borderColor = 'var(--primary)';
+            card.style.background = 'var(--primary-light)';
+        });
+        card.addEventListener('mouseleave', function () {
+            card.style.borderColor = 'var(--border)';
+            card.style.background = 'var(--bg)';
+        });
+    });
+
+    /* ---- Parallel status polling ---- */
+    var ACTIVE = { 'PENDING': true, 'RUNNING': true };
+    var runCards = Array.prototype.slice.call(document.querySelectorAll('.run-card[data-run-id]'));
+
+    function activeCards() {
+        return runCards.filter(function (card) {
+            var badge = card.querySelector('.run-status');
+            return badge && ACTIVE[(badge.getAttribute('data-status') || '').toUpperCase()];
         });
     }
+
     function poll() {
-        var pending = activeRows();
+        var pending = activeCards();
         if (pending.length === 0) return;
-        var reloadNeeded = false, remaining = pending.length;
-        pending.forEach(function (row) {
-            fetch(row.getAttribute('data-status-url'), {headers: {'X-Requested-With': 'XMLHttpRequest'}})
-                .then(function (r) { return r.json(); })
-                .then(function (data) {
-                    var bar = row.querySelector('.progress-bar');
-                    var text = row.querySelector('.progress-text');
-                    var eta = row.querySelector('.progress-eta');
-                    // The bar is driven by the live value the worker writes as it
-                    // moves through its phases, not by the final state.
-                    if (bar) bar.style.width = data.progress + '%';
-                    if (text) {
-                        if (data.status === 'RUNNING' && data.phase) {
-                            text.textContent = data.phase + ' — ' + data.progress + '%'
-                                + (data.total > 0 ? ' (' + data.processed + ' of ' + data.total + ' jobs)' : '');
-                        } else {
-                            text.textContent = data.progress + '%';
+
+        // Parallel: fire all status requests simultaneously
+        var reloadNeeded = false;
+        var settled = 0;
+
+        Promise.allSettled(
+            pending.map(function (card) {
+                var url = card.getAttribute('data-status-url');
+                return (window.fetchWithRetry || fetch)(url, { headers: { 'X-Requested-With': 'XMLHttpRequest' } }, 5000, 1)
+                    .then(function (r) { return r.json(); })
+                    .then(function (data) {
+                        var bar  = card.querySelector('.progress-bar');
+                        var text = card.querySelector('.progress-text');
+                        var eta  = card.querySelector('.progress-eta');
+
+                        if (bar) bar.style.width = data.progress + '%';
+
+                        if (text) {
+                            if (data.status === 'RUNNING' && data.phase) {
+                                var detail = data.total > 0
+                                    ? ' (' + data.processed + ' of ' + data.total + ' jobs)'
+                                    : '';
+                                text.textContent = data.phase + ' — ' + data.progress + '%' + detail;
+                            } else {
+                                text.textContent = data.progress + '%';
+                            }
                         }
-                    }
-                    if (eta) {
-                        eta.textContent = (data.status === 'RUNNING' && data.eta_display)
-                            ? 'Estimated time remaining: ' + data.eta_display
-                            : '';
-                    }
-                    var badge = row.querySelector('.run-status');
-                    if (badge) { badge.setAttribute('data-status', data.status); badge.textContent = data.status_display; }
-                    if (!ACTIVE[data.status]) reloadNeeded = true;
-                })
-                .catch(function () {})
-                .finally(function () {
-                    remaining -= 1;
-                    if (remaining === 0 && reloadNeeded) window.location.reload();
-                });
+                        if (eta) {
+                            eta.textContent = (data.status === 'RUNNING' && data.eta_display)
+                                ? 'ETA: ' + data.eta_display : '';
+                        }
+
+                        var badge = card.querySelector('.run-status');
+                        if (badge) {
+                            badge.setAttribute('data-status', data.status);
+                            badge.textContent = data.status_display;
+                            badge.className = 'run-status badge' + (
+                                data.status === 'COMPLETED' ? ' badge-green' :
+                                data.status === 'RUNNING'   ? ' badge-blue badge-pulse' :
+                                data.status === 'PENDING'   ? ' badge-orange badge-pulse' :
+                                ' badge-red'
+                            );
+                        }
+
+                        if (!ACTIVE[data.status]) reloadNeeded = true;
+                    });
+            })
+        ).then(function () {
+            if (reloadNeeded) window.location.reload();
         });
     }
-    // Poll straight away, then every 2s. Waiting a full interval before the first
-    // request left the bar frozen on its server-rendered value (usually 0%) for
-    // seconds after page load, which reads exactly like a bar that does not work.
-    if (activeRows().length > 0) {
+
+    if (activeCards().length > 0) {
         poll();
-        setInterval(poll, 2000);
+        setInterval(poll, 2500);
     }
 })();
 </script>

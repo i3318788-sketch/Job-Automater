@@ -1,157 +1,465 @@
 {% extends 'base.html' %}
 {% load tz %}
-{% block title %}Search #{{ search_run.id }} results · Job Automation{% endblock %}
+{% block title %}Search #{{ search_run.id }} Results · Job Automation System{% endblock %}
 
 {% block content %}
-<div class="card">
-    <h1>Search #{{ search_run.id }} results</h1>
-    <p class="muted">
-        <strong>Status:</strong> {{ search_run.get_status_display }} &middot;
-        <strong>Run:</strong> {{ search_run.created_at|localtime|date:"d M Y, h:i A" }} &middot;
-        <strong>Profile:</strong> {% if search_run.cv %}{{ search_run.cv.display_name }}{% else %}—{% endif %} &middot;
-        <strong>Location:</strong>
-        {% if search_run.city %}{{ search_run.city }}, {% endif %}{{ search_run.countries|join:", "|default:"—" }}
-    </p>
-    {% if search_run.error_message %}
-        <p class="badge badge-red">{{ search_run.error_message }}</p>
-    {% endif %}
-    <div style="display:flex; gap:0.6rem; margin-top:0.5rem;">
-        <a class="btn btn-secondary" href="{% url 'dashboard' %}">← Dashboard</a>
-        {% if search_run.status == 'COMPLETED' %}
-            <a class="btn" href="{% url 'export_excel' search_run.id %}" data-loading="Preparing download…">⬇ Download Excel</a>
-        {% endif %}
+<!-- Page Header Card -->
+<div class="card" style="background:var(--gradient-hero); color:#fff; border:none; overflow:hidden; position:relative;">
+    <div style="position:absolute; top:-30px; right:-30px; width:150px; height:150px; background:rgba(244,121,33,0.15); border-radius:50%;"></div>
+    <div style="position:relative; z-index:1;">
+        <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; flex-wrap:wrap;">
+            <div>
+                <p style="font-size:0.78rem; color:rgba(255,255,255,0.55); font-weight:600; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:0.25rem;">Search Results</p>
+                <h1 style="color:#fff; margin-bottom:0.5rem;">Search #{{ search_run.id }}</h1>
+                <div style="display:flex; flex-wrap:wrap; gap:0.75rem; font-size:0.82rem; color:rgba(255,255,255,0.7);">
+                    <span>📅 {{ search_run.created_at|localtime|date:"d M Y, h:i A" }}</span>
+                    <span>👤 {% if search_run.cv %}{{ search_run.cv.display_name }}{% else %}—{% endif %}</span>
+                    <span>📍 {% if search_run.city %}{{ search_run.city }}, {% endif %}{{ search_run.countries|join:", "|default:"—" }}</span>
+                    <span>
+                        <span class="badge {% if search_run.status == 'COMPLETED' %}badge-green{% elif search_run.status == 'RUNNING' %}badge-blue badge-pulse{% elif search_run.status == 'PENDING' %}badge-orange badge-pulse{% else %}badge-red{% endif %}">
+                            {{ search_run.get_status_display }}
+                        </span>
+                    </span>
+                </div>
+                {% if search_run.error_message %}
+                    <div style="margin-top:0.75rem; padding:0.5rem 0.75rem; background:rgba(239,68,68,0.2); border-radius:6px; font-size:0.82rem;">⚠️ {{ search_run.error_message }}</div>
+                {% endif %}
+            </div>
+            <div style="display:flex; gap:0.6rem; flex-shrink:0; flex-wrap:wrap;">
+                <a class="btn btn-secondary" href="{% url 'dashboard' %}" style="background:rgba(255,255,255,0.15); color:#fff; border:1.5px solid rgba(255,255,255,0.3); box-shadow:none;">← Dashboard</a>
+                {% if search_run.status == 'COMPLETED' %}
+                    <a class="btn" href="{% url 'export_excel' search_run.id %}" data-loading="Preparing download…" style="background:var(--gradient-primary);">⬇ Excel</a>
+                {% endif %}
+            </div>
+        </div>
     </div>
 </div>
 
-<div class="card">
-    <h2>Jobs found ({{ total_found }})</h2>
+<!-- Summary Stats -->
+<div class="stats-grid" style="grid-template-columns:repeat(4,1fr);">
+    <div class="stat-card"><div class="stat-icon">📋</div><div class="stat-value">{{ total_found }}</div><div class="stat-label">Total Jobs</div></div>
+    <div class="stat-card"><div class="stat-icon">✅</div><div class="stat-value" style="-webkit-text-fill-color:var(--success); background:none;">{{ above_count }}</div><div class="stat-label">Above {{ MATCH_THRESHOLD }}%</div></div>
+    <div class="stat-card"><div class="stat-icon">📊</div><div class="stat-value" style="-webkit-text-fill-color:var(--warning); background:none;">{{ below_count }}</div><div class="stat-label">Below Threshold</div></div>
+    <div class="stat-card"><div class="stat-icon">❓</div><div class="stat-value" style="-webkit-text-fill-color:var(--muted); background:none;">{{ not_scored_count }}</div><div class="stat-label">Not Scored</div></div>
+</div>
 
-    <div class="job-tabs" role="tablist">
-        <button type="button" class="job-tab active" role="tab" data-filter="all">
-            All Jobs <span class="badge badge-blue">{{ total_found }}</span>
-        </button>
-        <button type="button" class="job-tab" role="tab" data-filter="above">
-            Above {{ MATCH_THRESHOLD }}% <span class="badge badge-green">{{ above_count }}</span>
-        </button>
-        <button type="button" class="job-tab" role="tab" data-filter="below">
-            Below {{ MATCH_THRESHOLD }}% <span class="badge badge-red">{{ below_count }}</span>
-        </button>
-    </div>
-
-    {% if not_scored_count %}
-        <p class="muted">
-            <span class="badge badge-yellow">{{ not_scored_count }} not scored</span>
-            These adverts arrived without a readable description, so there was
-            nothing to match your CV against. They are listed last — open one to
-            read it on the employer's site.
-        </p>
-    {% endif %}
-    {% if jobs %}
-        <p class="muted" id="tab-empty" style="display:none;">
-            No jobs in this tab.
-        </p>
-        <div class="table-scroll" id="jobs-table">
-            <table>
-                <thead>
-                    <tr>
-                        <th>Score</th><th>ATS</th><th>Title</th><th>Company</th><th>Location</th>
-                        <th>Salary</th><th>Sponsorship</th><th>Reason</th><th>Missing skills</th>
-                        <th>Tailored CV</th><th>Apply</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for job in jobs %}
-                        {# data-score is empty for an unscored job, so the tab filter can tell "unknown" from "zero". #}
-                        <tr class="job-row" data-score="{% if job.match_score is not None %}{{ job.match_score }}{% endif %}">
-                            <td>
-                                {% if job.match_score is None %}
-                                    <span class="badge badge-lg badge-grey" title="This advert had no readable description to match against">Not scored</span>
-                                {% elif job.match_score >= MATCH_THRESHOLD %}<span class="badge badge-lg badge-green">{{ job.match_score }}</span>
-                                {% elif job.match_score >= 50 %}<span class="badge badge-lg badge-yellow">{{ job.match_score }}</span>
-                                {% else %}<span class="badge badge-lg badge-red">{{ job.match_score }}</span>{% endif %}
-                            </td>
-                            <td>
-                                {% if job.ats_score is not None %}
-                                    <a href="{% url 'ats_report' job.id %}" title="View the full ATS report">
-                                        <span class="badge {% if job.ats_score >= ATS_THRESHOLD %}badge-green{% elif job.ats_score >= 60 %}badge-yellow{% else %}badge-red{% endif %}">{{ job.ats_score }}</span>
-                                    </a>
-                                {% else %}<span class="muted" title="No tailored CV was generated for this job, so there is no ATS score for it">Not scored</span>{% endif %}
-                            </td>
-                            <td>{{ job.title }}</td>
-                            <td>{{ job.company|default:"—" }}</td>
-                            <td>{{ job.location|default:"—" }}</td>
-                            <td>
-                                {% if job.salary %}{{ job.salary }}{% else %}<span class="muted">Salary not listed</span>{% endif %}
-                                {% if job.above_salary_preference %}
-                                    <span class="badge badge-yellow" title="Above the maximum in your preferences — shown anyway, since pay is negotiable">above preference</span>
-                                {% endif %}
-                            </td>
-                            <td>
-                                {% if job.sponsorship_flag == 'SPONSORED' %}<span class="badge badge-green">Sponsored</span>
-                                {% else %}<span class="muted">{{ job.get_sponsorship_flag_display }}</span>{% endif %}
-                            </td>
-                            <td>{{ job.match_reason|default:"—" }}</td>
-                            <td>
-                                {% if job.missing_skills %}
-                                    <span class="muted" title="{{ job.missing_skills|join:', ' }}">{{ job.missing_skills|join:", "|truncatechars:40 }}</span>
-                                {% else %}<span class="muted">—</span>{% endif %}
-                            </td>
-                            <td>{% if job.tailored_pdf %}<a href="{{ job.tailored_pdf.url }}" target="_blank" rel="noopener">PDF</a>{% else %}—{% endif %}</td>
-                            <td>{% if job.application_link %}<a href="{{ job.application_link }}" target="_blank" rel="noopener">Link</a>{% else %}—{% endif %}</td>
-                        </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
+<!-- Filter + Refresh Bar -->
+<div class="card" style="padding:1rem 1.25rem;">
+    <div style="display:flex; align-items:center; gap:1rem; flex-wrap:wrap; justify-content:space-between;">
+        <div class="job-tabs" style="margin:0;">
+            <button type="button" class="job-tab active" data-filter="all" id="tab-all">
+                All <span class="badge badge-blue" id="count-all">{{ total_found }}</span>
+            </button>
+            <button type="button" class="job-tab" data-filter="above" id="tab-above">
+                Above {{ MATCH_THRESHOLD }}% <span class="badge badge-green" id="count-above">{{ above_count }}</span>
+            </button>
+            <button type="button" class="job-tab" data-filter="below" id="tab-below">
+                Below {{ MATCH_THRESHOLD }}% <span class="badge badge-red" id="count-below">{{ below_count }}</span>
+            </button>
         </div>
-    {% else %}
-        <p class="muted">No jobs were found for this search.</p>
-    {% endif %}
+        <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+            <label style="margin:0; font-size:0.8rem; color:var(--muted); display:flex; align-items:center; gap:0.4rem; cursor:pointer;">
+                <input type="checkbox" id="sponsored-toggle" style="width:auto; cursor:pointer;"> Sponsored only
+            </label>
+            <button type="button" class="btn btn-secondary btn-sm" id="refresh-btn" title="Clear cache and reload">🔄 Refresh</button>
+        </div>
+    </div>
+</div>
+
+<!-- Progress indicator (shown while loading) -->
+<div id="fetch-progress" style="display:none; margin-bottom:1rem; padding:0.75rem 1rem; background:var(--primary-light); border-radius:var(--radius-sm); border:1px solid var(--primary); font-size:0.875rem; color:var(--primary);">
+    <span class="spinner" style="display:inline-block; width:14px; height:14px; border:2px solid rgba(244,121,33,0.3); border-top-color:var(--primary); border-radius:50%; animation:spin 0.7s linear infinite; vertical-align:middle; margin-right:0.5rem;"></span>
+    <span id="fetch-progress-text">Loading jobs…</span>
+</div>
+
+<!-- Skeleton Loaders (shown before first load) -->
+<div id="skeleton-grid" style="display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:1rem; margin-bottom:1rem;">
+    {% for i in "123456" %}
+    <div class="skeleton-card">
+        <div style="display:flex; align-items:center; gap:0.75rem; margin-bottom:1rem;">
+            <div class="skeleton skeleton-circle" style="width:52px; height:52px;"></div>
+            <div style="flex:1;">
+                <div class="skeleton skeleton-line" style="width:70%; margin-bottom:0.4rem;"></div>
+                <div class="skeleton skeleton-line" style="width:50%;"></div>
+            </div>
+        </div>
+        <div class="skeleton skeleton-line" style="width:100%;"></div>
+        <div class="skeleton skeleton-line" style="width:80%;"></div>
+        <div class="skeleton skeleton-line" style="width:60%;"></div>
+    </div>
+    {% endfor %}
+</div>
+
+<!-- No results message (hidden by default) -->
+<div id="no-results-msg" style="display:none; text-align:center; padding:3rem 1rem;">
+    <div style="font-size:3.5rem; margin-bottom:1rem;">🔍</div>
+    <h2>No jobs in this view</h2>
+    <p class="muted">Try a different filter tab or refresh to fetch new results.</p>
+</div>
+
+<!-- Jobs Grid (populated by JS) -->
+<div id="jobs-grid" style="display:none; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:1rem;">
+</div>
+
+<!-- Load More -->
+<div id="load-more-container" style="display:none; text-align:center; margin-top:1.5rem;">
+    <button type="button" class="btn btn-ghost" id="load-more-btn">Load More Jobs ↓</button>
+    <p class="muted" style="margin-top:0.5rem; font-size:0.8rem;" id="pagination-info"></p>
 </div>
 {% endblock %}
 
 {% block scripts %}
-<script>
-(function () {
-    // Client-side tab filtering: every job is already in the DOM, so switching
-    // tabs is instant and needs no round trip.
-    var threshold = {{ MATCH_THRESHOLD }};
-    var tabs = document.querySelectorAll('.job-tab');
-    var rows = document.querySelectorAll('.job-row');
-    var empty = document.getElementById('tab-empty');
-    var table = document.getElementById('jobs-table');
-    if (!tabs.length || !rows.length) { return; }
+<style>
+    /* ============================================================
+       JOB CARD COMPONENTS
+    ============================================================ */
+    .job-card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 1.25rem;
+        box-shadow: var(--shadow-sm);
+        transition: all 0.25s;
+        display: flex; flex-direction: column;
+        gap: 0.75rem;
+        animation: cardFadeIn 0.35s ease both;
+        position: relative; overflow: hidden;
+    }
+    .job-card::before {
+        content: '';
+        position: absolute; left: 0; top: 0; bottom: 0; width: 4px;
+        border-radius: 4px 0 0 4px;
+    }
+    .job-card.score-high   { border-left: 4px solid var(--success); }
+    .job-card.score-high::before { background: var(--success); }
+    .job-card.score-medium { border-left: 4px solid var(--warning); }
+    .job-card.score-medium::before { background: var(--warning); }
+    .job-card.score-low    { border-left: 4px solid var(--danger); }
+    .job-card.score-low::before { background: var(--danger); }
+    .job-card.score-unscored { border-left: 4px solid var(--muted); }
+    .job-card.score-unscored::before { background: var(--muted); }
 
-    function apply(filter) {
-        var shown = 0;
-        rows.forEach(function (row) {
-            // An unscored job has no score at all. It is NOT a zero, so it never
-            // claims to be above the threshold — but it stays visible in "All
-            // Jobs" and in "Below", so the two tabs still account for every row.
-            var raw = row.dataset.score;
-            var scored = raw !== '';
-            var score = scored ? parseInt(raw, 10) : null;
-            var show = filter === 'all'
-                || (filter === 'above' && scored && score >= threshold)
-                || (filter === 'below' && (!scored || score < threshold));
-            row.style.display = show ? '' : 'none';
-            if (show) { shown++; }
-        });
-        if (empty) { empty.style.display = shown ? 'none' : ''; }
-        if (table) { table.style.display = shown ? '' : 'none'; }
+    .job-card:hover {
+        box-shadow: var(--shadow-lg);
+        transform: translateY(-4px);
+        border-color: var(--border-hover);
+    }
+    @keyframes cardFadeIn {
+        from { opacity: 0; transform: translateY(16px); }
+        to   { opacity: 1; transform: none; }
     }
 
-    tabs.forEach(function (tab) {
+    /* Score ring */
+    .score-ring-wrap {
+        position: relative; flex-shrink: 0;
+        width: 56px; height: 56px;
+    }
+    .score-ring-wrap svg { transform: rotate(-90deg); }
+    .score-ring-bg   { fill: none; stroke: var(--border); stroke-width: 5; }
+    .score-ring-fill { fill: none; stroke-width: 5; stroke-linecap: round; transition: stroke-dashoffset 0.6s cubic-bezier(.4,0,.2,1); }
+    .score-ring-fill.high   { stroke: var(--success); }
+    .score-ring-fill.medium { stroke: var(--warning); }
+    .score-ring-fill.low    { stroke: var(--danger); }
+    .score-ring-fill.unscored { stroke: var(--muted); }
+    .score-ring-label {
+        position: absolute; inset: 0;
+        display: flex; align-items: center; justify-content: center;
+        font-weight: 800; font-size: 0.78rem;
+        font-family: 'Plus Jakarta Sans', sans-serif;
+        line-height: 1;
+    }
+    .score-ring-label.high   { color: var(--success); }
+    .score-ring-label.medium { color: var(--warning); }
+    .score-ring-label.low    { color: var(--danger); }
+    .score-ring-label.unscored { color: var(--muted); font-size: 0.6rem; }
+</style>
+
+<script>
+(function () {
+    'use strict';
+
+    var RUN_ID       = {{ search_run.id }};
+    var THRESHOLD    = {{ MATCH_THRESHOLD }};
+    var ATS_THRESHOLD= {{ ATS_THRESHOLD }};
+    var PAGE_SIZE    = 24;
+    var CACHE_KEY    = 'search_results_' + RUN_ID;
+    var CACHE_TTL    = 5 * 60 * 1000; // 5 minutes
+    var FILTER_KEY   = 'search_filter_' + RUN_ID;
+
+    var currentPage     = 1;
+    var currentFilter   = 'all';
+    var sponsoredOnly   = false;
+    var totalLoaded     = 0;
+    var totalAvailable  = 0;
+    var hasMore         = false;
+    var isLoading       = false;
+
+    var grid        = document.getElementById('jobs-grid');
+    var skeleton    = document.getElementById('skeleton-grid');
+    var noResults   = document.getElementById('no-results-msg');
+    var loadMoreCon = document.getElementById('load-more-container');
+    var loadMoreBtn = document.getElementById('load-more-btn');
+    var progressBar = document.getElementById('fetch-progress');
+    var progressTxt = document.getElementById('fetch-progress-text');
+    var paginationInfo = document.getElementById('pagination-info');
+    var refreshBtn  = document.getElementById('refresh-btn');
+    var sponsorToggle = document.getElementById('sponsored-toggle');
+
+    /* ---- Cache helpers ---- */
+    function cacheGet(page, filter) {
+        try {
+            var raw = sessionStorage.getItem(CACHE_KEY + '_' + filter + '_p' + page);
+            if (!raw) return null;
+            var entry = JSON.parse(raw);
+            if (Date.now() - entry.ts > CACHE_TTL) { sessionStorage.removeItem(CACHE_KEY + '_' + filter + '_p' + page); return null; }
+            return entry.data;
+        } catch (e) { return null; }
+    }
+    function cacheSet(page, filter, data) {
+        try {
+            sessionStorage.setItem(CACHE_KEY + '_' + filter + '_p' + page, JSON.stringify({ ts: Date.now(), data: data }));
+            // Also store basic run info for dashboard cache notice
+            sessionStorage.setItem('job_search_cache_{{ active_cv.id|default:"0" }}', JSON.stringify({ run_id: RUN_ID, timestamp: Date.now() }));
+        } catch (e) {}
+    }
+    function cacheClearAll() {
+        var keys = [];
+        for (var i = 0; i < sessionStorage.length; i++) { keys.push(sessionStorage.key(i)); }
+        keys.forEach(function (k) { if (k.startsWith(CACHE_KEY)) sessionStorage.removeItem(k); });
+    }
+
+    /* ---- Circular SVG progress ring ---- */
+    function buildRing(score, scoreClass) {
+        var r = 22;
+        var circ = 2 * Math.PI * r;
+        var fraction = score !== null ? Math.max(0, Math.min(100, score)) / 100 : 0;
+        var offset = circ * (1 - fraction);
+        var label = score !== null ? score + '%' : 'N/A';
+
+        return '<div class="score-ring-wrap">' +
+            '<svg width="56" height="56" viewBox="0 0 56 56">' +
+            '<circle class="score-ring-bg" cx="28" cy="28" r="' + r + '"/>' +
+            '<circle class="score-ring-fill ' + scoreClass + '" cx="28" cy="28" r="' + r + '"' +
+            ' stroke-dasharray="' + circ + '"' +
+            ' stroke-dashoffset="' + offset + '"/>' +
+            '</svg>' +
+            '<div class="score-ring-label ' + scoreClass + '">' + label + '</div>' +
+        '</div>';
+    }
+
+    /* ---- Sponsorship badge ---- */
+    function sponsorBadge(flag, label) {
+        if (flag === 'SPONSORED') return '<span class="badge badge-green">✅ ' + label + '</span>';
+        return '<span class="badge badge-grey" style="font-size:0.68rem;">' + (label || 'Unknown') + '</span>';
+    }
+
+    /* ---- Salary above pref badge ---- */
+    function salaryDisplay(salary, abovePref) {
+        if (!salary) return '<span class="muted">Not listed</span>';
+        var s = salary;
+        if (abovePref) s += ' <span class="badge badge-yellow" style="font-size:0.65rem;">above pref</span>';
+        return s;
+    }
+
+    /* ---- Build a single job card HTML ---- */
+    function buildCard(job) {
+        var ring = buildRing(job.match_score, job.score_class);
+
+        var atsHtml = '';
+        if (job.ats_score !== null && job.ats_score !== undefined) {
+            var atsClass = job.ats_score >= ATS_THRESHOLD ? 'badge-green' : job.ats_score >= 60 ? 'badge-yellow' : 'badge-red';
+            atsHtml = job.ats_url
+                ? '<a href="' + job.ats_url + '" class="badge ' + atsClass + '" title="ATS Report">ATS ' + job.ats_score + '%</a>'
+                : '<span class="badge ' + atsClass + '">ATS ' + job.ats_score + '%</span>';
+        }
+
+        var skillsHtml = '';
+        if (job.missing_skills && job.missing_skills.length > 0) {
+            var skillItems = job.missing_skills.slice(0, 4).map(function (s) {
+                return '<span class="badge badge-orange" style="font-size:0.68rem;">' + s + '</span>';
+            }).join(' ');
+            skillsHtml = '<div style="margin-top:0.5rem;">' +
+                '<p style="font-size:0.72rem; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:0.3rem;">Missing Skills</p>' +
+                '<div style="display:flex; flex-wrap:wrap; gap:0.3rem;">' + skillItems + '</div></div>';
+        }
+
+        var actionsHtml = '<div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-top:auto; padding-top:0.5rem; border-top:1px solid var(--border);">';
+        if (job.application_link) {
+            actionsHtml += '<a href="' + job.application_link + '" target="_blank" rel="noopener" class="btn btn-sm" style="flex:1;">Apply Now ↗</a>';
+        }
+        if (job.tailored_pdf_url) {
+            actionsHtml += '<a href="' + job.tailored_pdf_url + '" target="_blank" rel="noopener" class="btn btn-secondary btn-sm">📥 PDF</a>';
+        }
+        if (job.ats_url) {
+            actionsHtml += '<a href="' + job.ats_url + '" class="btn btn-ghost btn-sm">📊 ATS</a>';
+        }
+        actionsHtml += '</div>';
+
+        var reasonHtml = '';
+        if (job.match_reason) {
+            var safeReason = job.match_reason.replace(/</g,'&lt;').replace(/>/g,'&gt;').substring(0, 120);
+            reasonHtml = '<p style="font-size:0.78rem; color:var(--muted); margin:0; font-style:italic; line-height:1.4;">' + safeReason + (job.match_reason.length > 120 ? '…' : '') + '</p>';
+        }
+
+        return '<div class="job-card score-' + job.score_class + '" data-sponsorship="' + job.sponsorship_flag + '">' +
+            '<div style="display:flex; align-items:flex-start; gap:0.85rem;">' +
+                ring +
+                '<div style="flex:1; min-width:0;">' +
+                    '<h3 style="margin-bottom:0.2rem; font-size:0.95rem; line-height:1.3; word-break:break-word;">' + (job.title || '—') + '</h3>' +
+                    '<p style="margin:0; font-size:0.82rem; font-weight:600; color:var(--text-soft);">' + (job.company || '—') + '</p>' +
+                '</div>' +
+            '</div>' +
+            '<div style="display:flex; flex-wrap:wrap; gap:0.4rem; align-items:center;">' +
+                (job.location ? '<span style="font-size:0.78rem; color:var(--muted);">📍 ' + job.location + '</span>' : '') +
+                (job.salary ? '<span style="font-size:0.78rem; color:var(--muted); margin-left:auto;">💰 ' + salaryDisplay(job.salary, job.above_salary_preference) + '</span>' : '') +
+            '</div>' +
+            '<div style="display:flex; flex-wrap:wrap; gap:0.35rem; align-items:center;">' +
+                sponsorBadge(job.sponsorship_flag, job.sponsorship_label) +
+                (atsHtml ? atsHtml : '') +
+            '</div>' +
+            reasonHtml +
+            skillsHtml +
+            actionsHtml +
+        '</div>';
+    }
+
+    /* ---- Show / hide skeleton ---- */
+    function setLoading(val) {
+        isLoading = val;
+        if (progressBar) progressBar.style.display = val ? 'flex' : 'none';
+    }
+
+    /* ---- Render a batch of jobs ---- */
+    function renderJobs(jobs) {
+        if (skeleton) skeleton.style.display = 'none';
+        grid.style.display = 'grid';
+
+        var filtered = jobs.filter(function (j) {
+            if (sponsoredOnly && j.sponsorship_flag !== 'SPONSORED') return false;
+            return true;
+        });
+
+        if (filtered.length === 0 && totalLoaded === 0) {
+            grid.style.display = 'none';
+            noResults.style.display = 'block';
+        } else {
+            noResults.style.display = 'none';
+        }
+
+        var html = filtered.map(function (j, idx) {
+            return '<div style="animation-delay:' + (idx * 40) + 'ms">' + buildCard(j) + '</div>';
+        }).join('');
+        grid.insertAdjacentHTML('beforeend', html);
+        totalLoaded += jobs.length;
+    }
+
+    /* ---- Fetch a page of jobs ---- */
+    function fetchJobs(page, filter, useCache) {
+        if (isLoading) return;
+        setLoading(true);
+        if (progressTxt) progressTxt.textContent = 'Loading jobs… (page ' + page + ')';
+
+        var cached = useCache !== false ? cacheGet(page, filter) : null;
+        if (cached) {
+            setLoading(false);
+            totalAvailable = cached.total;
+            hasMore = cached.has_more;
+            renderJobs(cached.jobs);
+            updatePagination();
+            return;
+        }
+
+        var url = '/search/' + RUN_ID + '/jobs-json/?page=' + page + '&page_size=' + PAGE_SIZE + '&filter=' + filter;
+        (window.fetchWithRetry || window.fetchWithTimeout || fetch)(url, {
+            headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        }, 8000, 1)
+            .then(function (r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.json();
+            })
+            .then(function (data) {
+                cacheSet(page, filter, data);
+                totalAvailable = data.total;
+                hasMore = data.has_more;
+                // Update badge counts from first page
+                if (page === 1) {
+                    var cAll   = document.getElementById('count-all');
+                    var cAbove = document.getElementById('count-above');
+                    var cBelow = document.getElementById('count-below');
+                    if (cAll)   cAll.textContent   = data.total_all;
+                    if (cAbove) cAbove.textContent  = data.above_count;
+                    if (cBelow) cBelow.textContent  = data.below_count;
+                }
+                renderJobs(data.jobs);
+                updatePagination();
+            })
+            .catch(function (err) {
+                if (skeleton) skeleton.style.display = 'none';
+                grid.style.display = 'grid';
+                window.showToast('Failed to load jobs: ' + err.message, 'error');
+            })
+            .finally(function () { setLoading(false); });
+    }
+
+    function updatePagination() {
+        if (hasMore) {
+            loadMoreCon.style.display = 'block';
+            if (paginationInfo) paginationInfo.textContent = 'Showing ' + totalLoaded + ' of ' + totalAvailable + ' jobs';
+        } else {
+            loadMoreCon.style.display = 'none';
+        }
+    }
+
+    /* ---- Filter tab clicks ---- */
+    document.querySelectorAll('.job-tab').forEach(function (tab) {
         tab.addEventListener('click', function () {
-            tabs.forEach(function (t) {
-                t.classList.remove('active');
-                t.setAttribute('aria-selected', 'false');
-            });
+            document.querySelectorAll('.job-tab').forEach(function (t) { t.classList.remove('active'); });
             tab.classList.add('active');
-            tab.setAttribute('aria-selected', 'true');
-            apply(tab.dataset.filter);
+            currentFilter = tab.getAttribute('data-filter');
+            currentPage = 1; totalLoaded = 0; hasMore = false;
+            grid.innerHTML = '';
+            grid.style.display = 'none';
+            if (skeleton) skeleton.style.display = 'grid';
+            fetchJobs(currentPage, currentFilter, true);
         });
     });
-    apply('all');
+
+    /* ---- Sponsored toggle ---- */
+    if (sponsorToggle) {
+        sponsorToggle.addEventListener('change', function () {
+            sponsoredOnly = this.checked;
+            // Re-render from cache without re-fetching
+            currentPage = 1; totalLoaded = 0; hasMore = false;
+            grid.innerHTML = '';
+            grid.style.display = 'none';
+            if (skeleton) skeleton.style.display = 'grid';
+            fetchJobs(1, currentFilter, true);
+        });
+    }
+
+    /* ---- Load More button ---- */
+    if (loadMoreBtn) {
+        loadMoreBtn.addEventListener('click', function () {
+            currentPage++;
+            fetchJobs(currentPage, currentFilter, true);
+        });
+    }
+
+    /* ---- Refresh: clear cache & reload ---- */
+    if (refreshBtn) {
+        refreshBtn.addEventListener('click', function () {
+            cacheClearAll();
+            currentPage = 1; totalLoaded = 0; hasMore = false;
+            grid.innerHTML = '';
+            grid.style.display = 'none';
+            if (skeleton) skeleton.style.display = 'grid';
+            fetchJobs(1, currentFilter, false);
+        });
+    }
+
+    /* ---- Initial load ---- */
+    fetchJobs(1, currentFilter, true);
+
 })();
 </script>
 {% endblock %}

@@ -441,6 +441,7 @@ def search_results(request, run_id):
     )
 
 
+
 @login_required
 def export_excel(request, run_id):
     """Download a formatted .xlsx of a completed search run's jobs."""
@@ -456,3 +457,99 @@ def export_excel(request, run_id):
         filename=f'search_results_{search_run.pk}.xlsx',
         content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     )
+
+
+@login_required
+def search_jobs_json(request, run_id):
+    """Return paginated JSON job results for a given search run.
+
+    Supports ?page=N&page_size=N query parameters for lazy loading.
+    Used by the frontend for caching and incremental rendering.
+    """
+    search_run = get_object_or_404(SearchRun, pk=run_id, user=request.user)
+    threshold = settings.MATCH_THRESHOLD
+    ats_threshold = settings.ATS_THRESHOLD
+
+    try:
+        page = max(1, int(request.GET.get('page', 1)))
+        page_size = max(1, min(100, int(request.GET.get('page_size', 25))))
+    except (ValueError, TypeError):
+        page = 1
+        page_size = 25
+
+    filter_tab = request.GET.get('filter', 'all')  # 'all', 'above', 'below'
+
+    jobs_qs = (
+        search_run.jobs
+        .select_related('ats_report')
+        .order_by(F('match_score').desc(nulls_last=True), 'title')
+    )
+
+    if filter_tab == 'above':
+        jobs_qs = jobs_qs.filter(match_score__gte=threshold)
+    elif filter_tab == 'below':
+        from django.db.models import Q as _Q
+        jobs_qs = jobs_qs.filter(
+            _Q(match_score__lt=threshold) | _Q(match_score__isnull=True)
+        )
+
+    total = jobs_qs.count()
+    offset = (page - 1) * page_size
+    jobs_page = list(jobs_qs[offset: offset + page_size])
+
+    def _sponsorship_label(job):
+        if job.sponsorship_flag == 'SPONSORED':
+            return 'Sponsored'
+        return job.get_sponsorship_flag_display()
+
+    jobs_data = []
+    for job in jobs_page:
+        ats_score = None
+        ats_url = None
+        if hasattr(job, 'ats_report') and job.ats_report is not None:
+            ats_score = job.ats_score
+            ats_url = f'/job/{job.pk}/ats/'
+
+        jobs_data.append({
+            'id': job.pk,
+            'title': job.title,
+            'company': job.company or '',
+            'location': job.location or '',
+            'salary': job.salary or '',
+            'sponsorship_flag': job.sponsorship_flag,
+            'sponsorship_label': _sponsorship_label(job),
+            'match_score': job.match_score,
+            'match_reason': job.match_reason or '',
+            'missing_skills': job.missing_skills or [],
+            'above_salary_preference': job.above_salary_preference,
+            'ats_score': ats_score,
+            'ats_url': ats_url,
+            'tailored_pdf_url': job.tailored_pdf.url if job.tailored_pdf else None,
+            'application_link': job.application_link or '',
+            'score_class': (
+                'high' if (job.match_score is not None and job.match_score >= threshold)
+                else 'medium' if (job.match_score is not None and job.match_score >= 50)
+                else 'low' if job.match_score is not None
+                else 'unscored'
+            ),
+        })
+
+    all_jobs = list(search_run.jobs.order_by(F('match_score').desc(nulls_last=True)))
+    scored = [j for j in all_jobs if j.match_score is not None]
+    above_count = sum(1 for j in scored if j.match_score >= threshold)
+
+    return JsonResponse({
+        'run_id': run_id,
+        'status': search_run.status,
+        'total': total,
+        'total_all': len(all_jobs),
+        'above_count': above_count,
+        'below_count': len(all_jobs) - above_count,
+        'not_scored_count': len(all_jobs) - len(scored),
+        'page': page,
+        'page_size': page_size,
+        'has_more': (offset + page_size) < total,
+        'match_threshold': threshold,
+        'ats_threshold': ats_threshold,
+        'jobs': jobs_data,
+    })
