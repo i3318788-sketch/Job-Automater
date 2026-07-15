@@ -1904,11 +1904,11 @@ def fabricated_metrics(original_cv_text, tailored_cv_text):
 # Weights for score_cv_against_contract. Hard-skill and must-have coverage
 # dominate, as they do in the tools candidates actually get measured by.
 CONTRACT_WEIGHTS = {
-    'hard_skills': 0.40,
+    'hard_skills': 0.25,
     'must_have': 0.25,
-    'title': 0.15,
+    'title': 0.25,
     'acronyms': 0.10,
-    'sections': 0.10,
+    'sections': 0.15,
 }
 
 
