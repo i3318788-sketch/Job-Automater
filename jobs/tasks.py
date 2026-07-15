@@ -290,21 +290,20 @@ def _match_reason(coverage, contract):
     if not coverage.get('scorable'):
         return NOT_SCORED_REASON
 
-    hard = contract.get('hard_skills') or []
-    found = len(coverage.get('found_hard') or [])
+    # Found/total mirror the score's own denominator (hard skills + acronyms), so
+    # the reason and the number never disagree.
+    breakdown = coverage.get('breakdown') or {}
+    found = breakdown.get('found', len(coverage.get('found_hard') or []))
+    total = breakdown.get('total', len(contract.get('hard_skills') or []))
     missing = coverage.get('missing_hard') or []
     must_missing = coverage.get('missing_must') or []
 
-    parts = []
-    if hard:
-        parts.append(f'Covers {found}/{len(hard)} of the skills this job asks for')
+    parts = [f'Covers {found}/{total} of the keywords this job asks for']
     if must_missing:
         parts.append('missing must-haves: ' + ', '.join(must_missing[:4]))
     elif missing:
         parts.append('missing: ' + ', '.join(missing[:4]))
-    if coverage.get('title_ok'):
-        parts.append('job title matches')
-    return '. '.join(parts) + '.' if parts else 'Matched on job title only.'
+    return '. '.join(parts) + '.'
 
 
 def _apply_salary_preference(salary_text, min_salary, max_salary, reason,
