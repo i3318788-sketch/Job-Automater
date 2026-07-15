@@ -327,18 +327,14 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
     def assess(text):
         """Score a draft against the contract, and check it invented nothing.
 
-        The ATS score is pure keyword coverage: the fraction of the job's
-        keywords that the tailored CV contains, from the same function that
-        produces the match score against the original CV. The seven-phase report
-        is kept alongside it as advisory diagnostic detail (recommendations,
-        formatting notes) — it no longer feeds the headline number.
+        The headline score comes from the contract when there is one: that is the
+        set of terms the job actually asked for, so it is the number that agrees
+        with an external ATS. The seven-phase report is kept alongside it as the
+        diagnostic detail.
         """
         report = check_cv_against_job(text, job_description, job_title, job_location)
-        coverage = score_cv_against_contract(text, contract) if contract else None
-        # Only override with the keyword score when the job actually had keywords
-        # to measure; a job with none leaves coverage['score'] as None, and there
-        # is nothing to keyword-match against.
-        if coverage and coverage.get('score') is not None:
+        if contract and contract.get('hard_skills'):
+            coverage = score_cv_against_contract(text, contract)
             report['contract_coverage'] = coverage
             report['phase_score'] = report['overall_score']
             report['overall_score'] = coverage['score']

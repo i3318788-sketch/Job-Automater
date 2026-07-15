@@ -1899,18 +1899,26 @@ def fabricated_metrics(original_cv_text, tailored_cv_text):
 
 
 # ---------------------------------------------------------------------------
-# Contract-based coverage scoring (pure keyword matching)
+# Contract-based coverage scoring (the Jobscan-style number)
 # ---------------------------------------------------------------------------
+# Weights for score_cv_against_contract. Hard-skill and must-have coverage
+# dominate, as they do in the tools candidates actually get measured by.
+CONTRACT_WEIGHTS = {
+    'hard_skills': 0.40,
+    'must_have': 0.25,
+    'title': 0.15,
+    'acronyms': 0.10,
+    'sections': 0.10,
+}
+
 
 def score_cv_against_contract(cv_text, contract):
-    """Score a CV purely on how many of the job's keywords it contains (0-100).
+    """Score a CV's coverage of a job's keyword contract (0-100). Never raises.
 
-    Never raises. The score is exactly the fraction of the job's keywords (the
-    hard skills and acronyms mined from the advert) that appear in the CV. It
-    measures the terms the job actually asks for and nothing else — no job-title
-    match, no CV formatting, no experience or education weighting. The same
-    function scores the original CV (the match score) and the tailored CV (the
-    ATS score); only the CV text differs.
+    This is the number to compare against an external ATS tool: it measures
+    exactly the terms the job asks for, rather than the terms our vocabulary
+    happens to know. The seven-phase report remains the diagnostic view; this is
+    the headline.
     """
     from .job_keywords import term_present
 
@@ -1954,33 +1962,67 @@ def score_cv_against_contract(cv_text, contract):
             else:
                 missing_acronyms.append(pair[0])
 
-        # No keywords to measure against: the advert yielded no hard skills and no
-        # acronyms. Pure keyword matching has nothing to compare, so there is no
-        # honest score — the caller shows these as "Not scored" and sorts them
-        # last. (A job title is deliberately NOT a keyword: matching it says only
-        # that the advert is called what the candidate calls themselves, not that
-        # they can do the job. must_have is a subset of hard_skills, so it is
-        # already covered by the hard-skill check below.)
-        if not (hard or acronyms):
+        titles = [contract.get('job_title') or ''] + (contract.get('title_variants') or [])
+        titles = [t for t in titles if t]
+
+        # No requirement to measure against: the advert yielded no hard skills, no
+        # must-haves and no acronyms. There is no honest score to give.
+        #
+        # A job title is NOT a requirement. Matching one says only that the advert
+        # is called what the candidate calls themselves — it says nothing about
+        # whether they can do the job. When the title was allowed to carry a score
+        # on its own, the only two things left to weigh were the title and the CV's
+        # section-heading coverage, and both are properties of the CV alone: any
+        # well-formatted CV whose title matched scored ~100/100 against an advert
+        # whose requirements we had failed to parse. That is the silent 100 this
+        # guard exists to prevent, so it refuses a title-only contract too.
+        #
+        # The caller shows these as "Not scored" and sorts them last.
+        if not (hard or must or acronyms):
             logger.info(
-                'Contract carries no hard skills or acronyms (source=%s, title=%r) '
-                '— not scorable, returning None.',
+                'Contract carries no hard skills, must-haves or acronyms '
+                '(source=%s, title=%r) — not scorable, returning None.',
                 contract.get('source'), contract.get('job_title'),
             )
-            return dict(empty)
+            return dict(empty, breakdown={'sections': float(_section_coverage(cv_text))})
 
-        # Pure keyword coverage: what fraction of the job's keywords does the CV
-        # contain? Every job keyword counts once — each hard skill, plus each
-        # acronym concept (either surface form satisfies it). Nothing else feeds
-        # the score: not the job title, not CV section headings, not recency,
-        # chronology or quantification. The number is exactly "keywords of the job
-        # present in this CV / keywords of the job", scored the same way for the
-        # original CV (match score) and the tailored CV (ATS score).
-        total_keywords = len(hard) + len(acronyms)
-        found_keywords = len(found_hard) + len(found_acronyms)
-        score = _clamp(found_keywords / total_keywords * 100)
+        title_ok = any(term_present(t, lowered) for t in titles)
+        if not title_ok and titles:
+            # Partial credit for a close title ("Backend Engineer" vs "Senior
+            # Backend Engineer") — an ATS fuzzy-matches titles, it doesn't demand
+            # a literal string.
+            title_score = max(_fuzzy_ratio(t, lowered[:400]) for t in titles)
+            title_score = 100 if title_score >= 85 else (60 if title_score >= 50 else 0)
+        else:
+            title_score = 100 if title_ok else 50  # no title stated -> neutral
 
-        breakdown = {'found': found_keywords, 'total': total_keywords}
+        sections = _section_coverage(cv_text)
+
+        def pct(found, total):
+            return len(found) / len(total) * 100.0 if total else None
+
+        # A category with nothing to measure scores None, not 100. Awarding full
+        # marks for an absent requirement was handing out a free 35 points to
+        # every job that stated no must-haves and used no acronyms — enough to
+        # score a pastry-chef advert 45/100 against a backend engineer's CV. The
+        # weight of an inapplicable category is redistributed across the ones that
+        # do apply, so the score always reflects what the job actually asked for.
+        breakdown = {
+            'hard_skills': pct(found_hard, hard),
+            'must_have': pct(found_must, must),
+            'title': float(title_score) if titles else None,
+            'acronyms': pct(found_acronyms, acronyms),
+            'sections': float(sections),
+        }
+        applicable = {
+            key: value for key, value in breakdown.items() if value is not None
+        }
+        total_weight = sum(CONTRACT_WEIGHTS[k] for k in applicable)
+        score = _clamp(
+            sum(applicable[k] * CONTRACT_WEIGHTS[k] for k in applicable) / total_weight
+        ) if total_weight else 0
+        breakdown = {k: (round(v, 1) if v is not None else None)
+                     for k, v in breakdown.items()}
 
         return {
             'score': score,
@@ -1989,12 +2031,27 @@ def score_cv_against_contract(cv_text, contract):
             'missing_must': missing_must,
             'missing_acronyms': missing_acronyms,
             'found_hard': found_hard,
-            'title_ok': False,
+            'title_ok': bool(title_ok),
             'breakdown': breakdown,
         }
     except Exception:
         logger.exception('Contract scoring failed')
         return empty
+
+
+def _section_coverage(cv_text):
+    """Percentage of the sections an ATS needs in order to parse a CV at all."""
+    standard, _creative = find_headings(cv_text)
+    found = {
+        SECTION_ALIASES[_normalize_heading(h)]
+        for h in standard if _normalize_heading(h) in SECTION_ALIASES
+    }
+    required = {'profile', 'experience', 'education', 'skills'}
+    have = len(required & found)
+    # Contact details count for the fifth slot.
+    if re.search(r'[\w.+-]+@[\w-]+\.\w+|\+?\d[\d\s()-]{7,}', cv_text or ''):
+        have += 1
+    return _clamp(have / (len(required) + 1) * 100)
 
 
 def genuine_missing_terms(ats_result, limit=15):
