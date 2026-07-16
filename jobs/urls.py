@@ -7,6 +7,7 @@ urlpatterns = [
     path('cv/upload/', views.upload_cv, name='upload_cv'),
     path('cv/create/', views.create_profile, name='create_profile'),
     path('cv/<int:cv_id>/delete/', views.delete_cv, name='delete_cv'),
+    path('cv/<int:cv_id>/delete-file/', views.delete_cv_file, name='delete_cv_file'),
     path('preferences/', views.edit_preferences, name='edit_preferences'),
     path('profile/', views.profile, name='profile'),
     path('search/start/', views.start_search, name='start_search'),

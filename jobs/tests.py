@@ -549,6 +549,38 @@ class ProfileManagementTests(TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertTrue(CV.objects.filter(pk=cv.pk).exists())
 
+    def test_delete_cv_file_keeps_profile_and_history(self):
+        # The "Delete CV" button (CV File card) must remove only the file and its
+        # parsed data — the profile record, its name, and any search history stay.
+        cv = _make_cv_for(self.user, name='Profile A')
+        cv.parsed_data = {'skills': ['python'], 'job_titles': ['engineer']}
+        cv.save()
+        run = SearchRun.objects.create(user=self.user, cv=cv)
+
+        response = self.client.post(reverse('delete_cv_file', args=[cv.pk]))
+        self.assertRedirects(response, reverse('dashboard'))
+
+        # Profile record survives, only the CV file/parsed data are cleared.
+        cv.refresh_from_db()
+        self.assertEqual(cv.name, 'Profile A')
+        self.assertFalse(cv.has_file)
+        self.assertEqual(cv.parsed_text, '')
+        self.assertEqual(cv.parsed_data, {})
+        # Search history is untouched and still linked to the profile.
+        run.refresh_from_db()
+        self.assertEqual(run.cv_id, cv.pk)
+        self.assertTrue(SearchRun.objects.filter(pk=run.pk).exists())
+        # Profile stays active so a new CV can be uploaded straight away.
+        self.assertEqual(self.client.session['active_cv_id'], cv.pk)
+
+    def test_delete_cv_file_other_user_forbidden(self):
+        other = User.objects.create_user(username='intruder2', password='pw12345!')
+        cv = _make_cv_for(other, name='Secret')
+        response = self.client.post(reverse('delete_cv_file', args=[cv.pk]))
+        self.assertEqual(response.status_code, 404)
+        cv.refresh_from_db()
+        self.assertTrue(cv.has_file)
+
     def test_upload_targets_active_profile(self):
         cv = _make_cv_for(self.user, name='Profile A')
         cv.original_file.delete(save=False)  # empty the profile
@@ -3423,3 +3455,46 @@ class GoogleSheetsTests(TestCase):
         self.assertEqual(len(values[0]), 12)
         self.assertEqual(values[0][0], 'Dev')
         self.assertEqual(values[0][11], '')  # no tailored PDF on this job
+
+    @mock.patch('jobs.services.google_sheets.os.path.exists', return_value=True)
+    def test_search_header_row_is_merged_centered_and_bold(self, _exists):
+        """A date header spanning A-L, merged into one bold, size-16, centered cell."""
+        from datetime import date
+        from jobs.services.google_sheets import GoogleSheetsLogger, LAST_COLUMN
+
+        with override_settings(GOOGLE_SHEET_ID='sheet123',
+                               GOOGLE_SHEETS_CREDENTIALS_JSON='/fake/creds.json'):
+            with mock.patch('gspread.authorize') as authorize, \
+                 mock.patch('google.oauth2.service_account.Credentials.from_service_account_file'):
+                tab = authorize.return_value.open_by_key.return_value.worksheet.return_value
+                # Headers + 2 existing job rows -> header lands on row 4.
+                tab.get_all_values.return_value = [['h']] + [['x']] * 2
+
+                sheets = GoogleSheetsLogger()
+                index = sheets.log_search_header('Haseeb Ijaz', date(2026, 7, 16))
+
+        self.assertEqual(index, 4)
+        span = f'A4:{LAST_COLUMN}4'  # A4:L4 — every used column
+
+        # The date value is written into the top-left cell of the span.
+        value_call = tab.update.call_args
+        self.assertEqual(value_call.kwargs['range_name'], 'A4')
+        self.assertEqual(value_call.kwargs['values'], [['16 July 2026']])
+
+        # The whole row is merged into a single cell.
+        tab.merge_cells.assert_called_once()
+        self.assertEqual(tab.merge_cells.call_args.args[0], span)
+
+        # Formatting: bold, size 16, centered horizontally and vertically.
+        fmt_call = tab.format.call_args
+        self.assertEqual(fmt_call.args[0], span)
+        fmt = fmt_call.args[1]
+        self.assertEqual(fmt['horizontalAlignment'], 'CENTER')
+        self.assertTrue(fmt['textFormat']['bold'])
+        self.assertEqual(fmt['textFormat']['fontSize'], 16)
+
+    def test_search_header_noop_when_disabled(self):
+        from jobs.services.google_sheets import GoogleSheetsLogger
+        with override_settings(GOOGLE_SHEET_ID='', GOOGLE_SHEETS_CREDENTIALS_JSON=''):
+            sheets = GoogleSheetsLogger()
+        self.assertIsNone(sheets.log_search_header('Gina'))

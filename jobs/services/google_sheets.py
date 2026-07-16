@@ -163,6 +163,57 @@ class GoogleSheetsLogger:
         existing = worksheet.get_all_values()
         return max(len(existing) + 1, FIRST_DATA_ROW)
 
+    def log_search_header(self, candidate_name, search_date=None):
+        """Write a merged, centered date row above this run's job rows.
+
+        One header row is written per search run, so the tab reads: date row,
+        that run's jobs, next date row, next run's jobs, and so on. The row spans
+        every used column (A-L) merged into a single cell, with the date bold,
+        size 16 and centered. Returns the 1-based row index written, or None.
+
+        Best-effort like everything else here: a formatting failure is logged and
+        swallowed so it can never abort a search.
+        """
+        if not self.enabled:
+            return None
+        worksheet = self.get_or_create_worksheet(candidate_name)
+        if worksheet is None:
+            return None
+
+        from datetime import date, datetime
+
+        if search_date is None:
+            search_date = date.today()
+        if isinstance(search_date, datetime):
+            search_date = search_date.date()
+        date_text = search_date.strftime('%d %B %Y')
+
+        try:
+            index = self.next_data_row(worksheet)
+            span = f'A{index}:{LAST_COLUMN}{index}'
+            # Value goes in the top-left cell of the span before the merge.
+            worksheet.update(
+                range_name=f'A{index}', values=[[date_text]],
+                value_input_option='USER_ENTERED',
+            )
+            worksheet.merge_cells(span, merge_type='MERGE_ALL')
+            worksheet.format(span, {
+                'horizontalAlignment': 'CENTER',
+                'verticalAlignment': 'MIDDLE',
+                'textFormat': {'bold': True, 'fontSize': 16},
+            })
+            logger.info(
+                'Wrote search date header "%s" to Google Sheets tab "%s" at %s',
+                date_text, sanitize_tab_name(candidate_name), span,
+            )
+            return index
+        except Exception:
+            logger.exception(
+                'Failed to write search date header to Google Sheets tab "%s"',
+                sanitize_tab_name(candidate_name),
+            )
+            return None
+
     def log_job(self, job, candidate_name, cv_skills=None):
         """Write one job into columns A-L of the next free row. True on success."""
         if not self.enabled:

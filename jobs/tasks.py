@@ -674,6 +674,11 @@ def run_job_search(search_run_id):
         # Sheets logging happens here rather than mid-loop, so every row is
         # written with its final match and ATS scores already in place.
         all_jobs = list(search_run.jobs.all())
+        # One date header row per search run, written above this run's jobs, so
+        # the tab reads: date row, this run's jobs, next date row, next run's
+        # jobs. Written once, before the job rows for this run.
+        if sheets.enabled and all_jobs:
+            sheets.log_search_header(candidate_name, search_run.created_at)
         for i, job in enumerate(all_jobs, start=1):
             if sheets.enabled:
                 sheets.log_job(job, candidate_name, cv_skills=cv_skills)

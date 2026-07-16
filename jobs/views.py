@@ -114,7 +114,13 @@ def create_profile(request):
 @login_required
 @require_POST
 def delete_cv(request, cv_id):
-    """Delete a CV profile (file + record) and switch to another profile."""
+    """Delete a whole CV profile (file + record) and switch to another profile.
+
+    This is the profile-tab "×" action, which removes the entire candidate
+    profile. The "Delete CV" button in the CV File card is a *different* action —
+    see ``delete_cv_file`` — that clears only the uploaded file and keeps the
+    profile.
+    """
     cv = get_object_or_404(CV, pk=cv_id, user=request.user)
     name = cv.display_name
     if cv.original_file:
@@ -127,6 +133,36 @@ def delete_cv(request, cv_id):
     else:
         request.session.pop(SESSION_ACTIVE_CV, None)
     messages.success(request, f'Profile "{name}" deleted.')
+    return redirect('dashboard')
+
+
+@login_required
+@require_POST
+def delete_cv_file(request, cv_id):
+    """Remove only the uploaded CV file and its parsed data from a profile.
+
+    The candidate profile itself is kept: its name, its search-run history, the
+    user's preferences and every other record stay exactly as they were. Only the
+    file on disk and the fields derived from it (``parsed_text``/``parsed_data``)
+    are cleared, so the user can immediately upload a new CV into the same profile
+    without re-creating it. This is deliberately NOT ``delete_cv`` — that deletes
+    the whole profile record; this only empties the CV attached to it.
+    """
+    cv = get_object_or_404(CV, pk=cv_id, user=request.user)
+    if cv.original_file:
+        cv.original_file.delete(save=False)  # remove the file from storage
+    cv.original_file = ''
+    cv.parsed_text = ''
+    cv.parsed_data = {}
+    cv.save(update_fields=['original_file', 'parsed_text', 'parsed_data'])
+
+    # Keep this profile active — the user is expected to upload a replacement.
+    request.session[SESSION_ACTIVE_CV] = cv.pk
+    messages.success(
+        request,
+        f'CV removed from "{cv.display_name}". Upload a new CV file when ready — '
+        f'your profile and search history are unchanged.',
+    )
     return redirect('dashboard')
 
 

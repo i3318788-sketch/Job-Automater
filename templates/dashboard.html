@@ -77,8 +77,8 @@
                 <span style="color:var(--primary); font-size:1.4rem;">📄</span>
                 <span style="font-weight:500; flex:1;">{{ active_cv.original_file.name|cut:"cvs/" }}</span>
                 <a class="btn btn-ghost btn-sm" href="{{ active_cv.original_file.url }}" target="_blank" rel="noopener">👁 View</a>
-                <form method="post" action="{% url 'delete_cv' active_cv.id %}" style="margin:0;"
-                      onsubmit="return confirm('Are you sure you want to delete this CV?');" data-loading="Deleting CV…">
+                <form method="post" action="{% url 'delete_cv_file' active_cv.id %}" style="margin:0;"
+                      onsubmit="return confirm('Remove this CV file? Your profile, preferences and search history stay — only the uploaded CV is deleted, and you can upload a new one.');" data-loading="Deleting CV…">
                     {% csrf_token %}
                     <button type="submit" class="btn btn-danger btn-sm">🗑 Delete</button>
                 </form>
