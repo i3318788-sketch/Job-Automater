@@ -7,7 +7,9 @@ inventing any new experience. Falls back to the original CV text on any failure.
 ATS checker and, when it falls short of the target, re-runs the rewrite with the
 checker's specific findings fed back in.
 """
+import json
 import logging
+import re
 
 from django.conf import settings
 
@@ -146,6 +148,257 @@ experience bullets that evidence them.
 Return only the revised CV text."""
 
 
+# The model returns STRUCTURED JSON, not free-form text. Rendering from structure
+# removes the fragile text-reparsing step (parse_cv_sections) that mis-detected
+# headers when a source CV extracted messily (dates hoisted above the name, a date
+# fused onto the name line). A fixed schema also guarantees one identical UK format
+# for every CV, whatever layout the original was in.
+JSON_SYSTEM_PROMPT = """You are an expert UK CV writer. You are given a candidate's \
+ORIGINAL CV text — which was extracted from a PDF/DOCX and MAY BE OUT OF ORDER \
+(dates hoisted above the name, a date fused onto the name line, sidebar content \
+interleaved) — and a target JOB DESCRIPTION. Reconstruct the CV as STRUCTURED DATA \
+and tailor it to the job.
+
+Return ONLY a JSON object with EXACTLY these keys:
+{
+  "name": "the candidate's real full name (NEVER a date, a job title or an address)",
+  "contact": "one line: phone | email | location, using ONLY details in the CV",
+  "profile": "a 3-5 sentence professional summary, tailored to the job description",
+  "skills": ["8-12 skills, standard capitalisation, e.g. JavaScript, SEO, Excel"],
+  "experience": [
+    {"title": "role title", "company": "employer", "location": "city",
+     "dates": "e.g. Mar 2024 - Present", "bullets": ["3-5 achievement bullets"]}
+  ],
+  "education": [
+    {"title": "qualification", "institution": "school/university",
+     "dates": "e.g. 2017 - 2020", "detail": "grade / note, or empty string"}
+  ],
+  "certifications": ["one per entry, or empty list"],
+  "additional": ["languages / interests, or empty list"]
+}
+
+SEMANTIC RECONSTRUCTION (critical — the source text may be scrambled):
+- Put the person's REAL full name in "name". A date range, a job title, an email or \
+an address is NEVER the name.
+- Attach every date range to the CORRECT role in experience[].dates. NEVER let a \
+date float to the top, into "name", or into "contact".
+- Group each role's title, company, location, dates and bullets together, most \
+recent first.
+
+TAILORING RULES (do not break):
+- DO NOT change job titles, companies/employers, or dates — copy them EXACTLY as in \
+the original CV.
+- DO NOT invent roles, employers, dates or experience; keep the same real work. \
+Never drop a real role.
+- You MAY rephrase the profile and the existing bullets to use the job \
+description's wording/terminology, while still describing the SAME real work the \
+person already did.
+- Add the skills the job requires (from the keyword list and the JD) into "skills", \
+and weave them into the relevant existing bullet where they genuinely fit. If the \
+candidate has NEVER done a required skill, add it to "skills" ONLY — do not \
+fabricate an experience bullet claiming they did it.
+- Keep quantified results (numbers, %, £) only where they already exist. Use UK \
+spelling. No photo, DOB, nationality or marital status.
+
+Return ONLY the JSON object — no commentary, no markdown fences."""
+
+
+# The fixed field order used both for the plain-text rendering (ATS/tailored_text)
+# and, in pdf_generator, for the PDF layout.
+_EMPTY_DATA = {
+    'name': '', 'contact': '', 'profile': '', 'skills': [],
+    'experience': [], 'education': [], 'certifications': [], 'additional': [],
+}
+
+_DATE_ONLY_RE = re.compile(
+    r'^[\s\-–—]*(?:'
+    r'(?:[A-Za-z]{3,9}\.?\s+)?\d{4}'          # 2020, March 2024
+    r'|\d{1,2}[/-]\d{2,4}'                     # 03/2024
+    r'|present|current|now'
+    r')(?:[\s\-–—to]+.*)?$',
+    re.IGNORECASE,
+)
+
+
+def _s(value):
+    return str(value).strip() if value is not None else ''
+
+
+def _empty_data():
+    return {k: ([] if isinstance(v, list) else '') for k, v in _EMPTY_DATA.items()}
+
+
+def _normalise_data(data, cv_text=''):
+    """Coerce a model/JSON dict into the exact schema, with safe types and a guard
+    that a date never ends up as the candidate's name."""
+    data = data if isinstance(data, dict) else {}
+
+    experience = []
+    for entry in (data.get('experience') or []):
+        if not isinstance(entry, dict):
+            continue
+        experience.append({
+            'title': _s(entry.get('title')),
+            'company': _s(entry.get('company')),
+            'location': _s(entry.get('location')),
+            'dates': _s(entry.get('dates')),
+            'bullets': [_s(b) for b in (entry.get('bullets') or []) if _s(b)],
+        })
+
+    education = []
+    for entry in (data.get('education') or []):
+        if not isinstance(entry, dict):
+            continue
+        education.append({
+            'title': _s(entry.get('title')),
+            'institution': _s(entry.get('institution')),
+            'location': _s(entry.get('location')),
+            'dates': _s(entry.get('dates')),
+            'detail': _s(entry.get('detail')),
+        })
+
+    result = {
+        'name': _s(data.get('name')),
+        'contact': _s(data.get('contact')),
+        'profile': _s(data.get('profile')),
+        'skills': [_s(x) for x in (data.get('skills') or []) if _s(x)],
+        'experience': experience,
+        'education': education,
+        'certifications': [_s(x) for x in (data.get('certifications') or []) if _s(x)],
+        'additional': [_s(x) for x in (data.get('additional') or []) if _s(x)],
+    }
+    # Never let a bare date sit in the name slot.
+    if not result['name'] or _DATE_ONLY_RE.match(result['name']):
+        result['name'] = _guess_name(cv_text) or result['name']
+    return result
+
+
+def _guess_name(cv_text):
+    """Best-effort real name: the first line that is not a date/contact/heading."""
+    for raw in (cv_text or '').splitlines():
+        line = raw.strip()
+        if not line or _DATE_ONLY_RE.match(line):
+            continue
+        if '@' in line or 'http' in line.lower() or re.search(r'\d{5,}', line):
+            continue
+        if len(line) > 60:
+            continue
+        return line
+    return ''
+
+
+def cv_data_to_text(data):
+    """Flatten the structured CV dict into clean plain text.
+
+    Used for ATS scoring and for ``Job.tailored_text``. Emits the same section
+    headings the ATS checker/text parser understand, in the canonical order.
+    """
+    data = _normalise_data(data)
+    lines = []
+    if data['name']:
+        lines.append(data['name'])
+    if data['contact']:
+        lines.append(data['contact'])
+    lines.append('')
+
+    if data['profile']:
+        lines += ['PROFESSIONAL PROFILE', data['profile'], '']
+    if data['skills']:
+        lines.append('KEY SKILLS')
+        lines += [f'- {s}' for s in data['skills']]
+        lines.append('')
+    if data['experience']:
+        lines.append('PROFESSIONAL EXPERIENCE')
+        for e in data['experience']:
+            head = ' | '.join(p for p in (e['title'], e['company'], e['location']) if p)
+            if head:
+                lines.append(head)
+            if e['dates']:
+                lines.append(e['dates'])
+            lines += [f'- {b}' for b in e['bullets']]
+            lines.append('')
+    if data['education']:
+        lines.append('EDUCATION')
+        for ed in data['education']:
+            head = ' | '.join(p for p in (ed['title'], ed['institution'], ed['location']) if p)
+            if head:
+                lines.append(head)
+            if ed['dates']:
+                lines.append(ed['dates'])
+            if ed['detail']:
+                lines.append(f'- {ed["detail"]}')
+            lines.append('')
+    if data['certifications']:
+        lines.append('CERTIFICATIONS')
+        lines += [f'- {c}' for c in data['certifications']]
+        lines.append('')
+    if data['additional']:
+        lines.append('ADDITIONAL INFORMATION')
+        lines += [f'- {a}' for a in data['additional']]
+    return '\n'.join(lines).strip()
+
+
+def _strip_lead_bullet(line):
+    return line.strip().lstrip('-•*–—· ').strip()
+
+
+def _parse_entries(lines, education=False):
+    """Best-effort grouping of section lines into structured entries.
+
+    Only used as a FALLBACK (when OpenAI is unavailable or errors); the normal path
+    reconstructs structure semantically via the model.
+    """
+    date_re = re.compile(r'\b\d{4}\b|present|current', re.IGNORECASE)
+    entries, cur = [], None
+    for raw in lines or []:
+        line = raw.strip()
+        if not line:
+            continue
+        bulleted = line[:1] in '-•*–—·'
+        if '|' in line and not bulleted:
+            if cur:
+                entries.append(cur)
+            parts = [p.strip() for p in line.split('|')]
+            if education:
+                cur = {'title': parts[0],
+                       'institution': parts[1] if len(parts) > 1 else '',
+                       'location': parts[2] if len(parts) > 2 else '',
+                       'dates': '', 'detail': ''}
+            else:
+                cur = {'title': parts[0],
+                       'company': parts[1] if len(parts) > 1 else '',
+                       'location': parts[2] if len(parts) > 2 else '',
+                       'dates': '', 'bullets': []}
+        elif cur and not bulleted and not cur['dates'] and date_re.search(line) and len(line) < 40:
+            cur['dates'] = line
+        elif cur:
+            content = _strip_lead_bullet(line)
+            if education:
+                cur['detail'] = (cur['detail'] + ' ' + content).strip() if cur['detail'] else content
+            else:
+                cur['bullets'].append(content)
+    if cur:
+        entries.append(cur)
+    return entries
+
+
+def _text_to_data(cv_text):
+    """Reconstruct the structured dict from raw CV text (OpenAI-free fallback)."""
+    from .pdf_generator import parse_cv_sections
+
+    sections = parse_cv_sections(cv_text or '')
+    return _normalise_data({
+        'name': sections.get('name', ''),
+        'contact': sections.get('contact', ''),
+        'profile': ' '.join(sections.get('profile') or []),
+        'skills': [_strip_lead_bullet(l) for l in (sections.get('skills') or [])],
+        'experience': _parse_entries(sections.get('experience') or []),
+        'education': _parse_entries(sections.get('education') or [], education=True),
+        'certifications': [_strip_lead_bullet(l) for l in (sections.get('certifications') or [])],
+        'additional': [_strip_lead_bullet(l) for l in (sections.get('additional') or [])],
+    }, cv_text)
+
+
 def _openai_configured():
     return bool(getattr(settings, 'OPENAI_API_KEY', ''))
 
@@ -252,21 +505,21 @@ def _build_user_prompt(cv_text, job_description, job_title, company,
 
 def tailor_cv_for_job(cv_text, job_description, job_title, company,
                       contract=None, missing_terms=None):
-    """Return a tailored version of ``cv_text`` aligned to the given job.
+    """Return a STRUCTURED CV dict (see ``JSON_SYSTEM_PROMPT``) tailored to the job.
 
-    ``contract`` is the shared keyword contract (see ``job_keywords``); when
-    given, the rewrite targets exactly the terms the CV will be scored on.
-    ``missing_terms`` drives a second pass that recovers genuine coverage the
-    first draft left on the table.
+    The model runs in JSON mode and reconstructs the CV's fields SEMANTICALLY from
+    the (possibly out-of-order) ``cv_text``, so a messy PDF extraction can no longer
+    scramble the rendered layout. ``contract`` targets the exact scored terms;
+    ``missing_terms`` drives a recovery pass.
 
-    On any failure (missing key, API error, empty input) the original CV text is
-    returned so downstream PDF generation still has content to work with.
+    On any failure (missing key, API error, empty input, unparsable JSON) a dict is
+    reconstructed from the original ``cv_text`` so downstream rendering still works.
     """
     if not cv_text:
-        return cv_text
+        return _empty_data()
     if not _openai_configured():
-        logger.info('OpenAI not configured; returning original CV for tailoring.')
-        return cv_text
+        logger.info('OpenAI not configured; building CV data from the original text.')
+        return _text_to_data(cv_text)
 
     try:
         from openai import OpenAI
@@ -275,7 +528,7 @@ def tailor_cv_for_job(cv_text, job_description, job_title, company,
         response = client.chat.completions.create(
             model=DEFAULT_TAILOR_MODEL,
             messages=[
-                {'role': 'system', 'content': SYSTEM_PROMPT},
+                {'role': 'system', 'content': JSON_SYSTEM_PROMPT},
                 {
                     'role': 'user',
                     'content': _build_user_prompt(
@@ -284,13 +537,14 @@ def tailor_cv_for_job(cv_text, job_description, job_title, company,
                     ),
                 },
             ],
+            response_format={'type': 'json_object'},
             temperature=0.3,
         )
-        tailored = (response.choices[0].message.content or '').strip()
-        return tailored or cv_text
+        raw = response.choices[0].message.content or ''
+        return _normalise_data(json.loads(raw), cv_text)
     except Exception:  # pragma: no cover - network/dep dependent
-        logger.exception('CV tailoring failed; returning original CV text.')
-        return cv_text
+        logger.exception('CV tailoring failed; building CV data from original text.')
+        return _text_to_data(cv_text)
 
 
 def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
@@ -302,10 +556,10 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
     a draft that falls short is re-generated with that checker's specific findings
     fed back to the model. The best-scoring draft wins.
 
-    Returns ``(tailored_text, ats_report, attempts)``. The report is the full dict
-    from ``ATSChecker.get_detailed_report``. When the target is never reached the
-    best attempt is returned anyway — with its true (lower) score, not a
-    flattering one.
+    Returns ``(cv_data, ats_report, attempts)`` where ``cv_data`` is the STRUCTURED
+    CV dict (rendered to the PDF from structure). The report is the full dict from
+    ``ATSChecker.get_detailed_report``. When the target is never reached the best
+    attempt is returned anyway — with its true (lower) score, not a flattering one.
     """
     from .ats_checker import (
         altered_facts,
@@ -378,14 +632,14 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
             return candidate[1]['honest']
         return candidate[1]['overall_score'] > incumbent[1]['overall_score']
 
-    tailored = tailor_cv_for_job(
+    data = tailor_cv_for_job(
         cv_text, job_description, job_title, company, contract=contract,
     )
-    best = (tailored, assess(tailored))
+    best = (data, assess(cv_data_to_text(data)))
     attempts = 1
 
     # Without OpenAI there is nothing to iterate on — the "tailored" CV is the
-    # original, and re-running would just burn cycles producing the same text.
+    # original reconstructed into structure, and re-running would just repeat it.
     if not _openai_configured():
         return best[0], best[1], attempts
 
@@ -399,13 +653,13 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
                 # Honest but short of target: the gap is coverage, so name the
                 # exact terms to recover from the candidate's real experience.
                 missing = genuine_missing_terms(best[1]['contract_coverage'])
-                tailored = tailor_cv_for_job(
+                data = tailor_cv_for_job(
                     cv_text, job_description, job_title, company,
                     contract=contract, missing_terms=missing,
                 )
             else:
                 # Dishonest, or no contract: feed back the checker's findings.
-                tailored = _retry_with_feedback(
+                data = _retry_with_feedback(
                     cv_text, job_description, job_title, company, best[0], best[1],
                     contract=contract,
                 )
@@ -413,7 +667,7 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
             logger.exception('ATS-guided retailoring failed; keeping best draft.')
             break
 
-        report = assess(tailored)
+        report = assess(cv_data_to_text(data))
         logger.info(
             'ATS retailor attempt %s for "%s": %s -> %s (invented skills: %s; '
             'invented metrics: %s)',
@@ -421,8 +675,8 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
             report['unsupported_claims'] or 'none',
             report['fabricated_metrics'] or 'none',
         )
-        if better((tailored, report), best):
-            best = (tailored, report)
+        if better((data, report), best):
+            best = (data, report)
 
     if not best[1]['honest']:
         # Every draft made something up, so there is no honest draft to ship. Fall
@@ -459,7 +713,9 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
             'that reached a higher score did so by claiming skills your CV does not '
             'evidence, so we kept your real CV and its true score instead.'
         )
-        return cv_text, original_report, attempts
+        # Ship the ORIGINAL content, but still as structured data so it renders in
+        # the same clean UK format as everything else.
+        return _text_to_data(cv_text), original_report, attempts
 
     if best[1]['overall_score'] < target_score:
         # The honest ceiling for this job. Recorded on the report rather than only
@@ -487,8 +743,9 @@ def tailor_cv_for_job_with_ats(cv_text, job_description, job_title, company,
 
 
 def _retry_with_feedback(cv_text, job_description, job_title, company,
-                         previous_draft, report, contract=None):
-    """One more tailoring pass, with the ATS checker's findings in the prompt."""
+                         previous_data, report, contract=None):
+    """One more tailoring pass (JSON mode), with the ATS checker's findings in the
+    prompt. ``previous_data`` is the last structured dict; returns a new dict."""
     from openai import OpenAI
 
     coverage = report.get('contract_coverage') or {}
@@ -549,16 +806,21 @@ def _retry_with_feedback(cv_text, job_description, job_title, company,
     response = client.chat.completions.create(
         model=DEFAULT_TAILOR_MODEL,
         messages=[
-            {'role': 'system', 'content': SYSTEM_PROMPT},
+            {'role': 'system', 'content': JSON_SYSTEM_PROMPT},
             {
                 'role': 'user',
                 'content': _build_user_prompt(
                     cv_text, job_description, job_title, company, contract,
                 ),
             },
-            {'role': 'assistant', 'content': previous_draft},
-            {'role': 'user', 'content': feedback},
+            {'role': 'assistant', 'content': cv_data_to_text(previous_data)},
+            {'role': 'user',
+             'content': feedback + '\n\nReturn the corrected CV as the same JSON object.'},
         ],
+        response_format={'type': 'json_object'},
         temperature=0.3,
     )
-    return (response.choices[0].message.content or '').strip() or previous_draft
+    try:
+        return _normalise_data(json.loads(response.choices[0].message.content or ''), cv_text)
+    except Exception:  # pragma: no cover - defensive
+        return previous_data

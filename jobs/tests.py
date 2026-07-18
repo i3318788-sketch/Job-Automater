@@ -785,14 +785,20 @@ class CeleryTaskTests(TestCase):
 
 
 class TailoringTests(TestCase):
-    def test_returns_original_when_openai_not_configured(self):
-        # With no OPENAI_API_KEY configured, tailoring falls back to the original.
+    def test_returns_structured_original_when_openai_not_configured(self):
+        # Tailoring now returns STRUCTURED data (a dict). With no OPENAI_API_KEY it
+        # reconstructs the original CV content into that structure.
+        from jobs.services.tailoring import cv_data_to_text
         with override_settings(OPENAI_API_KEY=''):
             result = tailor_cv_for_job('My CV text', 'Job desc', 'Engineer', 'Acme')
-        self.assertEqual(result, 'My CV text')
+        self.assertIsInstance(result, dict)
+        self.assertIn('My CV text', cv_data_to_text(result))
 
-    def test_empty_cv_returns_empty(self):
-        self.assertEqual(tailor_cv_for_job('', 'Job desc', 'Engineer', 'Acme'), '')
+    def test_empty_cv_returns_empty_structure(self):
+        result = tailor_cv_for_job('', 'Job desc', 'Engineer', 'Acme')
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result['name'], '')
+        self.assertEqual(result['experience'], [])
 
 
 class PdfGeneratorTests(TestCase):
@@ -1479,19 +1485,20 @@ class ATSFabricationGuardrailTests(TestCase):
         self, mock_tailor, mock_retry
     ):
         """The whole point: a dishonest draft never wins, however well it scores."""
-        from jobs.services.tailoring import tailor_cv_for_job_with_ats
+        from jobs.services.tailoring import tailor_cv_for_job_with_ats, _text_to_data
 
-        # Draft 1: stuffed with invented skills and metrics -> scores well.
-        dishonest = ATS_GOOD_CV + '\n- Delivered CI/CD pipelines, cutting costs 60%.\n'
+        # Drafts are STRUCTURED dicts now. Draft 1: invented skills+metrics.
+        dishonest = _text_to_data(
+            ATS_GOOD_CV + '\n- Delivered CI/CD pipelines, cutting costs 60%.\n')
         # Draft 2: honest, and necessarily scores lower.
-        honest = ORIGINAL_CV_NO_NUMBERS
+        honest = _text_to_data(ORIGINAL_CV_NO_NUMBERS)
         mock_tailor.return_value = dishonest
         mock_retry.return_value = honest
 
-        text, report, _attempts = tailor_cv_for_job_with_ats(
+        data, report, _attempts = tailor_cv_for_job_with_ats(
             ORIGINAL_CV_NO_NUMBERS, self.JD, 'Backend Engineer', 'Acme',
         )
-        self.assertEqual(text, honest)
+        self.assertEqual(data, honest)
         self.assertTrue(report['honest'])
         self.assertFalse(report['unsupported_claims'])
         self.assertFalse(report['fabricated_metrics'])
@@ -1506,16 +1513,21 @@ class ATSFabricationGuardrailTests(TestCase):
         merely flagged. That was the bug. Flagging a lie still sends the lie to
         the employer; the candidate is the one who pays for it at interview.
         """
-        from jobs.services.tailoring import tailor_cv_for_job_with_ats
-        liar = ORIGINAL_CV_NO_NUMBERS + '\n- Ran CI/CD, improving speed by 55%.\n'
+        from jobs.services.tailoring import tailor_cv_for_job_with_ats, _text_to_data
+        # A dishonest structured draft: CI/CD is a JD skill the CV can't evidence,
+        # and 55% is a metric that appears nowhere in the original.
+        liar = _text_to_data(ORIGINAL_CV_NO_NUMBERS)
+        liar['skills'] = liar['skills'] + ['CI/CD']
+        liar['profile'] = (liar['profile']
+                           + ' Ran CI/CD pipelines, improving speed by 55%.').strip()
         mock_tailor.return_value = liar
         mock_retry.return_value = liar
 
-        text, report, _a = tailor_cv_for_job_with_ats(
+        data, report, _a = tailor_cv_for_job_with_ats(
             ORIGINAL_CV_NO_NUMBERS, self.JD, 'Backend Engineer', 'Acme',
         )
-        # The untailored (true) CV is what ships.
-        self.assertEqual(text, ORIGINAL_CV_NO_NUMBERS)
+        # The untailored (true) CV is what ships — as structured data.
+        self.assertEqual(data, _text_to_data(ORIGINAL_CV_NO_NUMBERS))
         self.assertTrue(report['fell_back_to_original'])
         # And the rejected fabrication is recorded, so the user can see why.
         rejected = ' '.join(report['fabrication_rejected'])
@@ -2157,14 +2169,15 @@ class ATSFileChecksTests(TestCase):
 
 @override_settings(OPENAI_API_KEY='', MEDIA_ROOT=_TEST_MEDIA)
 class ATSTailoringLoopTests(TestCase):
+    @override_settings(OPENAI_API_KEY='')
     def test_returns_report_without_openai(self):
-        from jobs.services.tailoring import tailor_cv_for_job_with_ats
-        text, report, attempts = tailor_cv_for_job_with_ats(
+        from jobs.services.tailoring import tailor_cv_for_job_with_ats, _text_to_data
+        data, report, attempts = tailor_cv_for_job_with_ats(
             ATS_GOOD_CV, ATS_JOB_DESCRIPTION, 'Senior Backend Engineer', 'Acme',
             'London, UK',
         )
-        # No OpenAI -> the original CV is returned, scored honestly, no retries.
-        self.assertEqual(text, ATS_GOOD_CV)
+        # No OpenAI -> the original CV is returned as structure, scored honestly.
+        self.assertEqual(data, _text_to_data(ATS_GOOD_CV))
         self.assertEqual(attempts, 1)
         self.assertGreaterEqual(report['overall_score'], 75)
 
@@ -2173,17 +2186,17 @@ class ATSTailoringLoopTests(TestCase):
     @mock.patch('jobs.services.tailoring._retry_with_feedback')
     @mock.patch('jobs.services.tailoring.tailor_cv_for_job')
     def test_retries_until_target_then_stops(self, mock_tailor, mock_retry):
-        from jobs.services.tailoring import tailor_cv_for_job_with_ats
+        from jobs.services.tailoring import tailor_cv_for_job_with_ats, _text_to_data
         # The source CV is the strong one, so a draft built from it is honest.
         # First draft is weak; the retry surfaces what was already there.
-        mock_tailor.return_value = ATS_BAD_CV
-        mock_retry.return_value = ATS_GOOD_CV
+        mock_tailor.return_value = _text_to_data(ATS_BAD_CV)
+        mock_retry.return_value = _text_to_data(ATS_GOOD_CV)
 
-        text, report, attempts = tailor_cv_for_job_with_ats(
+        data, report, attempts = tailor_cv_for_job_with_ats(
             ATS_GOOD_CV, ATS_JOB_DESCRIPTION, 'Senior Backend Engineer', 'Acme',
             'London, UK',
         )
-        self.assertEqual(text, ATS_GOOD_CV)
+        self.assertEqual(data, _text_to_data(ATS_GOOD_CV))
         self.assertEqual(attempts, 2)  # stopped as soon as the target was cleared
         self.assertGreaterEqual(report['overall_score'], 75)
         self.assertTrue(report['honest'])
@@ -2196,15 +2209,15 @@ class ATSTailoringLoopTests(TestCase):
     def test_unreachable_target_keeps_best_draft_and_reports_true_score(
         self, mock_tailor, mock_retry
     ):
-        from jobs.services.tailoring import tailor_cv_for_job_with_ats
-        mock_tailor.return_value = ATS_BAD_CV
-        mock_retry.return_value = ATS_GOOD_CV  # better, but still under 100
+        from jobs.services.tailoring import tailor_cv_for_job_with_ats, _text_to_data
+        mock_tailor.return_value = _text_to_data(ATS_BAD_CV)
+        mock_retry.return_value = _text_to_data(ATS_GOOD_CV)  # better, still < 100
 
-        text, report, attempts = tailor_cv_for_job_with_ats(
+        data, report, attempts = tailor_cv_for_job_with_ats(
             ATS_GOOD_CV, ATS_JOB_DESCRIPTION, 'Senior Backend Engineer', 'Acme',
         )
         # Keeps the best attempt and reports its real score, not a flattering one.
-        self.assertEqual(text, ATS_GOOD_CV)
+        self.assertEqual(data, _text_to_data(ATS_GOOD_CV))
         self.assertEqual(attempts, 2)
         self.assertLess(report['overall_score'], 100)
 
@@ -3031,20 +3044,22 @@ Lower Second Class (2:2)
         The score is kept as-is and flagged. It is never topped up by claiming a
         skill the CV cannot evidence.
         """
-        from jobs.services.tailoring import tailor_cv_for_job_with_ats
+        from jobs.services.tailoring import (
+            tailor_cv_for_job_with_ats, _text_to_data, cv_data_to_text,
+        )
         # An honest draft: same facts, no invented skills, but a weak match for a
         # job wanting Kubernetes/Terraform the candidate has never touched.
-        honest = self.ORIGINAL + '\nKEY SKILLS\n- Python\n'
+        honest = _text_to_data(self.ORIGINAL + '\nKEY SKILLS\n- Python\n')
         mock_tailor.return_value = honest
         mock_retry.return_value = honest
 
-        text, report, _attempts = tailor_cv_for_job_with_ats(
+        data, report, _attempts = tailor_cv_for_job_with_ats(
             self.ORIGINAL,
             'We need Kubernetes, Terraform, Go and Kafka experience.',
             'Platform Engineer', 'Acme',
         )
 
-        self.assertEqual(altered_facts_for(self.ORIGINAL, text), [])
+        self.assertEqual(altered_facts_for(self.ORIGINAL, cv_data_to_text(data)), [])
         self.assertLess(report['overall_score'], 80)
         self.assertTrue(report['below_target_honestly'])
         self.assertEqual(report['honest_ceiling'], report['overall_score'])
@@ -3061,15 +3076,16 @@ Lower Second Class (2:2)
 
         A CV that lies about a degree is worse than one that scores badly.
         """
-        from jobs.services.tailoring import tailor_cv_for_job_with_ats
-        liar = self.ORIGINAL.replace('Lower Second Class (2:2)', 'First Class')
+        from jobs.services.tailoring import tailor_cv_for_job_with_ats, _text_to_data
+        liar = _text_to_data(
+            self.ORIGINAL.replace('Lower Second Class (2:2)', 'First Class'))
         mock_tailor.return_value = liar
         mock_retry.return_value = liar
 
-        text, report, _attempts = tailor_cv_for_job_with_ats(
+        data, report, _attempts = tailor_cv_for_job_with_ats(
             self.ORIGINAL, 'Python role', 'Analyst', 'Acme',
         )
-        self.assertEqual(text, self.ORIGINAL)  # fell back to the truth
+        self.assertEqual(data, _text_to_data(self.ORIGINAL))  # fell back to the truth
         self.assertTrue(report['fell_back_to_original'])
         self.assertTrue(report['altered_facts_rejected'])
 
@@ -3087,21 +3103,21 @@ Lower Second Class (2:2)
         document that wins the ATS screen and collapses at interview is worse than
         a low score, so there is now no path that returns a fabrication.
         """
-        from jobs.services.tailoring import tailor_cv_for_job_with_ats
+        from jobs.services.tailoring import tailor_cv_for_job_with_ats, _text_to_data
         # An honest CV, plus skills that appear nowhere in the original.
-        liar = self.ORIGINAL + (
+        liar = _text_to_data(self.ORIGINAL + (
             '\nKEY SKILLS\n- Salesforce Apex\n- Kubernetes\n- Terraform\n'
-        )
+        ))
         mock_tailor.return_value = liar
         mock_retry.return_value = liar
 
-        text, report, _attempts = tailor_cv_for_job_with_ats(
+        data, report, _attempts = tailor_cv_for_job_with_ats(
             self.ORIGINAL,
             'We need Salesforce Apex, Kubernetes and Terraform.',
             'Platform Engineer', 'Acme',
         )
 
-        self.assertEqual(text, self.ORIGINAL)  # the truth shipped, not the lie
+        self.assertEqual(data, _text_to_data(self.ORIGINAL))  # the truth shipped
         self.assertTrue(report['fell_back_to_original'])
         self.assertTrue(report['fabrication_rejected'])
         # The reported score is the ORIGINAL CV's real one, not the fabrication's.

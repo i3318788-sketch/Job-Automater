@@ -33,8 +33,11 @@ from .services.keyword_extractor import (
     prescore_job,
 )
 from .services.matching import detect_sponsorship, parse_salary
-from .services.pdf_generator import build_pdf_filename, generate_tailored_pdf
-from .services.tailoring import tailor_cv_for_job_with_ats
+from .services.pdf_generator import (
+    build_pdf_filename,
+    generate_tailored_pdf_from_data,
+)
+from .services.tailoring import cv_data_to_text, tailor_cv_for_job_with_ats
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +151,8 @@ def _build_tailored_cv(job_data, cv_text, candidate_name):
         contract = job_data.get('contract') or extract_job_keywords(
             job_data['description'], job_data['title'],
         )
-        tailored, report, attempts = tailor_cv_for_job_with_ats(
+        # Tailoring now returns STRUCTURED CV data (a dict), not free-form text.
+        cv_data, report, attempts = tailor_cv_for_job_with_ats(
             cv_text, job_data['description'], job_data['title'], job_data['company'],
             job_data['location'], contract=contract,
         )
@@ -160,12 +164,14 @@ def _build_tailored_cv(job_data, cv_text, candidate_name):
         tmp_path = os.path.join(
             tempfile.gettempdir(), f'{job_data["id"]}_{filename}',
         )
-        generate_tailored_pdf(
-            tailored, candidate_name, job_data['title'], job_data['company'], tmp_path,
+        # Render straight from the structured data — no text re-parsing, so a messy
+        # source extraction can't scramble the layout.
+        generate_tailored_pdf_from_data(
+            cv_data, candidate_name, job_data['title'], job_data['company'], tmp_path,
         )
         payload.update({
             'contract': contract,
-            'tailored_text': tailored,
+            'tailored_text': cv_data_to_text(cv_data),
             'report': report,
             'attempts': attempts,
             'filename': filename,

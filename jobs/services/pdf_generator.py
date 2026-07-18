@@ -313,6 +313,90 @@ def generate_tailored_pdf(cv_text, candidate_name, job_title, company, output_pa
     logger.info('Generated UK-format tailored PDF at %s', output_path)
 
 
+def _render_data_section(key, data, styles, doc_width):
+    """Flowables for one section of the structured CV, in the existing styles."""
+    flow = []
+    if key == 'profile':
+        text = (data.get('profile') or '').strip()
+        if text:
+            flow.append(Paragraph(_escape(text), styles['CVBody']))
+    elif key == 'skills':
+        skills = [s for s in (data.get('skills') or []) if str(s).strip()]
+        if skills:
+            flow = _skills_table(skills, styles, doc_width)
+    elif key in ('experience', 'education'):
+        for entry in (data.get(key) or []):
+            if not isinstance(entry, dict):
+                continue
+            if key == 'experience':
+                head_parts = [entry.get('title'), entry.get('company'), entry.get('location')]
+            else:
+                head_parts = [entry.get('title'), entry.get('institution'), entry.get('location')]
+            head_parts = [p for p in head_parts if p and str(p).strip()]
+            if head_parts:
+                bold = _escape(head_parts[0])
+                rest = ' | '.join(_escape(p) for p in head_parts[1:])
+                flow.append(Paragraph(
+                    f'<b>{bold}</b>' + (f' | {rest}' if rest else ''), styles['CVRole']))
+            if entry.get('dates'):
+                flow.append(Paragraph(_escape(entry['dates']), styles['CVDate']))
+            if key == 'experience':
+                for bullet in (entry.get('bullets') or []):
+                    if str(bullet).strip():
+                        flow.append(Paragraph(_escape(bullet), styles['CVBullet'], bulletText='•'))
+            elif entry.get('detail') and str(entry['detail']).strip():
+                flow.append(Paragraph(_escape(entry['detail']), styles['CVBullet'], bulletText='•'))
+    elif key in ('certifications', 'additional'):
+        for item in (data.get(key) or []):
+            if str(item).strip():
+                flow.append(Paragraph(_escape(item), styles['CVBullet'], bulletText='•'))
+    return flow
+
+
+def generate_tailored_pdf_from_data(data, candidate_name, job_title, company, output_path):
+    """Render a STRUCTURED CV dict straight into the UK layout.
+
+    No text re-parsing (``parse_cv_sections``), no heading-alias guessing, no
+    flat-fallback branch. The fixed schema guarantees one identical format for every
+    CV regardless of the original layout, and a messy PDF extraction can no longer
+    scramble the header/sections. Uses the same reportlab styles and SECTION_ORDER
+    as the text-based renderer.
+    """
+    styles = _build_styles()
+    doc = SimpleDocTemplate(
+        output_path, pagesize=A4,
+        topMargin=16 * mm, bottomMargin=16 * mm,
+        leftMargin=18 * mm, rightMargin=18 * mm,
+        title=f'{candidate_name} - CV', author=candidate_name,
+    )
+    doc_width = doc.width
+
+    data = data if isinstance(data, dict) else {}
+    story = [
+        Paragraph(_escape(data.get('name') or candidate_name or 'Candidate'),
+                  styles['CVName']),
+    ]
+    if data.get('contact'):
+        story.append(Paragraph(_escape(data['contact']), styles['CVContact']))
+    story.append(HRFlowable(width='100%', thickness=1, color=colors.black,
+                            spaceBefore=3, spaceAfter=2))
+
+    for key, title in SECTION_ORDER:
+        body = _render_data_section(key, data, styles, doc_width)
+        if not body:
+            continue
+        heading = _section_heading(title, styles)
+        story.append(KeepTogether(heading + body[:1]))
+        story.extend(body[1:])
+        story.append(Spacer(1, 2))
+
+    if len(story) <= 3:
+        story.append(Paragraph('(No CV content available.)', styles['CVBody']))
+
+    doc.build(story)
+    logger.info('Generated structured tailored PDF at %s', output_path)
+
+
 def build_pdf_filename(candidate_name, job_title, company):
     """Build a filesystem-safe PDF name: CandidateName_JobTitle_Company.pdf."""
     def clean(part):
