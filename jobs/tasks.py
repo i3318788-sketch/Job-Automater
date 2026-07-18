@@ -172,6 +172,9 @@ def _build_tailored_cv(job_data, cv_text, candidate_name):
         payload.update({
             'contract': contract,
             'tailored_text': cv_data_to_text(cv_data),
+            # The tailored CV's skills list, so _apply_tailored_cv can record which
+            # skills were actually added (those not already in the original CV).
+            'tailored_skills': cv_data.get('skills') or [],
             'report': report,
             'attempts': attempts,
             'filename': filename,
@@ -195,14 +198,22 @@ def _apply_tailored_cv(job, payload, cv_text):
     try:
         contract = payload.get('contract')
         contract_terms = sorted(all_contract_terms(contract)) if contract else []
+        cv_lower = (cv_text or '').lower()
         if contract_terms:
             # The contract sees the whole advert, not just our 115-word vocabulary,
             # so it is the better record of what the job actually wants.
-            cv_lower = (cv_text or '').lower()
             job.job_skills = contract_terms
             job.missing_skills = [
                 term for term in contract_terms if not term_present(term, cv_lower)
             ]
+
+        # Skills actually woven into the tailored CV that were not already in the
+        # original CV — i.e. the ones the tailoring genuinely added for this job.
+        # A never-tailored job never reaches here, so it keeps the model default [].
+        job.added_skills = [
+            skill for skill in (payload.get('tailored_skills') or [])
+            if not term_present(skill, cv_lower)
+        ]
 
         job.tailored_text = payload['tailored_text']
         _save_ats_report(job, payload['report'])

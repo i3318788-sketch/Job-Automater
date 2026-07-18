@@ -215,6 +215,13 @@ class Job(models.Model):
     # Skills mined from the job description, and those the CV is missing.
     job_skills = models.JSONField(default=list, blank=True)
     missing_skills = models.JSONField(default=list, blank=True)
+    # Skills actually woven into the tailored CV that were not already in the
+    # original CV. default=list + blank so an insert can never leave it NULL; a
+    # job that is never tailored simply keeps [].
+    added_skills = models.JSONField(default=list, blank=True)
+    # JD-wanted skills with no evidence in the CV (reported, not silently added).
+    # Kept nullable-safe for the same reason.
+    unsupported_skills = models.JSONField(default=list, blank=True)
     # Estimated ATS score (0-100) of the tailored CV against this job.
     ats_score = models.IntegerField(null=True, blank=True)
     ats_status = models.CharField(
