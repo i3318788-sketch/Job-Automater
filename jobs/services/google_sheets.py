@@ -92,6 +92,70 @@ class GoogleSheetsLogger:
             self.client = None
             self.sheet = None
 
+    def health_check(self):
+        """Diagnose the Sheets integration without raising.
+
+        Logging is best-effort by design — a search must never fail because of it —
+        which is exactly why a broken deployment shows up as "nothing appears in the
+        sheet" and nothing else. This reports which step actually fails, so it can
+        be identified in one call instead of guessed at.
+        """
+        result = {
+            'status': 'error',
+            'configured': bool(self.credentials_path and self.sheet_id),
+            'credentials_path': self.credentials_path or None,
+            'credentials_file_found': bool(self.credentials_path)
+            and os.path.exists(self.credentials_path),
+            'sheet_id_set': bool(self.sheet_id),
+            'service_account_email': None,
+            'can_open_sheet': False,
+            'worksheets': [],
+            'error': None,
+        }
+
+        if not result['configured']:
+            result['error'] = (
+                'GOOGLE_SHEETS_CREDENTIALS_JSON and/or GOOGLE_SHEET_ID are not set '
+                'in the environment.'
+            )
+            return result
+
+        if not result['credentials_file_found']:
+            result['error'] = (
+                f'Credentials file not found at {self.credentials_path!r}. The '
+                'credentials/ directory is git-ignored, so "git pull" never puts it '
+                'on the server — copy the service-account JSON there. In Docker it '
+                'is mounted read-only at /app/credentials.'
+            )
+            return result
+
+        # The sheet must be shared with this address; surfacing it turns "not
+        # shared" from a guess into a copy-paste.
+        try:
+            import json as _json
+
+            with open(self.credentials_path) as handle:
+                result['service_account_email'] = _json.load(handle).get('client_email')
+        except Exception as exc:
+            result['error'] = f'Could not read the credentials file: {exc}'
+            return result
+
+        if not self.enabled:
+            result['error'] = (
+                'Could not open the sheet. Check that it is shared with the '
+                'service-account email above (Editor), that GOOGLE_SHEET_ID is '
+                'correct, and that the container can reach sheets.googleapis.com.'
+            )
+            return result
+
+        try:
+            result['worksheets'] = [ws.title for ws in self.sheet.worksheets()]
+            result['can_open_sheet'] = True
+            result['status'] = 'ok'
+        except Exception as exc:
+            result['error'] = f'Sheet opened but listing worksheets failed: {exc}'
+        return result
+
     def get_or_create_worksheet(self, candidate_name):
         """Return the candidate's tab, creating it (with headers) if needed."""
         if not self.sheet:

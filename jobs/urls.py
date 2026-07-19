@@ -17,4 +17,6 @@ urlpatterns = [
     path('search/<int:run_id>/export/', views.export_excel, name='export_excel'),
     path('search/<int:run_id>/jobs-json/', views.search_jobs_json, name='search_jobs_json'),
     path('job/<int:job_id>/ats/', views.ats_report, name='ats_report'),
+    # Deployment diagnostics: why Google Sheets logging is (or isn't) working.
+    path('health/google-sheets/', views.google_sheets_health, name='google_sheets_health'),
 ]

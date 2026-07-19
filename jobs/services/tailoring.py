@@ -163,8 +163,10 @@ Return ONLY a JSON object with EXACTLY these keys:
 {
   "name": "the candidate's real full name (NEVER a date, a job title or an address)",
   "contact": "one line: phone | email | location, using ONLY details in the CV",
+  "section_order": ["the section keys, in the ORIGINAL CV's own order"],
+  "section_headings": {"key": "the ORIGINAL CV's own heading text for that section"},
   "profile": "a 3-5 sentence professional summary, tailored to the job description",
-  "skills": ["8-12 skills, standard capitalisation, e.g. JavaScript, SEO, Excel"],
+  "skills": ["the original CV's skills PLUS the ones this job requires"],
   "experience": [
     {"title": "role title", "company": "employer", "location": "city",
      "dates": "e.g. Mar 2024 - Present", "bullets": ["3-5 achievement bullets"]}
@@ -176,6 +178,31 @@ Return ONLY a JSON object with EXACTLY these keys:
   "certifications": ["one per entry, or empty list"],
   "additional": ["languages / interests, or empty list"]
 }
+
+The valid section keys are exactly: profile, skills, experience, education, \
+certifications, additional.
+
+PRESERVE THE ORIGINAL CV'S LAYOUT (hard requirement — these two fields are \
+MANDATORY and must NEVER be empty):
+- Read the ORIGINAL CV's own section headings and reproduce them VERBATIM in \
+"section_headings" — same wording and same capitalisation. If the original says \
+"SUMMARY", use "SUMMARY" (not "PROFESSIONAL PROFILE"). If it says "Work History", \
+use "Work History" (not "PROFESSIONAL EXPERIENCE").
+- "section_order" must list the sections in the ORIGINAL CV's order.
+- Worked example — if the ORIGINAL CV reads:
+      SUMMARY ... EXPERIENCE ... EDUCATION ... SKILLS
+  you MUST return:
+      "section_order": ["profile", "experience", "education", "skills"],
+      "section_headings": {"profile": "SUMMARY", "experience": "EXPERIENCE",
+                           "education": "EDUCATION", "skills": "SKILLS"}
+  (note SKILLS stays LAST because that is where the original put it).
+- Do NOT add a section the original does not have. Do NOT drop a section it does \
+have. Do NOT reorder them. Only include keys whose content actually exists in the \
+original CV.
+- Map each original heading to the closest key: a summary/profile/objective section \
+-> "profile"; skills/competencies -> "skills"; experience/employment/work history \
+-> "experience"; education/qualifications -> "education"; certifications/courses -> \
+"certifications"; anything else (languages, interests, references) -> "additional".
 
 SEMANTIC RECONSTRUCTION (critical — the source text may be scrambled):
 - Put the person's REAL full name in "name". A date range, a job title, an email or \
@@ -193,22 +220,70 @@ Never drop a real role.
 - You MAY rephrase the profile and the existing bullets to use the job \
 description's wording/terminology, while still describing the SAME real work the \
 person already did.
-- Add the skills the job requires (from the keyword list and the JD) into "skills", \
-and weave them into the relevant existing bullet where they genuinely fit. If the \
-candidate has NEVER done a required skill, add it to "skills" ONLY — do not \
+- KEEP every skill already listed on the original CV, and ADD the skills this job \
+requires (from the keyword list and the JD) to that same list — never replace the \
+candidate's existing skills.
+- Weave added skills into the relevant existing bullet where they genuinely fit. If \
+the candidate has NEVER done a required skill, add it to "skills" ONLY — do not \
 fabricate an experience bullet claiming they did it.
+- Keep the same bullet style and section content the original used; only the \
+WORDING changes, never the structure.
 - Keep quantified results (numbers, %, £) only where they already exist. Use UK \
 spelling. No photo, DOB, nationality or marital status.
 
 Return ONLY the JSON object — no commentary, no markdown fences."""
 
 
-# The fixed field order used both for the plain-text rendering (ATS/tailored_text)
-# and, in pdf_generator, for the PDF layout.
+# The content fields, plus the layout fields that let the rendered CV mirror the
+# ORIGINAL's section order and heading wording instead of forcing one house style.
 _EMPTY_DATA = {
     'name': '', 'contact': '', 'profile': '', 'skills': [],
     'experience': [], 'education': [], 'certifications': [], 'additional': [],
+    'section_order': [], 'section_headings': {},
 }
+
+# Valid section keys, and the fallback heading used only when the original CV gave
+# us nothing to copy.
+SECTION_KEYS = ('profile', 'skills', 'experience', 'education', 'certifications',
+                'additional')
+DEFAULT_HEADINGS = {
+    'profile': 'PROFESSIONAL PROFILE',
+    'skills': 'KEY SKILLS',
+    'experience': 'PROFESSIONAL EXPERIENCE',
+    'education': 'EDUCATION',
+    'certifications': 'CERTIFICATIONS',
+    'additional': 'ADDITIONAL INFORMATION',
+}
+
+
+def section_layout(data):
+    """The (key, heading) pairs to render, in the original CV's own order.
+
+    Falls back to the canonical order/headings for anything the model did not
+    describe, and only ever yields sections that actually have content.
+    """
+    data = data if isinstance(data, dict) else {}
+    headings = data.get('section_headings') or {}
+    order = [k for k in (data.get('section_order') or []) if k in SECTION_KEYS]
+    # Anything with content but missing from section_order still gets rendered, in
+    # the canonical position, so a section can never silently vanish.
+    order += [k for k in SECTION_KEYS if k not in order]
+
+    layout = []
+    for key in order:
+        if not data.get(key):
+            continue
+        heading = _s(headings.get(key)) or DEFAULT_HEADINGS[key]
+        layout.append((key, heading))
+    return layout
+
+# One or more leading date tokens, e.g. "August 2023 - March 2024" or "03/2024 -
+# Present", used to peel a date off a line the extractor fused onto the name.
+_DATE_TOKEN = r'(?:(?:[A-Za-z]{3,9}\.?\s+)?\d{4}|\d{1,2}[/-]\d{2,4}|present|current|now)'
+_DATE_PREFIX_RE = re.compile(
+    r'^[\s\-–—]*' + _DATE_TOKEN + r'(?:\s*(?:[-–—]|to)\s*' + _DATE_TOKEN + r')*',
+    re.IGNORECASE,
+)
 
 _DATE_ONLY_RE = re.compile(
     r'^[\s\-–—]*(?:'
@@ -266,6 +341,16 @@ def _normalise_data(data, cv_text=''):
         'education': education,
         'certifications': [_s(x) for x in (data.get('certifications') or []) if _s(x)],
         'additional': [_s(x) for x in (data.get('additional') or []) if _s(x)],
+        # Layout mirrored from the original CV: which sections it had, in what
+        # order, and the exact heading wording it used.
+        'section_order': [
+            k for k in (data.get('section_order') or []) if k in SECTION_KEYS
+        ],
+        'section_headings': {
+            k: _s(v)
+            for k, v in (data.get('section_headings') or {}).items()
+            if k in SECTION_KEYS and _s(v)
+        } if isinstance(data.get('section_headings'), dict) else {},
     }
     # Never let a bare date sit in the name slot.
     if not result['name'] or _DATE_ONLY_RE.match(result['name']):
@@ -274,24 +359,34 @@ def _normalise_data(data, cv_text=''):
 
 
 def _guess_name(cv_text):
-    """Best-effort real name: the first line that is not a date/contact/heading."""
+    """Best-effort real name from messy text.
+
+    Handles the extraction artefact where a date range is fused onto the name line
+    ("August 2023 - March 2024RAJWINDER KAUR") by stripping the leading date, and
+    never mistakes a section heading ("PROFILE") for a person's name.
+    """
+    from .pdf_generator import SECTION_ALIASES, _normalize_heading
+
     for raw in (cv_text or '').splitlines():
         line = raw.strip()
-        if not line or _DATE_ONLY_RE.match(line):
+        if not line:
             continue
+        if SECTION_ALIASES.get(_normalize_heading(line)):
+            continue  # a heading is never the name
         if '@' in line or 'http' in line.lower() or re.search(r'\d{5,}', line):
-            continue
-        if len(line) > 60:
-            continue
-        return line
+            continue  # contact line
+        candidate = _DATE_PREFIX_RE.sub('', line).strip(' -–—:|')
+        if candidate and not _DATE_ONLY_RE.match(candidate) and len(candidate) <= 60:
+            return candidate
     return ''
 
 
 def cv_data_to_text(data):
     """Flatten the structured CV dict into clean plain text.
 
-    Used for ATS scoring and for ``Job.tailored_text``. Emits the same section
-    headings the ATS checker/text parser understand, in the canonical order.
+    Used for ATS scoring and for ``Job.tailored_text``. Sections are emitted in the
+    ORIGINAL CV's own order, under the ORIGINAL CV's own headings, so the tailored
+    document keeps the candidate's layout rather than a house style.
     """
     data = _normalise_data(data)
     lines = []
@@ -301,40 +396,35 @@ def cv_data_to_text(data):
         lines.append(data['contact'])
     lines.append('')
 
-    if data['profile']:
-        lines += ['PROFESSIONAL PROFILE', data['profile'], '']
-    if data['skills']:
-        lines.append('KEY SKILLS')
-        lines += [f'- {s}' for s in data['skills']]
+    for key, heading in section_layout(data):
+        lines.append(heading)
+        if key == 'profile':
+            lines.append(data['profile'])
+        elif key == 'experience':
+            for entry in data['experience']:
+                head = ' | '.join(
+                    p for p in (entry['title'], entry['company'], entry['location']) if p
+                )
+                if head:
+                    lines.append(head)
+                if entry['dates']:
+                    lines.append(entry['dates'])
+                lines += [f'- {b}' for b in entry['bullets']]
+        elif key == 'education':
+            for entry in data['education']:
+                head = ' | '.join(
+                    p for p in (entry['title'], entry['institution'], entry['location'])
+                    if p
+                )
+                if head:
+                    lines.append(head)
+                if entry['dates']:
+                    lines.append(entry['dates'])
+                if entry['detail']:
+                    lines.append(f'- {entry["detail"]}')
+        else:  # skills / certifications / additional: simple bullet lists
+            lines += [f'- {item}' for item in data[key]]
         lines.append('')
-    if data['experience']:
-        lines.append('PROFESSIONAL EXPERIENCE')
-        for e in data['experience']:
-            head = ' | '.join(p for p in (e['title'], e['company'], e['location']) if p)
-            if head:
-                lines.append(head)
-            if e['dates']:
-                lines.append(e['dates'])
-            lines += [f'- {b}' for b in e['bullets']]
-            lines.append('')
-    if data['education']:
-        lines.append('EDUCATION')
-        for ed in data['education']:
-            head = ' | '.join(p for p in (ed['title'], ed['institution'], ed['location']) if p)
-            if head:
-                lines.append(head)
-            if ed['dates']:
-                lines.append(ed['dates'])
-            if ed['detail']:
-                lines.append(f'- {ed["detail"]}')
-            lines.append('')
-    if data['certifications']:
-        lines.append('CERTIFICATIONS')
-        lines += [f'- {c}' for c in data['certifications']]
-        lines.append('')
-    if data['additional']:
-        lines.append('ADDITIONAL INFORMATION')
-        lines += [f'- {a}' for a in data['additional']]
     return '\n'.join(lines).strip()
 
 
@@ -382,14 +472,54 @@ def _parse_entries(lines, education=False):
     return entries
 
 
+def _detect_sections(cv_text):
+    """The section keys and their ORIGINAL heading text, in the order they appear.
+
+    Lets the fallback path keep the candidate's own layout too, instead of
+    relabelling everything to the house headings.
+    """
+    from .pdf_generator import SECTION_ALIASES, _normalize_heading
+
+    order, headings = [], {}
+    for raw in (cv_text or '').splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        key = SECTION_ALIASES.get(_normalize_heading(line))
+        if key and key not in headings:
+            headings[key] = line.strip('#*_ ').rstrip(':').strip()
+            order.append(key)
+    return order, headings
+
+
+def _clean_contact(contact):
+    """Keep only real contact details out of a messily-extracted header.
+
+    A scrambled extraction can leave date ranges and a fused "<date><NAME>"
+    fragment in the header, which must not end up printed as the contact line.
+    """
+    parts = []
+    for raw in re.split(r'[•|]', contact or ''):
+        part = _DATE_PREFIX_RE.sub('', raw.strip()).strip(' -–—:|')
+        if not part or _DATE_ONLY_RE.match(part):
+            continue
+        # Real contact details carry an @ or a run of digits (phone/postcode).
+        if '@' in part or re.search(r'\d{4,}', part):
+            parts.append(part)
+    return ' | '.join(parts)
+
+
 def _text_to_data(cv_text):
     """Reconstruct the structured dict from raw CV text (OpenAI-free fallback)."""
     from .pdf_generator import parse_cv_sections
 
     sections = parse_cv_sections(cv_text or '')
+    order, headings = _detect_sections(cv_text)
     return _normalise_data({
+        'section_order': order,
+        'section_headings': headings,
         'name': sections.get('name', ''),
-        'contact': sections.get('contact', ''),
+        'contact': _clean_contact(sections.get('contact', '')),
         'profile': ' '.join(sections.get('profile') or []),
         'skills': [_strip_lead_bullet(l) for l in (sections.get('skills') or [])],
         'experience': _parse_entries(sections.get('experience') or []),

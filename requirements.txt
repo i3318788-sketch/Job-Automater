@@ -28,5 +28,11 @@ gunicorn
 whitenoise
 psycopg2-binary
 
+# Timezone database. python:3.10-slim ships without the system tzdata, so
+# zoneinfo cannot resolve names like "Europe/London" in the container and every
+# localised timestamp breaks (it works locally only because the dev machine has
+# tzdata). Installing it as a wheel makes the container match local behaviour.
+tzdata
+
 # Optional: error tracking in production
 sentry-sdk

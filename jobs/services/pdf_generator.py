@@ -354,13 +354,14 @@ def _render_data_section(key, data, styles, doc_width):
 
 
 def generate_tailored_pdf_from_data(data, candidate_name, job_title, company, output_path):
-    """Render a STRUCTURED CV dict straight into the UK layout.
+    """Render a STRUCTURED CV dict, mirroring the ORIGINAL CV's own layout.
 
-    No text re-parsing (``parse_cv_sections``), no heading-alias guessing, no
-    flat-fallback branch. The fixed schema guarantees one identical format for every
-    CV regardless of the original layout, and a messy PDF extraction can no longer
-    scramble the header/sections. Uses the same reportlab styles and SECTION_ORDER
-    as the text-based renderer.
+    Sections are emitted in the original CV's order under its own heading wording
+    (``section_order`` / ``section_headings``), so a CV whose sections read
+    "SUMMARY / EXPERIENCE / EDUCATION / SKILLS" keeps exactly that — no house style
+    is imposed. Structure still comes from the schema rather than re-parsing text
+    (``parse_cv_sections``), so a messy PDF extraction can no longer scramble the
+    header or float dates above the name.
     """
     styles = _build_styles()
     doc = SimpleDocTemplate(
@@ -381,7 +382,10 @@ def generate_tailored_pdf_from_data(data, candidate_name, job_title, company, ou
     story.append(HRFlowable(width='100%', thickness=1, color=colors.black,
                             spaceBefore=3, spaceAfter=2))
 
-    for key, title in SECTION_ORDER:
+    # The original CV's own sections, order and heading wording.
+    from .tailoring import section_layout
+
+    for key, title in section_layout(data):
         body = _render_data_section(key, data, styles, doc_width)
         if not body:
             continue

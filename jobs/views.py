@@ -378,6 +378,21 @@ def start_search(request):
 
 
 @login_required
+def google_sheets_health(request):
+    """Report whether Google Sheets logging is actually working, and why not.
+
+    Sheets logging is deliberately best-effort (a search must never fail because
+    of it), so a misconfigured deployment looks like silence. This turns that
+    silence into a specific reason: missing credentials file, sheet not shared
+    with the service account, wrong sheet id, or no outbound network.
+    """
+    from .services.google_sheets import GoogleSheetsLogger
+
+    report = GoogleSheetsLogger().health_check()
+    return JsonResponse(report, status=200 if report['status'] == 'ok' else 500)
+
+
+@login_required
 def search_status(request, run_id):
     """Return the SearchRun status + progress as JSON (used by dashboard polling)."""
     search_run = get_object_or_404(SearchRun, pk=run_id, user=request.user)

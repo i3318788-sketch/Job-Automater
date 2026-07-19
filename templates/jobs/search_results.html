@@ -12,7 +12,10 @@
                 <p style="font-size:0.78rem; color:rgba(255,255,255,0.55); font-weight:600; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:0.25rem;">Search Results</p>
                 <h1 style="color:#fff; margin-bottom:0.5rem;">Search #{{ search_run.id }}</h1>
                 <div style="display:flex; flex-wrap:wrap; gap:0.75rem; font-size:0.82rem; color:rgba(255,255,255,0.7);">
-                    <span>📅 {{ search_run.created_at|localtime|date:"d M Y, h:i A" }}</span>
+                    {# USE_TZ=True: Django already renders this in settings.TIME_ZONE.
+                       The explicit |localtime filter was redundant and blew up when the
+                       container could not resolve the timezone, leaving the time blank. #}
+                    <span class="search-time">📅 {{ search_run.created_at|date:"d M Y, h:i A" }}</span>
                     <span>👤 {% if search_run.cv %}{{ search_run.cv.display_name }}{% else %}—{% endif %}</span>
                     <span>📍 {% if search_run.city %}{{ search_run.city }}, {% endif %}{{ search_run.countries|join:", "|default:"—" }}</span>
                     <span>
